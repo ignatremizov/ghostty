@@ -121,7 +121,8 @@ _ghostty_deferred_init() {
             fi
         fi
 
-        builtin local mark1=$'%{\e]133;A;cl=line\a%}'
+        builtin local markA=$'\e]133;A;cl=line\a'
+        builtin local mark1=$'%{\e]133;P;k=i\a%}'
         if [[ -o prompt_percent ]]; then
             builtin typeset -g precmd_functions
             if [[ ${precmd_functions[-1]} == _ghostty_precmd ]]; then
@@ -131,6 +132,13 @@ _ghostty_deferred_init() {
                 # SIGCHLD if notify is set. Themes that update prompt
                 # asynchronously from a `zle -F` handler might still remove our
                 # marks. Oh well.
+
+                if ! builtin zle; then
+                    # Emit a single fresh-line mark for actual new prompts.
+                    # Prompt redraws reuse the in-band P/B markers below so
+                    # async reset-prompt flows don't grow the screen.
+                    builtin print -rnu $_ghostty_fd -- $markA
+                fi
 
                 # Restore PS1/PS2 to their pre-mark state if nothing else has
                 # modified them since we last added marks. This avoids exposing
@@ -162,11 +170,26 @@ _ghostty_deferred_init() {
                 # Handle multiline prompts by marking newline-separated
                 # continuation lines with k=s (mark2).
                 #
+                # Pure-style prompts use \n%{\r%} to move back to column 0
+                # before the visible prompt line. Ghostty already promotes the
+                # next row to a prompt continuation when prompt mode crosses a
+                # newline, so inserting another explicit continuation mark after
+                # that hidden CR creates a second prompt boundary during redraws.
+                #
                 # We skip this when PS1 changed because injecting marks into
                 # newlines can break pattern matching in themes that
                 # strip/rebuild the prompt dynamically (e.g., Pure).
                 if (( ! ps1_changed )) && [[ $PS1 == *$'\n'* ]]; then
-                    PS1=${PS1//$'\n'/$'\n'${mark2}}
+                    if [[ $PS1 == *$'\n%{\r%}'* ]]; then
+                        :
+                    elif [[ $PS1 == ${mark1}$'\n'* ]]; then
+                        builtin local rest=${PS1#${mark1}$'\n'}
+                        if [[ $rest == *$'\n'* ]]; then
+                            PS1=${mark1}$'\n'${rest//$'\n'/$'\n'${mark2}}
+                        fi
+                    else
+                        PS1=${PS1//$'\n'/$'\n'${mark2}}
+                    fi
                 fi
 
                 # PS2 mark is needed when clearing the prompt on resize
@@ -190,7 +213,7 @@ _ghostty_deferred_init() {
                 # already have a mark, so the following reset-prompt will write
                 # it. If it doesn't, there is nothing we can do.
                 if ! builtin zle; then
-                    builtin print -rnu $_ghostty_fd -- $mark1[3,-3]
+                    builtin print -rnu $_ghostty_fd -- $markA
                     (( _ghostty_state = 2 ))
                 fi
             fi
@@ -198,7 +221,7 @@ _ghostty_deferred_init() {
             # Without prompt_percent we cannot patch prompt. Just print the
             # mark, except when we are invoked from zle. In the latter case we
             # cannot do anything.
-            builtin print -rnu $_ghostty_fd -- $mark1[3,-3]
+            builtin print -rnu $_ghostty_fd -- $markA
             (( _ghostty_state = 2 ))
         fi
     }
@@ -213,6 +236,19 @@ _ghostty_deferred_init() {
         if [[ -n ${_ghostty_saved_ps1+x} && $PS1 == $_ghostty_marked_ps1 ]]; then
             PS1=$_ghostty_saved_ps1
             PS2=$_ghostty_saved_ps2
+        else
+            # If another hook/theme rewrote PS1 after our precmd ran, fall
+            # back to removing any of our semantic prompt markers in place.
+            # This keeps other preexec hooks from seeing our markers even when
+            # we cannot safely restore the saved clean prompt verbatim.
+            PS1=${PS1//$'%{\e]133;A;cl=line\a%}'}
+            PS1=${PS1//$'%{\e]133;A;k=s\a%}'}
+            PS1=${PS1//$'%{\e]133;P;k=i\a%}'}
+            PS1=${PS1//$'%{\e]133;P;k=s\a%}'}
+            PS1=${PS1//$'%{\e]133;B\a%}'}
+            PS2=${PS2//$'%{\e]133;A;k=s\a%}'}
+            PS2=${PS2//$'%{\e]133;P;k=s\a%}'}
+            PS2=${PS2//$'%{\e]133;B\a%}'}
         fi
 
         # This will work incorrectly in the presence of a preexec hook that
@@ -268,11 +304,10 @@ _ghostty_deferred_init() {
     # emit 133;B to mark the input area, which is needed for click-to-move.
     (( $+functions[_ghostty_zle_line_init] )) || _ghostty_zle_line_init() { builtin true; }
     functions[_ghostty_zle_line_init]="
-        if [[ \$PS1 != *$'%{\\e]133;A'* ]]; then
+        if [[ \$PS1 != *$'%{\\e]133;A'* && \$PS1 != *$'%{\\e]133;P'* ]]; then
             builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a\\e]133;B\\a'
         fi
     "${functions[_ghostty_zle_line_init]}
-
     # Add Ghostty binary to PATH if the path feature is enabled
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"path"* ]] && [[ -n "$GHOSTTY_BIN_DIR" ]]; then
       if [[ ":$PATH:" != *":$GHOSTTY_BIN_DIR:"* ]]; then
