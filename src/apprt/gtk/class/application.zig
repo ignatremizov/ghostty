@@ -701,6 +701,8 @@ pub const Application = extern struct {
 
             .move_tab => return Action.moveTab(target, value),
 
+            .move_split_to_tab => return Action.moveSplitToTab(target, value),
+
             .new_split => return Action.newSplit(target, value),
 
             .new_tab => return Action.newTab(target),
@@ -2167,6 +2169,35 @@ const Action = struct {
                 return window.moveTab(
                     surface,
                     @intCast(value.amount),
+                );
+            },
+        }
+    }
+
+    pub fn moveSplitToTab(
+        target: apprt.Target,
+        value: apprt.action.GotoTab,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring move_split_to_tab", .{});
+                    return false;
+                };
+
+                return window.moveSurfaceToTab(
+                    surface,
+                    switch (value) {
+                        .previous => .previous,
+                        .next => .next,
+                        .last => .last,
+                        else => .{ .n = @intCast(@intFromEnum(value)) },
+                    },
                 );
             },
         }

@@ -6855,6 +6855,44 @@ pub const Keybinds = struct {
                 },
             );
         }
+        {
+            const mods: inputpkg.Mods = if (builtin.target.os.tag.isDarwin())
+                .{ .super = true, .alt = true, .shift = true }
+            else
+                .{ .ctrl = true, .alt = true, .shift = true };
+
+            const start: u21 = '1';
+            const end: u21 = '9';
+            comptime var i: u21 = start;
+            inline while (i <= end) : (i += 1) {
+                try self.set.putFlags(
+                    alloc,
+                    .{
+                        .key = .{ .physical = @field(
+                            inputpkg.Key,
+                            std.fmt.comptimePrint("digit_{u}", .{i}),
+                        ) },
+                        .mods = mods,
+                    },
+                    .{ .move_split_to_tab = (i - start) + 1 },
+                    .{
+                        .performable = !builtin.target.os.tag.isDarwin(),
+                    },
+                );
+
+                try self.set.putFlags(
+                    alloc,
+                    .{
+                        .key = .{ .unicode = i },
+                        .mods = mods,
+                    },
+                    .{ .move_split_to_tab = (i - start) + 1 },
+                    .{
+                        .performable = !builtin.target.os.tag.isDarwin(),
+                    },
+                );
+            }
+        }
 
         // Toggle fullscreen
         try self.set.put(

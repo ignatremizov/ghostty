@@ -871,6 +871,7 @@ typedef enum {
   GHOSTTY_ACTION_TOGGLE_VISIBILITY,
   GHOSTTY_ACTION_TOGGLE_BACKGROUND_OPACITY,
   GHOSTTY_ACTION_MOVE_TAB,
+  GHOSTTY_ACTION_MOVE_SPLIT_TO_TAB,
   GHOSTTY_ACTION_GOTO_TAB,
   GHOSTTY_ACTION_GOTO_SPLIT,
   GHOSTTY_ACTION_GOTO_WINDOW,
@@ -927,6 +928,7 @@ typedef union {
   ghostty_action_split_direction_e new_split;
   ghostty_action_fullscreen_e toggle_fullscreen;
   ghostty_action_move_tab_s move_tab;
+  ghostty_action_goto_tab_e move_split_to_tab;
   ghostty_action_goto_tab_e goto_tab;
   ghostty_action_goto_split_e goto_split;
   ghostty_action_goto_window_e goto_window;

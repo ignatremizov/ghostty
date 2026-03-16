@@ -132,6 +132,10 @@ pub const Action = union(Key) {
     /// cyclically within the tab range.
     move_tab: MoveTab,
 
+    /// Move the currently focused split into another tab, merging it into
+    /// the destination tab's split tree.
+    move_split_to_tab: GotoTab,
+
     /// Jump to a specific tab. Must handle the scenario that the tab
     /// value is invalid.
     goto_tab: GotoTab,
@@ -360,6 +364,7 @@ pub const Action = union(Key) {
         toggle_visibility,
         toggle_background_opacity,
         move_tab,
+        move_split_to_tab,
         goto_tab,
         goto_split,
         goto_window,

@@ -509,6 +509,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_MOVE_TAB:
                 return moveTab(app, target: target, move: action.action.move_tab)
 
+            case GHOSTTY_ACTION_MOVE_SPLIT_TO_TAB:
+                return moveSplitToTab(app, target: target, tab: action.action.move_split_to_tab)
+
             case GHOSTTY_ACTION_GOTO_TAB:
                 return gotoTab(app, target: target, tab: action.action.goto_tab)
 
@@ -1143,6 +1146,35 @@ extension Ghostty {
                         object: surfaceView,
                         userInfo: [
                             Notification.GotoTabKey: tab,
+                        ]
+                    )
+
+                default:
+                    assertionFailure()
+                }
+
+                return true
+        }
+
+        private static func moveSplitToTab(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            tab: ghostty_action_goto_tab_e) -> Bool {
+                switch target.tag {
+                case GHOSTTY_TARGET_APP:
+                    Ghostty.logger.warning("move split to tab does nothing with an app target")
+                    return false
+
+                case GHOSTTY_TARGET_SURFACE:
+                    guard let surface = target.target.surface else { return false }
+                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                    guard surfaceView.window?.windowController is TerminalController else { return false }
+
+                    NotificationCenter.default.post(
+                        name: .ghosttyMoveSplitToTab,
+                        object: surfaceView,
+                        userInfo: [
+                            SwiftUI.Notification.Name.GhosttyMoveSplitToTabKey: tab,
                         ]
                     )
 

@@ -688,6 +688,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .csi,
         .esc,
         .cursor_key,
+        .move_split_to_tab,
         .set_font_size,
         .set_surface_title,
         .set_tab_title,
@@ -736,4 +737,5 @@ test "command defaults" {
     const testing = std.testing;
     try testing.expect(defaults.len > 0);
     try testing.expectEqual(defaults.len, defaultsC.len);
+    try testing.expectEqual(@as(usize, 0), actionCommands(.move_split_to_tab).len);
 }
