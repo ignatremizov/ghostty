@@ -174,6 +174,14 @@ pub const Tab = extern struct {
         pub var offset: c_int = 0;
     };
 
+    const NewOptions = struct {
+        command: ?configpkg.Command = null,
+        working_directory: ?[:0]const u8 = null,
+        title: ?[:0]const u8 = null,
+
+        pub const none: @This() = .{};
+    };
+
     /// Set the parent of this tab page. This only affects the first surface
     /// ever created for a tab. If a surface was already created this does
     /// nothing.
@@ -187,15 +195,22 @@ pub const Tab = extern struct {
         }
     }
 
-    pub fn new(config: ?*Config, overrides: struct {
-        command: ?configpkg.Command = null,
-        working_directory: ?[:0]const u8 = null,
-        title: ?[:0]const u8 = null,
-
-        pub const none: @This() = .{};
-    }) *Self {
+    pub fn new(config: ?*Config, overrides: NewOptions) *Self {
         const tab = gobject.ext.newInstance(Tab, .{});
+        return tab.initCommon(config, true, overrides);
+    }
 
+    pub fn newEmpty(config: ?*Config) *Self {
+        const tab = gobject.ext.newInstance(Tab, .{});
+        return tab.initCommon(config, false, .none);
+    }
+
+    fn initCommon(
+        tab: *Self,
+        config: ?*Config,
+        create_initial_surface: bool,
+        overrides: NewOptions,
+    ) *Self {
         const priv: *Private = tab.private();
 
         if (config) |c| priv.config = c.ref();
@@ -209,19 +224,21 @@ pub const Tab = extern struct {
 
         tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
-        // Create our initial surface in the split tree.
-        priv.split_tree.newSplit(.right, null, .{
-            .command = overrides.command,
-            .working_directory = overrides.working_directory,
-            .title = overrides.title,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => {
-                // TODO: We should make our "no surfaces" state more aesthetically
-                // pleasing and show something like an "Oops, something went wrong"
-                // message. For now, this is incredibly unlikely.
-                @panic("oom");
-            },
-        };
+        if (create_initial_surface) {
+            // Create our initial surface in the split tree.
+            priv.split_tree.newSplit(.right, null, .{
+                .command = overrides.command,
+                .working_directory = overrides.working_directory,
+                .title = overrides.title,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    // TODO: We should make our "no surfaces" state more aesthetically
+                    // pleasing and show something like an "Oops, something went wrong"
+                    // message. For now, this is incredibly unlikely.
+                    @panic("oom");
+                },
+            };
+        }
 
         return tab;
     }
