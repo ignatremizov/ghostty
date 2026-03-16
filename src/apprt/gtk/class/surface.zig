@@ -696,6 +696,7 @@ pub const Surface = extern struct {
         // True if the current surface is a split, this is used to apply
         // unfocused-split-* options
         is_split: bool = false,
+        split_binding: ?*gobject.Binding = null,
 
         action_group: ?*gio.SimpleActionGroup = null,
 
@@ -823,6 +824,15 @@ pub const Surface = extern struct {
     pub fn redraw(self: *Self) void {
         const priv = self.private();
         priv.gl_area.queueRender();
+    }
+
+    pub fn setSplitBinding(self: *Self, binding: ?*gobject.Binding) void {
+        const priv = self.private();
+        if (priv.split_binding) |old| {
+            old.as(gobject.Object).unref();
+            priv.split_binding = null;
+        }
+        priv.split_binding = binding;
     }
 
     /// Callback used to determine whether border should be shown around the
@@ -1890,6 +1900,11 @@ pub const Surface = extern struct {
                 log.warn("unable to remove progress bar timer", .{});
             }
             priv.progress_bar_timer = null;
+        }
+
+        if (priv.split_binding) |binding| {
+            binding.as(gobject.Object).unref();
+            priv.split_binding = null;
         }
 
         if (priv.idle_rechild) |v| {

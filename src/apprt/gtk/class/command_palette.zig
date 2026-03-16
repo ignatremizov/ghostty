@@ -83,6 +83,9 @@ pub const CommandPalette = extern struct {
         /// This is where all command data is ultimately stored.
         source: *gio.ListStore,
 
+        /// The window this palette is currently operating on.
+        window: WeakRef(Window) = .empty,
+
         pub var offset: c_int = 0;
     };
 
@@ -142,6 +145,10 @@ pub const CommandPalette = extern struct {
     // Signal Handlers
 
     fn propConfig(self: *CommandPalette, _: *gobject.ParamSpec, _: ?*anyopaque) callconv(.c) void {
+        self.rebuildCommands();
+    }
+
+    fn rebuildCommands(self: *CommandPalette) void {
         const priv = self.private();
 
         const config = priv.config orelse {
@@ -185,13 +192,14 @@ pub const CommandPalette = extern struct {
         commands: *std.ArrayList(*Command),
         alloc: std.mem.Allocator,
     ) void {
-        _ = self;
+        self.collectDynamicPaneMoveCommands(config, commands, alloc);
         const cfg = config.get();
 
         for (cfg.@"command-palette-entry".value.items) |command| {
             // Filter out actions that are not implemented or don't make sense
             // for GTK.
             if (!isActionSupportedOnGtk(command.action)) continue;
+            if (command.action == .move_split_to_tab) continue;
 
             const cmd = Command.new(config, command) catch |err| {
                 log.warn("failed to create command: {}", .{err});
@@ -204,6 +212,103 @@ pub const CommandPalette = extern struct {
                 continue;
             };
         }
+    }
+
+    fn collectDynamicPaneMoveCommands(
+        self: *CommandPalette,
+        config: *Config,
+        commands: *std.ArrayList(*Command),
+        alloc: std.mem.Allocator,
+    ) void {
+        const priv = self.private();
+        const window = priv.window.get() orelse return;
+        defer window.unref();
+
+        const tab_view = window.getTabView();
+        const total = tab_view.getNPages();
+        if (total <= 0) return;
+
+        const selected = tab_view.getSelectedPage() orelse return;
+        const current = tab_view.getPagePosition(selected);
+
+        var i: c_int = 0;
+        while (i < total) : (i += 1) {
+            if (i == current) continue;
+            self.appendPaneMoveCommand(
+                config,
+                commands,
+                alloc,
+                @intCast(i + 1),
+                false,
+            );
+        }
+
+        // Moving to the next tab index creates a new tab and places the pane in it.
+        self.appendPaneMoveCommand(
+            config,
+            commands,
+            alloc,
+            @intCast(total + 1),
+            true,
+        );
+    }
+
+    fn appendPaneMoveCommand(
+        self: *CommandPalette,
+        config: *Config,
+        commands: *std.ArrayList(*Command),
+        alloc: std.mem.Allocator,
+        index: usize,
+        create_new: bool,
+    ) void {
+        _ = self;
+        const title = std.fmt.allocPrintSentinel(
+            alloc,
+            "Move Pane to Tab {d}",
+            .{index},
+            0,
+        ) catch |err| {
+            log.warn("failed to allocate move-pane command title: {}", .{err});
+            return;
+        };
+        defer alloc.free(title);
+
+        const description = description: {
+            const value = if (create_new)
+                std.fmt.allocPrintSentinel(
+                    alloc,
+                    "Move the current pane into a new tab {d}.",
+                    .{index},
+                    0,
+                )
+            else
+                std.fmt.allocPrintSentinel(
+                    alloc,
+                    "Move the current pane into tab {d}, merging it into that tab's layout.",
+                    .{index},
+                    0,
+                );
+            break :description value catch |err| {
+                log.warn("failed to allocate move-pane command description: {}", .{err});
+                return;
+            };
+        };
+        defer alloc.free(description);
+
+        const cmd = Command.new(config, .{
+            .action = .{ .move_split_to_tab = index },
+            .title = title,
+            .description = description,
+        }) catch |err| {
+            log.warn("failed to create move-pane command: {}", .{err});
+            return;
+        };
+        errdefer cmd.unref();
+
+        commands.append(alloc, cmd) catch |err| {
+            log.warn("failed to add move-pane command to list: {}", .{err});
+            return;
+        };
     }
 
     /// Check if an action is supported on GTK.
@@ -311,6 +416,10 @@ pub const CommandPalette = extern struct {
     /// be modal over the given window.
     pub fn toggle(self: *CommandPalette, window: *Window) void {
         const priv = self.private();
+        priv.window.set(window);
+
+        // Rebuild on open so dynamic commands reflect the current tab state.
+        self.rebuildCommands();
 
         // If the dialog has been shown, close it.
         if (priv.dialog.as(gtk.Widget).getRealized() != 0) {

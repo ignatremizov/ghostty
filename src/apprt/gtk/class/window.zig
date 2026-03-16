@@ -424,6 +424,8 @@ pub const Window = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            initial_surface: bool = true,
+            position_override: ?c_int = null,
 
             pub const none: @This() = .{};
         },
@@ -432,14 +434,17 @@ pub const Window = extern struct {
         const tab_view = priv.tab_view;
 
         // Create our new tab object
-        const tab = Tab.new(
-            priv.config,
-            .{
-                .command = overrides.command,
-                .working_directory = overrides.working_directory,
-                .title = overrides.title,
-            },
-        );
+        const tab = if (overrides.initial_surface)
+            Tab.new(
+                priv.config,
+                .{
+                    .command = overrides.command,
+                    .working_directory = overrides.working_directory,
+                    .title = overrides.title,
+                },
+            )
+        else
+            Tab.newEmpty(priv.config);
 
         if (parent_) |p| {
             // For a new window's first tab, inherit the parent's initial size hints.
@@ -455,7 +460,7 @@ pub const Window = extern struct {
             // This should never happen.
             return tab_view.append(tab.as(gtk.Widget));
         };
-        const position = switch (config.@"window-new-tab-position") {
+        const position = overrides.position_override orelse switch (config.@"window-new-tab-position") {
             .current => current: {
                 const selected = tab_view.getSelectedPage() orelse
                     break :current tab_view.getNPages();
@@ -602,6 +607,126 @@ pub const Window = extern struct {
         assert(desired_pos < total);
 
         return tab_view.reorderPage(page, desired_pos) != 0;
+    }
+
+    fn newEmptyTabPage(
+        self: *Self,
+        position: c_int,
+    ) *adw.TabPage {
+        return self.newTabPage(null, .tab, .{
+            .initial_surface = false,
+            .position_override = position,
+        });
+    }
+
+    /// Move the given surface into another tab, merging it as a split in the
+    /// destination tab.
+    pub fn moveSurfaceToTab(
+        self: *Self,
+        surface: *Surface,
+        target: SelectTab,
+    ) bool {
+        const priv = self.private();
+        const tab_view = priv.tab_view;
+
+        const source_tab = ext.getAncestor(
+            Tab,
+            surface.as(gtk.Widget),
+        ) orelse return false;
+        const source_page = tab_view.getPage(source_tab.as(gtk.Widget));
+        const total = tab_view.getNPages();
+        const current = tab_view.getPagePosition(source_page);
+
+        var create_destination = false;
+        const destination_pos: c_int = switch (target) {
+            .previous => previous: {
+                if (total <= 1) {
+                    self.addToast(i18n._("No other tab to move the pane into"));
+                    return false;
+                }
+                break :previous if (current > 0)
+                    current - 1
+                else
+                    total - 1;
+            },
+
+            .next => next: {
+                if (total <= 1) {
+                    self.addToast(i18n._("No other tab to move the pane into"));
+                    return false;
+                }
+                break :next if (current < total - 1)
+                    current + 1
+                else
+                    0;
+            },
+
+            .last => last: {
+                if (total <= 1) {
+                    self.addToast(i18n._("No other tab to move the pane into"));
+                    return false;
+                }
+                break :last total - 1;
+            },
+
+            .n => |v| n: {
+                if (v == 0) {
+                    self.addToast(i18n._("Invalid tab index"));
+                    return false;
+                }
+                const n_int = std.math.cast(c_int, v) orelse {
+                    self.addToast(i18n._("Invalid tab index"));
+                    return false;
+                };
+                if (n_int > total) {
+                    create_destination = true;
+                    break :n total;
+                }
+                break :n n_int - 1;
+            },
+        };
+        if (!create_destination and destination_pos == current) {
+            self.addToast(i18n._("Pane is already in that tab"));
+            return false;
+        }
+
+        const destination_page = if (create_destination)
+            self.newEmptyTabPage(destination_pos)
+        else
+            tab_view.getNthPage(destination_pos);
+        const destination_tab = gobject.ext.cast(
+            Tab,
+            destination_page.getChild(),
+        ) orelse return false;
+
+        const source_tree = source_tab.getSplitTree();
+        const destination_tree = destination_tab.getSplitTree();
+
+        _ = surface.ref();
+        defer surface.unref();
+
+        if (!source_tree.removeSurface(surface)) {
+            self.addToast(i18n._("Unable to move pane to that tab"));
+            return false;
+        }
+
+        destination_tree.addExistingSurface(.right, surface) catch |err| {
+            log.warn("unable to move surface into destination tab: {}", .{err});
+            source_tree.addExistingSurface(.right, surface) catch |restore_err| {
+                log.warn("unable to restore moved surface after failed move: {}", .{restore_err});
+            };
+            if (create_destination) tab_view.closePage(destination_page);
+            self.addToast(i18n._("Unable to move pane to that tab"));
+            return false;
+        };
+
+        if (!source_tree.getHasSurfaces()) {
+            tab_view.closePage(source_page);
+        }
+
+        tab_view.setSelectedPage(tab_view.getPage(destination_tab.as(gtk.Widget)));
+        surface.grabFocus();
+        return true;
     }
 
     pub fn toggleTabOverview(self: *Self) void {

@@ -97,6 +97,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(onMoveSplitToTab),
+            name: .ghosttyMoveSplitToTab,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(onCloseTab),
             name: .ghosttyCloseTab,
             object: nil)
@@ -1538,6 +1543,101 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         guard finalIndex >= 0 else { return }
         let targetWindow = tabbedWindows[finalIndex]
+        targetWindow.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func onMoveSplitToTab(notification: SwiftUI.Notification) {
+        guard let source = notification.object as? Ghostty.SurfaceView else { return }
+        guard source == self.focusedSurface else { return }
+        guard let window else { return }
+        guard let tabEnumAny = notification.userInfo?[Notification.Name.GhosttyMoveSplitToTabKey] else { return }
+        guard let tabEnum = tabEnumAny as? ghostty_action_goto_tab_e else { return }
+        guard let sourceNode = surfaceTree.root?.node(view: source) else { return }
+        guard let tabGroup = window.tabGroup else { return }
+        guard let currentIndex = tabGroup.windows.firstIndex(of: window) else { return }
+
+        let windows = tabGroup.windows
+        let createNewTab: Bool
+        let finalIndex: Int
+
+        let tabIndex = Int(tabEnum.rawValue)
+        if tabIndex <= 0 {
+            guard windows.count > 1 else { return }
+            createNewTab = false
+            switch tabIndex {
+            case Int(GHOSTTY_GOTO_TAB_PREVIOUS.rawValue):
+                finalIndex = currentIndex == 0 ? windows.count - 1 : currentIndex - 1
+            case Int(GHOSTTY_GOTO_TAB_NEXT.rawValue):
+                finalIndex = currentIndex == windows.count - 1 ? 0 : currentIndex + 1
+            case Int(GHOSTTY_GOTO_TAB_LAST.rawValue):
+                finalIndex = windows.count - 1
+            default:
+                return
+            }
+        } else {
+            let requested = tabIndex - 1
+            if requested < windows.count {
+                createNewTab = false
+                finalIndex = requested
+            } else {
+                createNewTab = true
+                finalIndex = windows.count
+            }
+        }
+
+        if !createNewTab && finalIndex == currentIndex { return }
+
+        let nextFocus: Ghostty.SurfaceView? = if sourceNode.contains(where: { $0 == focusedSurface }) {
+            findNextFocusTargetAfterClosing(node: sourceNode)
+        } else {
+            nil
+        }
+
+        let sourceTreeWithoutPane = surfaceTree.removing(sourceNode)
+
+        if createNewTab {
+            let newController = TerminalController(ghostty, withSurfaceTree: .init(view: source))
+            guard let newWindow = newController.window else { return }
+
+            replaceSurfaceTree(
+                sourceTreeWithoutPane,
+                moveFocusTo: nextFocus,
+                moveFocusFrom: focusedSurface,
+                undoAction: "Move Pane to Tab"
+            )
+
+            if window.isMiniaturized { window.deminiaturize(self) }
+            (tabGroup.windows.last ?? window).addTabbedWindowSafely(newWindow, ordered: .above)
+            newWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        guard let targetWindow = windows[safe: finalIndex],
+              let targetController = targetWindow.windowController as? TerminalController,
+              let destination = targetController.focusedSurface ?? targetController.surfaceTree.first else {
+            return
+        }
+
+        let newTargetTree: SplitTree<Ghostty.SurfaceView>
+        do {
+            newTargetTree = try targetController.surfaceTree.inserting(view: source, at: destination, direction: .right)
+        } catch {
+            Ghostty.logger.warning("failed to insert surface while moving pane to tab: \(error)")
+            return
+        }
+
+        replaceSurfaceTree(
+            sourceTreeWithoutPane,
+            moveFocusTo: nextFocus,
+            moveFocusFrom: focusedSurface,
+            undoAction: "Move Pane to Tab"
+        )
+        targetController.replaceSurfaceTree(
+            newTargetTree,
+            moveFocusTo: source,
+            moveFocusFrom: targetController.focusedSurface,
+            undoAction: "Move Pane to Tab"
+        )
         targetWindow.makeKeyAndOrderFront(nil)
     }
 

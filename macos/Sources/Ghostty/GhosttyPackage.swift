@@ -342,6 +342,10 @@ extension Notification.Name {
     static let ghosttyMoveTab = Notification.Name("com.mitchellh.ghostty.moveTab")
     static let GhosttyMoveTabKey = ghosttyMoveTab.rawValue
 
+    /// Move the focused pane into another tab. Has tab index in the userinfo.
+    static let ghosttyMoveSplitToTab = Notification.Name("com.mitchellh.ghostty.moveSplitToTab")
+    static let GhosttyMoveSplitToTabKey = ghosttyMoveSplitToTab.rawValue
+
     /// Close tab
     static let ghosttyCloseTab = Notification.Name("com.mitchellh.ghostty.closeTab")
 

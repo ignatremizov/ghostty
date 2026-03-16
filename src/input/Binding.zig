@@ -587,6 +587,13 @@ pub const Action = union(enum) {
     /// the last tab.
     move_tab: isize,
 
+    /// Move the currently focused split into the tab with the specific index,
+    /// starting from 1.
+    ///
+    /// If the tab number is higher than the number of tabs, this will use the
+    /// last tab. The destination tab will gain the moved split as a new pane.
+    move_split_to_tab: usize,
+
     /// Toggle the tab overview.
     ///
     /// This is only supported on Linux and when the system's libadwaita
@@ -1418,6 +1425,7 @@ pub const Action = union(enum) {
             .last_tab,
             .goto_tab,
             .move_tab,
+            .move_split_to_tab,
             .toggle_tab_overview,
             .new_split,
             .goto_split,
@@ -3391,6 +3399,11 @@ test "parse: action with int" {
         const binding = try parseSingle("a=jump_to_prompt:10");
         try testing.expect(binding.action == .jump_to_prompt);
         try testing.expectEqual(@as(i16, 10), binding.action.jump_to_prompt);
+    }
+    {
+        const binding = try parseSingle("a=move_split_to_tab:3");
+        try testing.expect(binding.action == .move_split_to_tab);
+        try testing.expectEqual(@as(usize, 3), binding.action.move_split_to_tab);
     }
 }
 
