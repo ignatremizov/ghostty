@@ -26,6 +26,11 @@ const log = std.log.scoped(.embedded_window);
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// On Linux with OpenGL, draws must happen on the app/main thread
+    /// because the host's GL context (e.g., GTK GLArea) is only valid there.
+    /// On macOS with Metal, this is not needed since Metal handles threading.
+    pub const must_draw_from_app_thread = builtin.target.os.tag == .linux;
+
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -343,6 +348,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -356,6 +362,10 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// Linux platform. The host is responsible for ensuring a valid
+    /// OpenGL context is current before calling surface init and draw.
+    pub const Linux = struct {};
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -365,6 +375,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        linux: extern struct {
+            reserved: ?*anyopaque,
         },
     };
 
@@ -385,6 +399,8 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (builtin.target.os.tag == .linux) .{ .linux = .{} } else error.UnsupportedPlatform,
         };
     }
 };
@@ -395,6 +411,7 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    linux = 3,
 };
 
 pub const EnvVar = extern struct {
@@ -767,7 +784,13 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        self.core_surface.draw() catch |err| {
+        // Use drawFrame(false) instead of the sync draw() path.
+        // CoreSurface.draw() calls drawFrame(true), which on size changes
+        // re-presents the last (stale) frame to avoid blank flashes during
+        // macOS CoreAnimation resize. On Linux/GTK, this prevents the
+        // renderer from ever updating to the new size. Using false lets
+        // the renderer detect the new GL viewport and resize its FBO.
+        self.core_surface.renderer.drawFrame(false) catch |err| {
             log.err("error in draw err={}", .{err});
             return;
         };
@@ -1687,6 +1710,25 @@ pub const CAPI = struct {
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();
+    }
+
+    /// Notify the surface that its display/GL context is about to be
+    /// destroyed (e.g., GTK GLArea unrealize during reparenting).
+    /// This deinitializes GL resources (FBOs, shaders) while preserving
+    /// the terminal/pty state. The host MUST make the GL context current
+    /// before calling this.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        surface.core_surface.renderer.displayUnrealized();
+    }
+
+    /// Notify the surface that a new display/GL context is now available
+    /// (e.g., GTK GLArea re-realize after reparenting). This reinitializes
+    /// GL resources (reloads GLAD, recompiles shaders, recreates FBOs).
+    /// The host MUST make the new GL context current before calling this.
+    export fn ghostty_surface_display_realized(surface: *Surface) void {
+        surface.core_surface.renderer.displayRealized() catch |err| {
+            log.err("error in displayRealized err={}", .{err});
+        };
     }
 
     /// Tell the surface that it needs to schedule a render
