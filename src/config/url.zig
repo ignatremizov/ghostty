@@ -52,24 +52,12 @@ const no_trailing_colon =
     \\(?<!:)
 ;
 
-const trailing_spaces_at_eol =
-    \\(?: +(?= *$))?
-;
-
 const dotted_path_lookahead =
     \\(?=[\w\-.~:\/?#@!$&*+;=%]*\.)
 ;
 
-const non_dotted_path_lookahead =
-    \\(?![\w\-.~:\/?#@!$&*+;=%]*\.)
-;
-
-const dotted_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*
-;
-
-const any_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*
+const unquoted_path_space_segments =
+    \\(?: (?!&&)(?!\|\|)(?![|;])(?=[\w\-.~:\/?#@!$&*+;=%]*\/)[\w\-.~:\/?#@!$&*+;=%]+)*
 ;
 
 // Branch 1: URLs with explicit schemes (http, mailto, ftp, etc.).
@@ -83,40 +71,54 @@ const rooted_or_relative_path_prefix =
 ;
 
 // Branch 2: Absolute paths and dot-relative paths (/, ./, ../).
-// A dotted segment is treated as file-like, while the undotted case stays
-// broad to capture directory-like paths with spaces.
+// Quoted paths are permissive and can contain spaces.
+const quoted_rooted_or_relative_path_branch =
+    "(?:(?<=\")" ++
+    rooted_or_relative_path_prefix ++
+    "[^\"\r\n]+" ++
+    "(?=\")|(?<=')" ++
+    rooted_or_relative_path_prefix ++
+    "[^'\r\n]+" ++
+    "(?='))";
+
+// Unquoted paths are conservative and stop before prose or shell operators.
 const rooted_or_relative_path_branch =
     rooted_or_relative_path_prefix ++
-    "(?:" ++
-    dotted_path_lookahead ++
     path_chars ++ "+" ++
-    dotted_path_space_segments ++
-    no_trailing_colon ++
-    trailing_spaces_at_eol ++
-    "|" ++
-    non_dotted_path_lookahead ++
-    path_chars ++ "+" ++
-    any_path_space_segments ++
-    no_trailing_colon ++
-    trailing_spaces_at_eol ++
-    ")";
+    unquoted_path_space_segments ++
+    no_trailing_punctuation ++
+    no_trailing_colon;
 
 // Branch 3: Bare relative paths such as src/config/url.zig.
 const bare_relative_path_prefix =
     \\(?<!\$\d*)(?<!\w)[\w][\w\-.]*\/
 ;
 
+const quoted_bare_relative_path_branch =
+    "(?:(?<=\")" ++
+    bare_relative_path_prefix ++
+    "[^\"\r\n]+" ++
+    "(?=\")|(?<=')" ++
+    bare_relative_path_prefix ++
+    "[^'\r\n]+" ++
+    "(?='))";
+
 const bare_relative_path_branch =
     dotted_path_lookahead ++
     bare_relative_path_prefix ++
     path_chars ++ "+" ++
-    no_trailing_colon ++
-    trailing_spaces_at_eol;
+    unquoted_path_space_segments ++
+    no_trailing_punctuation ++
+    no_trailing_colon;
 
 pub const regex =
     scheme_url_branch ++
     "|" ++
+    quoted_rooted_or_relative_path_branch ++
+    "|" ++
     rooted_or_relative_path_branch ++
+    "|" ++
+    quoted_bare_relative_path_branch ++
     "|" ++
     bare_relative_path_branch;
 
@@ -282,7 +284,7 @@ test "url regex" {
         },
         .{
             .input = "../example.py ",
-            .expect = "../example.py ",
+            .expect = "../example.py",
         },
         .{
             .input = "first time ../example.py contributor ",
@@ -344,11 +346,11 @@ test "url regex" {
         // File paths with spaces
         .{
             .input = "./spaces-end.   ",
-            .expect = "./spaces-end.   ",
+            .expect = "./spaces-end",
         },
         .{
             .input = "./space middle",
-            .expect = "./space middle",
+            .expect = "./space",
         },
         .{
             .input = "../test folder/file.txt",
@@ -361,6 +363,14 @@ test "url regex" {
         .{
             .input = "/tmp/test  folder/file.txt",
             .expect = "/tmp/test",
+        },
+        .{
+            .input = "\"/tmp/test folder/file.txt\"",
+            .expect = "/tmp/test folder/file.txt",
+        },
+        .{
+            .input = "'../test folder/file.txt'",
+            .expect = "../test folder/file.txt",
         },
         // unified diff lines
         .{
@@ -411,6 +421,10 @@ test "url regex" {
             .expect = "~/Documents/notes.md",
         },
         .{
+            .input = "\"~/Documents/notes final.md\"",
+            .expect = "~/Documents/notes final.md",
+        },
+        .{
             .input = "~/.config/ghostty/config",
             .expect = "~/.config/ghostty/config",
         },
@@ -442,6 +456,26 @@ test "url regex" {
         .{
             .input = "loaded from .local/share/ghostty/state.db now",
             .expect = ".local/share/ghostty/state.db",
+        },
+        .{
+            .input = "/home/ignat/ping.txt now.",
+            .expect = "/home/ignat/ping.txt",
+        },
+        .{
+            .input = "/home/ignat/foo/ping.txt.",
+            .expect = "/home/ignat/foo/ping.txt",
+        },
+        .{
+            .input = "/home/ignat/foo && mv /home/ignat/bar",
+            .expect = "/home/ignat/foo",
+        },
+        .{
+            .input = "/tmp/a&b.txt",
+            .expect = "/tmp/a&b.txt",
+        },
+        .{
+            .input = "/tmp/a;b.txt",
+            .expect = "/tmp/a;b.txt",
         },
         .{
             .input = "../some/where",
