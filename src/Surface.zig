@@ -2086,12 +2086,25 @@ fn resolvePathForOpening(
     self: *Surface,
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
+    var expandhome_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const expanded = internal_os.expandHome(path, &expandhome_buf) catch path;
+
+    if (std.fs.path.isAbsolute(expanded)) {
+        if (std.mem.eql(u8, expanded, path)) return null;
+
+        std.fs.accessAbsolute(expanded, .{}) catch {
+            return null;
+        };
+
+        return try self.alloc.dupe(u8, expanded);
+    }
+
     if (!std.fs.path.isAbsolute(path)) {
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
 
-        const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
+        const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, expanded });
 
         std.Io.Dir.accessAbsolute(global.io(), resolved, .{}) catch {
             self.alloc.free(resolved);
@@ -2102,6 +2115,31 @@ fn resolvePathForOpening(
     }
 
     return null;
+}
+
+test "Surface: opening path expands tilde before pwd resolution" {
+    const testing = std.testing;
+    const path = "~/local/path/to/example.md";
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const expanded = internal_os.expandHome(
+        path,
+        &buf,
+    ) catch unreachable;
+
+    switch (builtin.os.tag) {
+        .linux, .freebsd, .macos => {
+            try testing.expect(std.fs.path.isAbsolute(expanded));
+            try testing.expect(!std.mem.containsAtLeast(
+                u8,
+                expanded,
+                1,
+                "/~/",
+            ));
+        },
+        .windows, .ios => try testing.expectEqualStrings(path, expanded),
+        else => @compileError("unimplemented"),
+    }
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
