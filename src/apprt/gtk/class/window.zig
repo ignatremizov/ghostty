@@ -24,7 +24,9 @@ const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const SplitTabs = @import("split_tabs.zig").SplitTabs;
 const Surface = @import("surface.zig").Surface;
+const Tab = @import("tab.zig").Tab;
 const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
@@ -408,7 +410,13 @@ pub const Window = extern struct {
     }
 
     pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
-        self.newWorkspace(parent_);
+        const parent_surface = if (parent_) |parent| parent.rt_surface.surface else self.getActiveSurface();
+        const workspace_page = if (parent_surface) |surface|
+            ext.getAncestor(WorkspacePage, surface.as(gtk.Widget)) orelse self.getSelectedWorkspacePage() orelse return
+        else
+            self.getSelectedWorkspacePage() orelse return;
+
+        workspace_page.newTab(parent_surface);
     }
 
     pub fn newWorkspaceForWindow(
@@ -533,6 +541,20 @@ pub const Window = extern struct {
             self,
             .{},
         );
+        _ = SplitTree.signals.@"surface-added".connect(
+            split_tree,
+            *Self,
+            workspacePageSurfaceAdded,
+            self,
+            .{},
+        );
+        _ = SplitTree.signals.@"surface-removed".connect(
+            split_tree,
+            *Self,
+            workspacePageSurfaceRemoved,
+            self,
+            .{},
+        );
 
         // Run an initial notification for the surface tree so we can setup
         // initial state.
@@ -556,92 +578,31 @@ pub const Window = extern struct {
     /// Select the tab as requested. Returns true if the tab selection
     /// changed.
     pub fn selectTab(self: *Self, n: SelectTab) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
-
-        // Get our current workspace-page numeric position.
-        const selected = tab_view.getSelectedPage() orelse return false;
-        const current = tab_view.getPagePosition(selected);
-
-        // Get our total
-        const total = tab_view.getNPages();
-
-        const goto: c_int = switch (n) {
-            .previous => if (current > 0)
-                current - 1
-            else
-                total - 1,
-
-            .next => if (current < total - 1)
-                current + 1
-            else
-                0,
-
-            .last => total - 1,
-
-            .n => |v| n: {
-                // 1-indexed
-                if (v == 0) return false;
-
-                const n_int = std.math.cast(
-                    c_int,
-                    v,
-                ) orelse return false;
-                break :n @min(n_int - 1, total - 1);
-            },
-        };
-        assert(goto >= 0);
-        assert(goto < total);
-
-        // If our target is the same as our current then we do nothing.
-        if (goto == current) return false;
-
-        // Add the page and select it
-        const page = tab_view.getNthPage(goto);
-        tab_view.setSelectedPage(page);
-
-        return true;
+        const surface = self.getActiveSurface() orelse return false;
+        const split_tabs = ext.getAncestor(
+            SplitTabs,
+            surface.as(gtk.Widget),
+        ) orelse return false;
+        return split_tabs.selectTab(switch (n) {
+            .previous => .previous,
+            .next => .next,
+            .last => .last,
+            .n => |idx| .{ .n = idx },
+        });
     }
 
     /// Move the tab containing the given surface by the given amount.
     /// Returns if this affected any tab positioning.
     pub fn moveTab(
-        self: *Self,
+        _: *Self,
         surface: *Surface,
         amount: isize,
     ) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
-
-        // If we have one tab we never move.
-        const total = tab_view.getNPages();
-        if (total == 1) return false;
-
-        // Get the tab that contains the given surface.
-        const workspace_page = ext.getAncestor(
-            WorkspacePage,
+        const split_tabs = ext.getAncestor(
+            SplitTabs,
             surface.as(gtk.Widget),
         ) orelse return false;
-
-        // Get the page position that contains the workspace page.
-        const page = tab_view.getPage(workspace_page.as(gtk.Widget));
-        const pos = tab_view.getPagePosition(page);
-
-        // Move it
-        const desired_pos: c_int = desired: {
-            const initial: c_int = @intCast(pos + amount);
-            const max = total - 1;
-            break :desired if (initial < 0)
-                max + initial + 1
-            else if (initial > max)
-                initial - max - 1
-            else
-                initial;
-        };
-        assert(desired_pos >= 0);
-        assert(desired_pos < total);
-
-        return tab_view.reorderPage(page, desired_pos) != 0;
+        return split_tabs.moveSurface(surface, amount);
     }
 
     fn newEmptyWorkspacePage(
@@ -1008,75 +969,77 @@ pub const Window = extern struct {
         self.private().toast_overlay.addToast(toast);
     }
 
+    fn connectSurfaceHandler(self: *Self, surface: *Surface) void {
+        const priv = self.private();
+
+        _ = gobject.signalHandlersDisconnectMatched(
+            surface.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+
+        _ = Surface.signals.@"present-request".connect(
+            surface,
+            *Self,
+            surfacePresentRequest,
+            self,
+            .{},
+        );
+        _ = Surface.signals.@"clipboard-write".connect(
+            surface,
+            *Self,
+            surfaceClipboardWrite,
+            self,
+            .{},
+        );
+        _ = Surface.signals.menu.connect(
+            surface,
+            *Self,
+            surfaceMenu,
+            self,
+            .{},
+        );
+        _ = Surface.signals.@"toggle-fullscreen".connect(
+            surface,
+            *Self,
+            surfaceToggleFullscreen,
+            self,
+            .{},
+        );
+        _ = Surface.signals.@"toggle-maximize".connect(
+            surface,
+            *Self,
+            surfaceToggleMaximize,
+            self,
+            .{},
+        );
+
+        if (!priv.surface_init) {
+            _ = Surface.signals.init.connect(
+                surface,
+                *Self,
+                surfaceInit,
+                self,
+                .{},
+            );
+        }
+    }
+
     fn connectSurfaceHandlers(
         self: *Self,
-        tree: *const Surface.Tree,
+        tree: *const SplitTabs.Tree,
     ) void {
-        const priv = self.private();
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
-            // Before adding any new signal handlers, disconnect any that we may
-            // have added before. Otherwise we may get multiple handlers for the
-            // same signal.
-            _ = gobject.signalHandlersDisconnectMatched(
-                surface.as(gobject.Object),
-                .{ .data = true },
-                0,
-                0,
-                null,
-                null,
-                self,
-            );
-
-            _ = Surface.signals.@"present-request".connect(
-                surface,
-                *Self,
-                surfacePresentRequest,
-                self,
-                .{},
-            );
-            _ = Surface.signals.@"clipboard-write".connect(
-                surface,
-                *Self,
-                surfaceClipboardWrite,
-                self,
-                .{},
-            );
-            _ = Surface.signals.menu.connect(
-                surface,
-                *Self,
-                surfaceMenu,
-                self,
-                .{},
-            );
-            _ = Surface.signals.@"toggle-fullscreen".connect(
-                surface,
-                *Self,
-                surfaceToggleFullscreen,
-                self,
-                .{},
-            );
-            _ = Surface.signals.@"toggle-maximize".connect(
-                surface,
-                *Self,
-                surfaceToggleMaximize,
-                self,
-                .{},
-            );
-
-            // If we've never had a surface initialize yet, then we register
-            // this signal. Its theoretically possible to launch multiple surfaces
-            // before init so we could register this on multiple and that is not
-            // a problem because we'll check the flag again in each handler.
-            if (!priv.surface_init) {
-                _ = Surface.signals.init.connect(
-                    surface,
-                    *Self,
-                    surfaceInit,
-                    self,
-                    .{},
-                );
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                self.connectSurfaceHandler(surface);
             }
         }
     }
@@ -1086,20 +1049,24 @@ pub const Window = extern struct {
     /// when a tab is detached or the tree changes.
     fn disconnectSurfaceHandlers(
         self: *Self,
-        tree: *const Surface.Tree,
+        tree: *const SplitTabs.Tree,
     ) void {
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
-            _ = gobject.signalHandlersDisconnectMatched(
-                surface.as(gobject.Object),
-                .{ .data = true },
-                0,
-                0,
-                null,
-                null,
-                self,
-            );
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                _ = gobject.signalHandlersDisconnectMatched(
+                    surface.as(gobject.Object),
+                    .{ .data = true },
+                    0,
+                    0,
+                    null,
+                    null,
+                    self,
+                );
+            }
         }
     }
 
@@ -1611,6 +1578,10 @@ pub const Window = extern struct {
         self.performBindingAction(.new_tab);
     }
 
+    fn btnNewWorkspace(_: *gtk.Button, self: *Self) callconv(.c) void {
+        self.newWorkspace(if (self.getActiveSurface()) |v| v.core() else null);
+    }
+
     fn btnToggleSidebar(_: *gtk.Button, self: *Self) callconv(.c) void {
         self.toggleWorkspaceSidebar();
     }
@@ -2049,8 +2020,8 @@ pub const Window = extern struct {
 
     fn workspacePageSplitTreeChanged(
         _: *SplitTree,
-        old_tree: ?*const Surface.Tree,
-        new_tree: ?*const Surface.Tree,
+        old_tree: ?*const SplitTabs.Tree,
+        new_tree: ?*const SplitTabs.Tree,
         self: *Self,
     ) callconv(.c) void {
         if (old_tree) |tree| {
@@ -2060,6 +2031,30 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+    }
+
+    fn workspacePageSurfaceAdded(
+        _: *SplitTree,
+        surface: *Surface,
+        self: *Self,
+    ) callconv(.c) void {
+        self.connectSurfaceHandler(surface);
+    }
+
+    fn workspacePageSurfaceRemoved(
+        _: *SplitTree,
+        surface: *Surface,
+        self: *Self,
+    ) callconv(.c) void {
+        _ = gobject.signalHandlersDisconnectMatched(
+            surface.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
     }
 
     fn actionAbout(
@@ -2409,6 +2404,7 @@ pub const Window = extern struct {
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
             class.bindTemplateCallback("new_tab", &btnNewTab);
+            class.bindTemplateCallback("new_workspace", &btnNewWorkspace);
             class.bindTemplateCallback("toggle_sidebar", &btnToggleSidebar);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
