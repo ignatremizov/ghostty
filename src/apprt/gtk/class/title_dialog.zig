@@ -223,7 +223,7 @@ pub const Target = enum(c_int) {
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .surface => i18n._("Change Terminal Title"),
-            .tab => i18n._("Change Tab Title"),
+            .tab => i18n._("Change Workspace Title"),
         };
     }
 

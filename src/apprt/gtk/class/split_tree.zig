@@ -940,6 +940,14 @@ pub const SplitTree = extern struct {
             );
             defer built.deinit();
             priv.tree_bin.setChild(built.widget);
+
+            // Rebuilding the widget hierarchy reparents live surface widgets.
+            // Force every surface to repaint once attached so newly split panes
+            // don't sit blank until an unrelated event triggers a redraw.
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                entry.view.redraw();
+            }
         }
 
         // Replacing our tree widget hierarchy can reset focus state.

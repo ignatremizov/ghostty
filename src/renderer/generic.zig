@@ -152,7 +152,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -1496,33 +1495,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // thread delivers the new terminal state/cell buffers, we can show a single-frame
             // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
             // last completed frame and let the normal render loop catch up on the next tick.
-            if (sync and size_changed and self.has_presented.load(.monotonic)) {
+            //
+            // We must not do this for runtimes that require all drawing from the app thread
+            // (GTK/GLArea). Those runtimes only ever reach us through `drawFrame(true)`, so
+            // replaying the previous target here would prevent `self.size.screen` from ever
+            // advancing to the new surface size and can leave stale framebuffers visible after
+            // resizes and split changes.
+            if (sync and
+                size_changed and
+                self.has_presented.load(.monotonic) and
+                !(if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
+                    apprt.App.must_draw_from_app_thread
+                else
+                    false))
+            {
                 try self.api.presentLastTarget();
                 return;
-            }
-
-            // During resize/layout transitions, the platform can trigger draws before the IO
-            // thread has delivered the corresponding terminal resize (and thus before updateFrame
-            // has rebuilt GPU cell buffers for the new grid). If we draw in that window we can
-            // render nothing but background (visually blank) because the projection/padding math
-            // uses a stale `cells.size` that doesn't match the new screen size.
-            //
-            // Detect this by computing the expected grid for the current surface size and
-            // comparing it to the currently rebuilt cell buffer grid. If they don't match, keep
-            // the last presented frame on-screen until the new cells arrive.
-            if (size_changed) {
-                const expected_grid = (renderer.Size{
-                    .screen = .{ .width = surface_size.width, .height = surface_size.height },
-                    .cell = self.size.cell,
-                    .padding = self.size.padding,
-                }).grid();
-
-                if (expected_grid.columns != self.cells.size.columns or
-                    expected_grid.rows != self.cells.size.rows)
-                {
-                    try self.api.presentLastTarget();
-                    return;
-                }
             }
 
             // Conditions under which we need to draw the frame, otherwise we
@@ -1540,6 +1528,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.api.presentLastTarget();
                 return;
             }
+
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.
@@ -1966,6 +1955,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // And indicate that our swap chain targets need to
                 // be re-created to account for the new blending mode.
                 self.target_config_modified +%= 1;
+            }
+
+            if (@hasField(GraphicsAPI, "background")) {
+                self.api.background = config.background;
+            }
+            if (@hasField(GraphicsAPI, "background_opacity")) {
+                self.api.background_opacity = config.background_opacity;
             }
 
             if (custom_shaders_changed) {

@@ -10,6 +10,7 @@ const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
+const terminal = @import("../terminal/main.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 
 pub const GraphicsAPI = OpenGL;
@@ -42,6 +43,11 @@ alloc: std.mem.Allocator,
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
+/// Terminal background color used when replaying an older frame onto a larger
+/// default framebuffer during live resize.
+background: terminal.color.RGB,
+background_opacity: f64,
+
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
@@ -52,6 +58,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
     return .{
         .alloc = alloc,
         .blending = opts.config.blending,
+        .background = opts.config.background,
+        .background_opacity = opts.config.background_opacity,
     };
 }
 
@@ -301,6 +309,7 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 /// Present the provided target.
 pub fn present(self: *OpenGL, target: Target) !void {
     // In order to present a target we blit it to the default framebuffer.
+    const surface = try self.surfaceSize();
 
     // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise the
     // values may be linearized as they're copied, but even though the draw
@@ -315,16 +324,42 @@ pub fn present(self: *OpenGL, target: Target) !void {
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();
 
-    // Blit
+    // If the default framebuffer is larger than our target, clear the exposed
+    // area to the configured terminal background before replaying the old
+    // frame. This preserves Ghostty's live-resize behavior without stretching
+    // the previous frame to fill the new surface size.
+    gl.clearColor(
+        @as(f32, @floatFromInt(self.background.r)) / 255.0,
+        @as(f32, @floatFromInt(self.background.g)) / 255.0,
+        @as(f32, @floatFromInt(self.background.b)) / 255.0,
+        @floatCast(self.background_opacity),
+    );
+    gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+
+    const blit_width = @min(target.width, surface.width);
+    const blit_height = @min(target.height, surface.height);
+    const src_y0: usize = target.height - blit_height;
+    const src_y1: usize = target.height;
+    const dst_y0: usize = surface.height - blit_height;
+    const dst_y1: usize = surface.height;
+
+    // Blit without scaling. During live resize we want to preserve the old
+    // frame at its previous pixel size and let newly exposed regions show the
+    // terminal background, rather than stretching or shrinking stale content.
+    //
+    // Keep the replay top-aligned in Y. Terminal content is visually anchored
+    // to the top edge, so during vertical resizes we want newly exposed or
+    // clipped area to occur at the bottom, matching Ghostty's normal row
+    // growth/shrink behavior.
     gl.glad.context.BlitFramebuffer.?(
         0,
+        @intCast(src_y0),
+        @intCast(blit_width),
+        @intCast(src_y1),
         0,
-        @intCast(target.width),
-        @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
+        @intCast(dst_y0),
+        @intCast(blit_width),
+        @intCast(dst_y1),
         gl.c.GL_COLOR_BUFFER_BIT,
         gl.c.GL_NEAREST,
     );

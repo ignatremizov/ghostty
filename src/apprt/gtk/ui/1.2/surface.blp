@@ -326,21 +326,21 @@ menu context_menu_model {
     }
 
     submenu {
-      label: _("Tab");
+      label: _("Workspace");
 
       item {
-        label: _("Change Tab Title…");
-        action: "tab.prompt-tab-title";
+        label: _("Change Workspace Title…");
+        action: "workspace.prompt-tab-title";
       }
 
       item {
-        label: _("New Tab");
+        label: _("New Workspace");
         action: "win.new-tab";
       }
 
       item {
-        label: _("Close Tab");
-        action: "tab.close";
+        label: _("Close Workspace");
+        action: "workspace.close";
         target: "this";
       }
     }
