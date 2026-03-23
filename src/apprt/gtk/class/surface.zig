@@ -873,8 +873,11 @@ pub const Surface = extern struct {
     pub fn setSplitBinding(self: *Self, binding: ?*gobject.Binding) void {
         const priv = self.private();
         if (priv.split_binding) |old| {
+            // Mirror the other binding holders in the GTK runtime: dropping our
+            // reference is enough, and avoids calling unbind() during teardown
+            // after GTK has already started dismantling the binding graph.
             priv.split_binding = null;
-            old.unbind();
+            old.as(gobject.Object).unref();
         }
         priv.split_binding = binding;
     }

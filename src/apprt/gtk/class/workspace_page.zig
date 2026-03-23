@@ -14,6 +14,7 @@ const Common = @import("../class.zig").Common;
 const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const SplitTabs = @import("split_tabs.zig").SplitTabs;
 const Surface = @import("surface.zig").Surface;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 
@@ -89,11 +90,11 @@ pub const WorkspacePage = extern struct {
             const impl = gobject.ext.defineProperty(
                 name,
                 Self,
-                ?*Surface.Tree,
+                ?*SplitTabs.Tree,
                 .{
                     .accessor = gobject.ext.typedAccessor(
                         Self,
-                        ?*Surface.Tree,
+                        ?*SplitTabs.Tree,
                         .{
                             .getter = getSurfaceTree,
                         },
@@ -306,7 +307,7 @@ pub const WorkspacePage = extern struct {
     }
 
     /// Get the surface tree of this workspace page.
-    pub fn getSurfaceTree(self: *Self) ?*Surface.Tree {
+    pub fn getSurfaceTree(self: *Self) ?*SplitTabs.Tree {
         const priv = self.private();
         return priv.split_tree.getTree();
     }
@@ -322,6 +323,12 @@ pub const WorkspacePage = extern struct {
     pub fn getNeedsConfirmQuit(self: *Self) bool {
         const tree = self.getSplitTree();
         return tree.getNeedsConfirmQuit();
+    }
+
+    pub fn newTab(self: *Self, parent_: ?*Surface) void {
+        self.getSplitTree().newTab(parent_, .none) catch |err| switch (err) {
+            error.OutOfMemory => @panic("oom"),
+        };
     }
 
     /// Get the top-level page view holding this workspace page, if any.
@@ -390,7 +397,7 @@ pub const WorkspacePage = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"surface-tree".impl.param_spec);
 
         // If our tree is empty we close the workspace page.
-        const tree: *const Surface.Tree = self.getSurfaceTree() orelse &.empty;
+        const tree: *const SplitTabs.Tree = self.getSurfaceTree() orelse &.empty;
         if (tree.isEmpty()) {
             signals.@"close-request".impl.emit(
                 self,

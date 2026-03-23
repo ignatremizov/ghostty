@@ -1,0 +1,21 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $GhosttySplitTabs: Box {
+  orientation: vertical;
+  hexpand: true;
+  vexpand: true;
+
+  Adw.TabBar tab_bar {
+    autohide: true;
+    expand-tabs: true;
+    view: tab_view;
+  }
+
+  Adw.TabView tab_view {
+    notify::selected-page => $notify_selected_page();
+    close-page => $close_page();
+    page-detached => $page_detached();
+    shortcuts: none;
+  }
+}

@@ -38,7 +38,9 @@ const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
+const SplitTabs = @import("split_tabs.zig").SplitTabs;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const Tab = @import("tab.zig").Tab;
 const Window = @import("window.zig").Window;
 const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
@@ -1973,11 +1975,14 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                return surface.as(gtk.Widget).activateAction(
-                    "workspace.close",
-                    glib.ext.VariantType.stringFor([:0]const u8),
-                    @as([*:0]const u8, @tagName(value)),
-                ) != 0;
+                const split_tabs = ext.getAncestor(
+                    SplitTabs,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in split-local tabs, ignoring close_tab", .{});
+                    return false;
+                };
+                return split_tabs.closeSurface(surface, value);
             },
         }
     }
@@ -2106,15 +2111,15 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
+                const split_tabs = ext.getAncestor(
+                    SplitTabs,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    log.warn("surface is not in split-local tabs, ignoring goto_tab", .{});
                     return false;
                 };
 
-                return window.selectTab(switch (tab) {
+                return split_tabs.selectTab(switch (tab) {
                     .previous => .previous,
                     .next => .next,
                     .last => .last,
@@ -2247,15 +2252,15 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
+                const split_tabs = ext.getAncestor(
+                    SplitTabs,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    log.warn("surface is not in split-local tabs, ignoring move_tab", .{});
                     return false;
                 };
 
-                return window.moveTab(
+                return split_tabs.moveSurface(
                     surface,
                     @intCast(value.amount),
                 );
@@ -2512,14 +2517,14 @@ const Action = struct {
                     .app => return false,
                     .surface => |v| {
                         const surface = v.rt_surface.surface;
-                        const workspace_page = ext.getAncestor(
-                            WorkspacePage,
+                        const tab = ext.getAncestor(
+                            Tab,
                             surface.as(gtk.Widget),
                         ) orelse {
-                            log.warn("surface is not in a workspace page, ignoring prompt_tab_title", .{});
+                            log.warn("surface is not in a split-local tab, ignoring prompt_tab_title", .{});
                             return false;
                         };
-                        workspace_page.promptWorkspaceTitle();
+                        tab.promptTitle();
                         return true;
                     },
                 }
@@ -2682,14 +2687,14 @@ const Action = struct {
             },
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const workspace_page = ext.getAncestor(
-                    WorkspacePage,
+                const tab = ext.getAncestor(
+                    Tab,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a workspace page, ignoring set_tab_title", .{});
+                    log.warn("surface is not in a split-local tab, ignoring set_tab_title", .{});
                     return false;
                 };
-                workspace_page.setTitleOverride(if (value.title.len == 0) null else value.title);
+                tab.setTitleOverride(if (value.title.len == 0) null else value.title);
                 return true;
             },
         }

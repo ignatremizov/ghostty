@@ -54,7 +54,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         Adw.SplitButton {
           clicked => $new_tab();
           icon-name: "tab-new-symbolic";
-          tooltip-text: _("New Workspace");
+          tooltip-text: _("New Tab");
           dropdown-tooltip: _("New Split");
           menu-model: split_menu;
           can-focus: false;
@@ -104,7 +104,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
             clicked => $new_tab();
             icon-name: "tab-new-symbolic";
-            tooltip-text: _("New Workspace");
+            tooltip-text: _("New Tab");
             dropdown-tooltip: _("New Split");
             menu-model: split_menu;
             can-focus: false;
@@ -150,10 +150,6 @@ template $GhosttyWindow: Adw.ApplicationWindow {
       Box {
         orientation: vertical;
 
-        $GhosttyDebugWarning {
-          visible: bind template.debug;
-        }
-
         Paned workspace_split_view {
           orientation: horizontal;
           position: 280;
@@ -190,6 +186,21 @@ template $GhosttyWindow: Adw.ApplicationWindow {
                   ]
 
                   row-selected => $workspace_row_selected();
+                }
+              }
+
+              Gtk.Box {
+                margin-top: 8;
+                margin-bottom: 12;
+                margin-start: 12;
+                margin-end: 12;
+
+                Gtk.Button {
+                  clicked => $new_workspace();
+                  icon-name: "list-add-symbolic";
+                  label: _("New Workspace");
+                  halign: fill;
+                  hexpand: true;
                 }
               }
             }
