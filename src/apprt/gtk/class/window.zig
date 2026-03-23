@@ -25,7 +25,7 @@ const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
-const Tab = @import("tab.zig").Tab;
+const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -228,8 +228,8 @@ pub const Window = extern struct {
         /// config on a per-window basis.
         window_decoration: ?configpkg.WindowDecoration = null,
 
-        /// Binding group for our active tab.
-        tab_bindings: *gobject.BindingGroup,
+        /// Binding group for our active workspace page.
+        workspace_page_bindings: *gobject.BindingGroup,
 
         /// The configuration that this surface is using.
         config: ?*Config = null,
@@ -255,7 +255,7 @@ pub const Window = extern struct {
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
-        /// Tab page that the context menu was opened for.
+        /// Workspace page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
 
@@ -265,6 +265,10 @@ pub const Window = extern struct {
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
+        workspace_split_view: *gtk.Paned,
+        workspace_sidebar: *gtk.Box,
+        workspace_list: *gtk.ListBox,
+        workspace_sidebar_position: c_int = 280,
 
         pub var offset: c_int = 0;
     };
@@ -316,10 +320,10 @@ pub const Window = extern struct {
             self.as(gtk.Widget).addCssClass("devel");
         }
 
-        // Setup our tab binding group. This ensures certain properties
-        // are only synced from the currently active tab.
-        priv.tab_bindings = gobject.BindingGroup.new();
-        priv.tab_bindings.bind("title", self.as(gobject.Object), "title", .{});
+        // Setup our workspace-page binding group. This ensures certain
+        // properties are only synced from the currently active page.
+        priv.workspace_page_bindings = gobject.BindingGroup.new();
+        priv.workspace_page_bindings.bind("title", self.as(gobject.Object), "title", .{});
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -327,6 +331,15 @@ pub const Window = extern struct {
 
         // Initialize our actions
         self.initActionMap();
+
+        priv.workspace_list.setSelectionMode(.browse);
+        priv.workspace_list.bindModel(
+            priv.tab_view.getPages().as(gio.ListModel),
+            workspaceListCreateWidget,
+            self,
+            null,
+        );
+        self.syncWorkspaceListSelection();
 
         // Start states based on config.
         if (config.maximize) self.as(gtk.Window).maximize();
@@ -387,11 +400,37 @@ pub const Window = extern struct {
         return &self.private().winproto;
     }
 
-    /// Create a new tab with the given parent. The tab will be inserted
-    /// at the position dictated by the `window-new-tab-position` config.
-    /// The new tab will be selected.
+    /// Create a new workspace page with the given parent. The page will be
+    /// inserted at the position dictated by the `window-new-tab-position`
+    /// config. The new page will be selected.
+    pub fn newWorkspace(self: *Self, parent_: ?*CoreSurface) void {
+        _ = self.newWorkspacePage(parent_, .tab, .none);
+    }
+
     pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
-        _ = self.newTabPage(parent_, .tab, .none);
+        self.newWorkspace(parent_);
+    }
+
+    pub fn newWorkspaceForWindow(
+        self: *Self,
+        parent_: ?*CoreSurface,
+        overrides: struct {
+            command: ?configpkg.Command = null,
+            working_directory: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+
+            pub const none: @This() = .{};
+        },
+    ) void {
+        _ = self.newWorkspacePage(
+            parent_,
+            .window,
+            .{
+                .command = overrides.command,
+                .working_directory = overrides.working_directory,
+                .title = overrides.title,
+            },
+        );
     }
 
     pub fn newTabForWindow(
@@ -405,18 +444,14 @@ pub const Window = extern struct {
             pub const none: @This() = .{};
         },
     ) void {
-        _ = self.newTabPage(
-            parent_,
-            .window,
-            .{
-                .command = overrides.command,
-                .working_directory = overrides.working_directory,
-                .title = overrides.title,
-            },
-        );
+        self.newWorkspaceForWindow(parent_, .{
+            .command = overrides.command,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        });
     }
 
-    fn newTabPage(
+    fn newWorkspacePage(
         self: *Self,
         parent_: ?*CoreSurface,
         context: apprt.surface.NewSurfaceContext,
@@ -433,9 +468,9 @@ pub const Window = extern struct {
         const priv: *Private = self.private();
         const tab_view = priv.tab_view;
 
-        // Create our new tab object
-        const tab = if (overrides.initial_surface)
-            Tab.new(
+        // Create our new workspace page object.
+        const workspace_page = if (overrides.initial_surface)
+            WorkspacePage.new(
                 priv.config,
                 .{
                     .command = overrides.command,
@@ -444,21 +479,21 @@ pub const Window = extern struct {
                 },
             )
         else
-            Tab.newEmpty(priv.config);
+            WorkspacePage.newEmpty(priv.config);
 
         if (parent_) |p| {
             // For a new window's first tab, inherit the parent's initial size hints.
             if (context == .window) {
                 surfaceInit(p.rt_surface.gobj(), self);
             }
-            tab.setParentWithContext(p, context);
+            workspace_page.setParentWithContext(p, context);
         }
 
         // Get the position that we should insert the new tab at.
         const config = if (priv.config) |v| v.get() else {
             // If we don't have a config we just append it at the end.
             // This should never happen.
-            return tab_view.append(tab.as(gtk.Widget));
+            return tab_view.append(workspace_page.as(gtk.Widget));
         };
         const position = overrides.position_override orelse switch (config.@"window-new-tab-position") {
             .current => current: {
@@ -472,17 +507,17 @@ pub const Window = extern struct {
         };
 
         // Add the page and select it
-        const page = tab_view.insert(tab.as(gtk.Widget), position);
+        const page = tab_view.insert(workspace_page.as(gtk.Widget), position);
         tab_view.setSelectedPage(page);
 
         // Create some property bindings
-        _ = tab.as(gobject.Object).bindProperty(
+        _ = workspace_page.as(gobject.Object).bindProperty(
             "title",
             page.as(gobject.Object),
             "title",
             .{ .sync_create = true },
         );
-        _ = tab.as(gobject.Object).bindProperty(
+        _ = workspace_page.as(gobject.Object).bindProperty(
             "tooltip",
             page.as(gobject.Object),
             "tooltip",
@@ -490,18 +525,18 @@ pub const Window = extern struct {
         );
 
         // Bind signals
-        const split_tree = tab.getSplitTree();
+        const split_tree = workspace_page.getSplitTree();
         _ = SplitTree.signals.changed.connect(
             split_tree,
             *Self,
-            tabSplitTreeChanged,
+            workspacePageSplitTreeChanged,
             self,
             .{},
         );
 
         // Run an initial notification for the surface tree so we can setup
         // initial state.
-        tabSplitTreeChanged(
+        workspacePageSplitTreeChanged(
             split_tree,
             null,
             split_tree.getTree(),
@@ -524,7 +559,7 @@ pub const Window = extern struct {
         const priv = self.private();
         const tab_view = priv.tab_view;
 
-        // Get our current tab numeric position
+        // Get our current workspace-page numeric position.
         const selected = tab_view.getSelectedPage() orelse return false;
         const current = tab_view.getPagePosition(selected);
 
@@ -583,13 +618,13 @@ pub const Window = extern struct {
         if (total == 1) return false;
 
         // Get the tab that contains the given surface.
-        const tab = ext.getAncestor(
-            Tab,
+        const workspace_page = ext.getAncestor(
+            WorkspacePage,
             surface.as(gtk.Widget),
         ) orelse return false;
 
-        // Get the page position that contains the tab.
-        const page = tab_view.getPage(tab.as(gtk.Widget));
+        // Get the page position that contains the workspace page.
+        const page = tab_view.getPage(workspace_page.as(gtk.Widget));
         const pos = tab_view.getPagePosition(page);
 
         // Move it
@@ -609,19 +644,19 @@ pub const Window = extern struct {
         return tab_view.reorderPage(page, desired_pos) != 0;
     }
 
-    fn newEmptyTabPage(
+    fn newEmptyWorkspacePage(
         self: *Self,
         position: c_int,
     ) *adw.TabPage {
-        return self.newTabPage(null, .tab, .{
+        return self.newWorkspacePage(null, .tab, .{
             .initial_surface = false,
             .position_override = position,
         });
     }
 
-    /// Move the given surface into another tab, merging it as a split in the
-    /// destination tab.
-    pub fn moveSurfaceToTab(
+    /// Move the given surface into another workspace page, merging it as a
+    /// split in the destination page.
+    pub fn moveSurfaceToWorkspace(
         self: *Self,
         surface: *Surface,
         target: SelectTab,
@@ -629,11 +664,11 @@ pub const Window = extern struct {
         const priv = self.private();
         const tab_view = priv.tab_view;
 
-        const source_tab = ext.getAncestor(
-            Tab,
+        const source_workspace_page = ext.getAncestor(
+            WorkspacePage,
             surface.as(gtk.Widget),
         ) orelse return false;
-        const source_page = tab_view.getPage(source_tab.as(gtk.Widget));
+        const source_page = tab_view.getPage(source_workspace_page.as(gtk.Widget));
         const total = tab_view.getNPages();
         const current = tab_view.getPagePosition(source_page);
 
@@ -641,7 +676,7 @@ pub const Window = extern struct {
         const destination_pos: c_int = switch (target) {
             .previous => previous: {
                 if (total <= 1) {
-                    self.addToast(i18n._("No other tab to move the pane into"));
+                    self.addToast(i18n._("No other workspace to move the pane into"));
                     return false;
                 }
                 break :previous if (current > 0)
@@ -652,7 +687,7 @@ pub const Window = extern struct {
 
             .next => next: {
                 if (total <= 1) {
-                    self.addToast(i18n._("No other tab to move the pane into"));
+                    self.addToast(i18n._("No other workspace to move the pane into"));
                     return false;
                 }
                 break :next if (current < total - 1)
@@ -671,11 +706,11 @@ pub const Window = extern struct {
 
             .n => |v| n: {
                 if (v == 0) {
-                    self.addToast(i18n._("Invalid tab index"));
+                    self.addToast(i18n._("Invalid workspace index"));
                     return false;
                 }
                 const n_int = std.math.cast(c_int, v) orelse {
-                    self.addToast(i18n._("Invalid tab index"));
+                    self.addToast(i18n._("Invalid workspace index"));
                     return false;
                 };
                 if (n_int > total) {
@@ -686,37 +721,37 @@ pub const Window = extern struct {
             },
         };
         if (!create_destination and destination_pos == current) {
-            self.addToast(i18n._("Pane is already in that tab"));
+            self.addToast(i18n._("Pane is already in that workspace"));
             return false;
         }
 
         const destination_page = if (create_destination)
-            self.newEmptyTabPage(destination_pos)
+            self.newEmptyWorkspacePage(destination_pos)
         else
             tab_view.getNthPage(destination_pos);
-        const destination_tab = gobject.ext.cast(
-            Tab,
+        const destination_workspace_page = gobject.ext.cast(
+            WorkspacePage,
             destination_page.getChild(),
         ) orelse return false;
 
-        const source_tree = source_tab.getSplitTree();
-        const destination_tree = destination_tab.getSplitTree();
+        const source_tree = source_workspace_page.getSplitTree();
+        const destination_tree = destination_workspace_page.getSplitTree();
 
         _ = surface.ref();
         defer surface.unref();
 
         if (!source_tree.removeSurface(surface)) {
-            self.addToast(i18n._("Unable to move pane to that tab"));
+            self.addToast(i18n._("Unable to move pane to that workspace"));
             return false;
         }
 
         destination_tree.addExistingSurface(.right, surface) catch |err| {
-            log.warn("unable to move surface into destination tab: {}", .{err});
+            log.warn("unable to move surface into destination workspace: {}", .{err});
             source_tree.addExistingSurface(.right, surface) catch |restore_err| {
                 log.warn("unable to restore moved surface after failed move: {}", .{restore_err});
             };
             if (create_destination) tab_view.closePage(destination_page);
-            self.addToast(i18n._("Unable to move pane to that tab"));
+            self.addToast(i18n._("Unable to move pane to that workspace"));
             return false;
         };
 
@@ -724,16 +759,101 @@ pub const Window = extern struct {
             tab_view.closePage(source_page);
         }
 
-        tab_view.setSelectedPage(tab_view.getPage(destination_tab.as(gtk.Widget)));
+        tab_view.setSelectedPage(tab_view.getPage(destination_workspace_page.as(gtk.Widget)));
         surface.grabFocus();
         return true;
     }
 
-    pub fn toggleTabOverview(self: *Self) void {
+    pub fn moveSurfaceToTab(
+        self: *Self,
+        surface: *Surface,
+        target: SelectTab,
+    ) bool {
+        return self.moveSurfaceToWorkspace(surface, target);
+    }
+
+    pub fn toggleWorkspaceSidebar(self: *Self) void {
         const priv = self.private();
-        const tab_overview = priv.tab_overview;
-        const is_open = tab_overview.getOpen() != 0;
-        tab_overview.setOpen(@intFromBool(!is_open));
+        const split_view = priv.workspace_split_view;
+        if (split_view.getStartChild() != null) {
+            const pos = split_view.getPosition();
+            if (pos > 0) priv.workspace_sidebar_position = pos;
+            split_view.setStartChild(null);
+            return;
+        }
+
+        split_view.setStartChild(priv.workspace_sidebar.as(gtk.Widget));
+        split_view.setPosition(priv.workspace_sidebar_position);
+    }
+
+    pub fn toggleTabOverview(self: *Self) void {
+        self.toggleWorkspaceSidebar();
+    }
+
+    fn workspaceListCreateWidget(
+        item: *gobject.Object,
+        _: ?*anyopaque,
+    ) callconv(.c) *gtk.Widget {
+        const page = gobject.ext.cast(adw.TabPage, item) orelse @panic("expected tab page");
+
+        const row = gtk.ListBoxRow.new();
+        row.setActivatable(1);
+        row.setSelectable(1);
+
+        const box = gtk.Box.new(.horizontal, 0);
+        box.as(gtk.Widget).setMarginTop(6);
+        box.as(gtk.Widget).setMarginBottom(6);
+        box.as(gtk.Widget).setMarginStart(12);
+        box.as(gtk.Widget).setMarginEnd(12);
+
+        const label = gtk.Label.new(null);
+        label.setXalign(0);
+        label.as(gtk.Widget).setHexpand(1);
+
+        box.append(label.as(gtk.Widget));
+        row.setChild(box.as(gtk.Widget));
+
+        _ = page.as(gobject.Object).bindProperty(
+            "title",
+            label.as(gobject.Object),
+            "label",
+            .{ .sync_create = true },
+        );
+        _ = page.as(gobject.Object).bindProperty(
+            "tooltip",
+            row.as(gobject.Object),
+            "tooltip-text",
+            .{ .sync_create = true },
+        );
+
+        return row.as(gtk.Widget);
+    }
+
+    fn workspaceListRowSelected(
+        _: *gtk.ListBox,
+        row_: ?*gtk.ListBoxRow,
+        self: *Self,
+    ) callconv(.c) void {
+        const row = row_ orelse return;
+        const idx = row.getIndex();
+        if (idx < 0) return;
+
+        const priv = self.private();
+        const page = priv.tab_view.getNthPage(idx);
+        if (priv.tab_view.getSelectedPage() == page) return;
+        priv.tab_view.setSelectedPage(page);
+    }
+
+    fn syncWorkspaceListSelection(self: *Self) void {
+        const priv = self.private();
+        const page = priv.tab_view.getSelectedPage() orelse {
+            priv.workspace_list.unselectAll();
+            return;
+        };
+        const idx = priv.tab_view.getPagePosition(page);
+        const row = priv.workspace_list.getRowAtIndex(idx) orelse return;
+        if (priv.workspace_list.getSelectedRow() == row) return;
+        priv.workspace_list.selectRow(row);
     }
 
     /// Toggle the visible property.
@@ -1026,8 +1146,8 @@ pub const Window = extern struct {
     /// Get the currently active surface. See the "active-surface" property.
     /// This does not ref the value.
     pub fn getActiveSurface(self: *Self) ?*Surface {
-        const tab = self.getSelectedTab() orelse return null;
-        return tab.getActiveSurface();
+        const workspace_page = self.getSelectedWorkspacePage() orelse return null;
+        return workspace_page.getActiveSurface();
     }
 
     /// Returns the configuration for this window. The reference count
@@ -1080,13 +1200,13 @@ pub const Window = extern struct {
         self.syncAppearance();
     }
 
-    /// Get the currently selected tab as a Tab object.
-    fn getSelectedTab(self: *Self) ?*Tab {
+    /// Get the currently selected workspace page.
+    fn getSelectedWorkspacePage(self: *Self) ?*WorkspacePage {
         const priv = self.private();
         const page = priv.tab_view.getSelectedPage() orelse return null;
         const child = page.getChild();
-        assert(gobject.ext.isA(child, Tab));
-        return gobject.ext.cast(Tab, child);
+        assert(gobject.ext.isA(child, WorkspacePage));
+        return gobject.ext.cast(WorkspacePage, child);
     }
 
     /// Returns true if this window needs confirmation before quitting.
@@ -1098,11 +1218,11 @@ pub const Window = extern struct {
         for (0..@intCast(n)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
-            const tab = gobject.ext.cast(Tab, child) orelse {
-                log.warn("unexpected non-Tab child in tab view", .{});
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse {
+                log.warn("unexpected non-WorkspacePage child in workspace view", .{});
                 continue;
             };
-            if (tab.getNeedsConfirmQuit()) return true;
+            if (workspace_page.getNeedsConfirmQuit()) return true;
         }
 
         return false;
@@ -1140,12 +1260,9 @@ pub const Window = extern struct {
         }
 
         return switch (config.@"gtk-titlebar-style") {
-            // If the titlebar style is tabs never show the titlebar.
-            .tabs => false,
-
-            // If the titlebar style is native show the titlebar if configured
-            // to do so.
-            .native => config.@"gtk-titlebar",
+            // The top-level page selector now lives in the sidebar, so we no
+            // longer hide the header bar when the user prefers tab-style chrome.
+            .tabs, .native => config.@"gtk-titlebar",
         };
     }
 
@@ -1175,22 +1292,8 @@ pub const Window = extern struct {
         const priv = self.private();
         const config = if (priv.config) |v| v.get() else return true;
 
-        switch (config.@"gtk-titlebar-style") {
-            .tabs => {
-                // *Conditionally* disable the tab bar when maximized, the titlebar
-                // style is tabs, and gtk-titlebar-hide-when-maximized is set.
-                if (self.isMaximized() and config.@"gtk-titlebar-hide-when-maximized") return false;
-
-                // If the titlebar style is tabs the tab bar must always be visible.
-                return true;
-            },
-            .native => {
-                return switch (config.@"window-show-tab-bar") {
-                    .always, .auto => true,
-                    .never => false,
-                };
-            },
-        }
+        _ = config;
+        return false;
     }
 
     fn getTabsWide(self: *Self) bool {
@@ -1428,7 +1531,7 @@ pub const Window = extern struct {
             priv.config = null;
         }
 
-        priv.tab_bindings.setSource(null);
+        priv.workspace_page_bindings.setSource(null);
 
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
@@ -1443,7 +1546,7 @@ pub const Window = extern struct {
 
     fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
-        priv.tab_bindings.unref();
+        priv.workspace_page_bindings.unref();
         priv.winproto.deinit();
 
         gobject.Object.virtual_methods.finalize.call(
@@ -1530,11 +1633,15 @@ pub const Window = extern struct {
         self.performBindingAction(.new_tab);
     }
 
+    fn btnToggleSidebar(_: *gtk.Button, self: *Self) callconv(.c) void {
+        self.toggleWorkspaceSidebar();
+    }
+
     fn tabOverviewCreateTab(
         _: *adw.TabOverview,
         self: *Self,
     ) callconv(.c) *adw.TabPage {
-        return self.newTabPage(if (self.getActiveSurface()) |v| v.core() else null, .tab, .none);
+        return self.newWorkspacePage(if (self.getActiveSurface()) |v| v.core() else null, .tab, .none);
     }
 
     fn tabOverviewOpen(
@@ -1550,7 +1657,7 @@ pub const Window = extern struct {
         // can put a runtime version check here to avoid this workaround.
         //
         // Our workaround is to start a timer after 500ms to refocus
-        // the currently selected tab. We choose 500ms because the adw
+        // the currently selected workspace page. We choose 500ms because the adw
         // animation is 400ms.
         //
         // [1]: https://gitlab.gnome.org/GNOME/libadwaita/-/issues/670
@@ -1578,7 +1685,7 @@ pub const Window = extern struct {
         self.private().tab_overview_focus_timer = null;
 
         // Get our currently active surface which should respect the newly
-        // selected tab. Grab focus.
+        // selected workspace page. Grab focus.
         const surface = self.getActiveSurface() orelse return 0;
         surface.grabFocus();
 
@@ -1652,12 +1759,12 @@ pub const Window = extern struct {
     ) callconv(.c) c_int {
         const priv = self.private();
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse
             return @intFromBool(false);
 
-        // If the tab says it doesn't need confirmation then we go ahead
+        // If the workspace page says it doesn't need confirmation then we go ahead
         // and close immediately.
-        if (!tab.getNeedsConfirmQuit()) {
+        if (!workspace_page.getNeedsConfirmQuit()) {
             priv.tab_view.closePageFinish(page, @intFromBool(true));
             return @intFromBool(true);
         }
@@ -1692,16 +1799,17 @@ pub const Window = extern struct {
         const priv = self.private();
 
         // Always reset our binding source in case we have no pages.
-        priv.tab_bindings.setSource(null);
+        priv.workspace_page_bindings.setSource(null);
 
-        // Get our current page which MUST be a Tab object.
+        // Get our current page which MUST be a WorkspacePage object.
         const page = priv.tab_view.getSelectedPage() orelse return;
         const child = page.getChild();
-        assert(gobject.ext.isA(child, Tab));
+        assert(gobject.ext.isA(child, WorkspacePage));
 
         // Setup our binding group. This ensures things like the title
-        // are synced from the active tab.
-        priv.tab_bindings.setSource(child.as(gobject.Object));
+        // are synced from the active workspace page.
+        priv.workspace_page_bindings.setSource(child.as(gobject.Object));
+        self.syncWorkspaceListSelection();
 
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
@@ -1714,15 +1822,15 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
-        // Get the attached page which must be a Tab object.
+        // Get the attached page which must be a WorkspacePage object.
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
 
-        // Attach listeners for the tab.
-        _ = Tab.signals.@"close-request".connect(
-            tab,
+        // Attach listeners for the workspace page.
+        _ = WorkspacePage.signals.@"close-request".connect(
+            workspace_page,
             *Self,
-            tabCloseRequest,
+            workspacePageCloseRequest,
             self,
             .{},
         );
@@ -1746,7 +1854,7 @@ pub const Window = extern struct {
         // behavior is consistent with macOS and the previous GTK apprt,
         // but that behavior was all implicit and not documented, so here
         // I am.
-        if (tab.getSurfaceTree()) |tree| {
+        if (workspace_page.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
     }
@@ -1757,11 +1865,11 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
-        // We need to get the tab to disconnect the signals.
+        // We need to get the workspace page to disconnect the signals.
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
         _ = gobject.signalHandlersDisconnectMatched(
-            tab.as(gobject.Object),
+            workspace_page.as(gobject.Object),
             .{ .data = true },
             0,
             0,
@@ -1771,7 +1879,7 @@ pub const Window = extern struct {
         );
 
         // Remove the tree handlers
-        if (tab.getSurfaceTree()) |tree| {
+        if (workspace_page.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
         }
     }
@@ -1795,12 +1903,12 @@ pub const Window = extern struct {
         return win.private().tab_view;
     }
 
-    fn tabCloseRequest(
-        tab: *Tab,
+    fn workspacePageCloseRequest(
+        workspace_page: *WorkspacePage,
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
-        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
+        const page = priv.tab_view.getPage(workspace_page.as(gtk.Widget));
         // TODO: connect close page handler to tab to check for confirmation
         priv.tab_view.closePage(page);
     }
@@ -1887,18 +1995,18 @@ pub const Window = extern struct {
         }
 
         // Get the tab for this surface.
-        const tab = ext.getAncestor(
-            Tab,
+        const workspace_page = ext.getAncestor(
+            WorkspacePage,
             surface.as(gtk.Widget),
         ) orelse {
             log.warn("present request surface not found", .{});
             return;
         };
 
-        // Get the page that contains this tab
+        // Get the page that contains this workspace page.
         const priv = self.private();
         const tab_view = priv.tab_view;
-        const page = tab_view.getPage(tab.as(gtk.Widget));
+        const page = tab_view.getPage(workspace_page.as(gtk.Widget));
         tab_view.setSelectedPage(page);
 
         // Grab focus
@@ -1961,7 +2069,7 @@ pub const Window = extern struct {
         }
     }
 
-    fn tabSplitTreeChanged(
+    fn workspacePageSplitTreeChanged(
         _: *SplitTree,
         old_tree: ?*const Surface.Tree,
         new_tree: ?*const Surface.Tree,
@@ -2081,8 +2189,8 @@ pub const Window = extern struct {
         const priv = self.private();
         const page = priv.context_menu_page orelse return;
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
-        tab.promptTabTitle();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        workspace_page.promptWorkspaceTitle();
     }
 
     fn actionPromptSurfaceTitle(
@@ -2286,7 +2394,7 @@ pub const Window = extern struct {
             gobject.ext.ensureType(DebugWarning);
             gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
-            gobject.ext.ensureType(Tab);
+            gobject.ext.ensureType(WorkspacePage);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -2316,10 +2424,14 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_view", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
+            class.bindTemplateChildPrivate("workspace_split_view", .{});
+            class.bindTemplateChildPrivate("workspace_sidebar", .{});
+            class.bindTemplateChildPrivate("workspace_list", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
             class.bindTemplateCallback("new_tab", &btnNewTab);
+            class.bindTemplateCallback("toggle_sidebar", &btnToggleSidebar);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
             class.bindTemplateCallback("close_request", &windowCloseRequest);
@@ -2330,6 +2442,7 @@ pub const Window = extern struct {
             class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
             class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
             class.bindTemplateCallback("notify_selected_page", &tabViewSelectedPage);
+            class.bindTemplateCallback("workspace_row_selected", &workspaceListRowSelected);
             class.bindTemplateCallback("notify_config", &propConfig);
             class.bindTemplateCallback("notify_fullscreened", &propFullscreened);
             class.bindTemplateCallback("notify_is_active", &propIsActive);

@@ -705,6 +705,17 @@ pub const Surface = extern struct {
         vadj: ?*gtk.Adjustment = null,
         hscroll_policy: gtk.ScrollablePolicy = .natural,
         vscroll_policy: gtk.ScrollablePolicy = .natural,
+
+        /// Pending idle focus source. This is tracked so disposal can cancel
+        /// it before GTK starts tearing down widget-owned state.
+        idle_focus_source: ?c_uint = null,
+
+        /// Tick callback used to continuously request redraws while an
+        /// interactive resize is in progress.
+        resize_tick_callback_id: c_uint = 0,
+        resize_tick_last_ms: i64 = 0,
+
+        disposing: bool = false,
         vadj_signal_group: ?*gobject.SignalGroup = null,
 
         // Key state tracking for key sequences and tables
@@ -823,14 +834,47 @@ pub const Surface = extern struct {
     /// then we should force a redraw.
     pub fn redraw(self: *Self) void {
         const priv = self.private();
+        if (priv.disposing) return;
+        priv.gl_area.as(gtk.Widget).queueDraw();
+        self.as(gtk.Widget).queueDraw();
         priv.gl_area.queueRender();
+    }
+
+    fn resizeTickSchedule(self: *Self) void {
+        const priv = self.private();
+        priv.resize_tick_last_ms = std.time.milliTimestamp();
+        if (priv.resize_tick_callback_id != 0) return;
+
+        priv.resize_tick_callback_id = self.as(gtk.Widget).addTickCallback(
+            resizeTickCallback,
+            null,
+            null,
+        );
+    }
+
+    fn resizeTickCallback(
+        widget: *gtk.Widget,
+        _: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+
+        const now = std.time.milliTimestamp();
+        if (now - priv.resize_tick_last_ms > 120) {
+            priv.resize_tick_callback_id = 0;
+            return 0;
+        }
+
+        self.redraw();
+        return 1;
     }
 
     pub fn setSplitBinding(self: *Self, binding: ?*gobject.Binding) void {
         const priv = self.private();
         if (priv.split_binding) |old| {
-            old.as(gobject.Object).unref();
             priv.split_binding = null;
+            old.unbind();
         }
         priv.split_binding = binding;
     }
@@ -1868,6 +1912,7 @@ pub const Surface = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.disposing = true;
 
         if (priv.config) |v| {
             v.unref();
@@ -1902,10 +1947,16 @@ pub const Surface = extern struct {
             priv.progress_bar_timer = null;
         }
 
-        if (priv.split_binding) |binding| {
-            binding.as(gobject.Object).unref();
-            priv.split_binding = null;
+        if (priv.resize_tick_callback_id != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.resize_tick_callback_id);
+            priv.resize_tick_callback_id = 0;
         }
+
+        // split_binding is cleared structurally when the surface leaves a split
+        // tree via setSplitBinding(null). By dispose time the binding may
+        // already be invalid or finalized by GTK teardown, so don't touch it
+        // here.
+        priv.split_binding = null;
 
         if (priv.idle_rechild) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -1919,6 +1970,13 @@ pub const Surface = extern struct {
                 log.warn("unable to remove pending horizontal scroll reset source", .{});
             }
             priv.pending_horizontal_scroll_reset = null;
+        }
+
+        if (priv.idle_focus_source) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove idle focus source", .{});
+            }
+            priv.idle_focus_source = null;
         }
 
         // This works around a GTK double-free bug where if you bind
@@ -2777,7 +2835,7 @@ pub const Surface = extern struct {
         const ctx = priv.im_context.as(gtk.IMContext);
         if (focused) ctx.focusIn() else ctx.focusOut();
 
-        _ = glib.idleAddOnce(idleFocus, self.ref());
+        self.scheduleIdleFocus();
         self.as(gobject.Object).notifyByPspec(properties.focused.impl.param_spec);
 
         // Bell stops ringing as soon as we gain focus
@@ -2789,16 +2847,34 @@ pub const Surface = extern struct {
     /// confirmation dialogs) that can trigger focus loss and cause a deadlock
     /// because the lock may be held during the callback.
     ///
-    /// Userdata should be a `*Surface`. This will unref once.
-    fn idleFocus(ud: ?*anyopaque) callconv(.c) void {
-        const self: *Self = @ptrCast(@alignCast(ud orelse return));
-        defer self.unref();
+    fn scheduleIdleFocus(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+
+        if (priv.idle_focus_source) |source| {
+            if (glib.Source.remove(source) == 0) {
+                log.warn("unable to replace idle focus source", .{});
+            }
+            priv.idle_focus_source = null;
+        }
+
+        priv.idle_focus_source = glib.idleAdd(idleFocus, self);
+    }
+
+    /// Userdata should be a `*Surface`.
+    fn idleFocus(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
 
         const priv = self.private();
-        const surface = priv.core_surface orelse return;
+        priv.idle_focus_source = null;
+        if (priv.disposing) return 0;
+
+        const surface = priv.core_surface orelse return 0;
         surface.focusCallback(priv.focused) catch |err| {
             log.warn("error in focus callback err={}", .{err});
         };
+
+        return 0;
     }
 
     fn gcMouseDown(
@@ -3308,6 +3384,10 @@ pub const Surface = extern struct {
 
         // Notify our core surface
         const priv = self.private();
+        if (priv.resize_tick_callback_id != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.resize_tick_callback_id);
+            priv.resize_tick_callback_id = 0;
+        }
         if (priv.core_surface) |surface| {
             // There is no guarantee that our GLArea context is current
             // when unrealize is emitted, so we need to make it current.
@@ -3392,30 +3472,11 @@ pub const Surface = extern struct {
     }
 
     fn glareaResize(
-        gl_area: *gtk.GLArea,
+        _: *gtk.GLArea,
         width: c_int,
         height: c_int,
         self: *Self,
     ) callconv(.c) void {
-        // Some debug output to help understand what GTK is telling us.
-        {
-            const widget = gl_area.as(gtk.Widget);
-            const scale_factor = widget.getScaleFactor();
-            const window_scale_factor = scale: {
-                const root = widget.getRoot() orelse break :scale 0;
-                const gtk_native = root.as(gtk.Native);
-                const gdk_surface = gtk_native.getSurface() orelse break :scale 0;
-                break :scale gdk_surface.getScaleFactor();
-            };
-
-            log.debug("gl resize width={} height={} scale={} window_scale={}", .{
-                width,
-                height,
-                scale_factor,
-                window_scale_factor,
-            });
-        }
-
         // Store our cached size
         const priv = self.private();
 
@@ -3438,8 +3499,14 @@ pub const Surface = extern struct {
                 surface.sizeCallback(new_size) catch |err| {
                     log.warn("error in size callback err={}", .{err});
                 };
+
                 // Setup our resize overlay if configured
                 self.resizeOverlaySchedule();
+                self.resizeTickSchedule();
+
+                // Explicitly invalidate the GLArea so the new frame is requested
+                // once the renderer state catches up.
+                self.redraw();
             }
 
             return;

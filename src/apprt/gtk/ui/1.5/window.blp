@@ -47,14 +47,14 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           // elements of a property chain are also subscribed to for changes.
           // This one long, ugly line saves us from manually building up this
           // massive notify chain in code.
-          subtitle: bind $computed_subtitle(template.config, tab_view.selected-page.child as <$GhosttyTab>.active-surface as <$GhosttySurface>.pwd) as <string>;
+          subtitle: bind $computed_subtitle(template.config, tab_view.selected-page.child as <$GhosttyWorkspacePage>.active-surface as <$GhosttySurface>.pwd) as <string>;
         };
 
         [start]
         Adw.SplitButton {
           clicked => $new_tab();
           icon-name: "tab-new-symbolic";
-          tooltip-text: _("New Tab");
+          tooltip-text: _("New Workspace");
           dropdown-tooltip: _("New Split");
           menu-model: split_menu;
           can-focus: false;
@@ -63,10 +63,10 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
         [end]
         Gtk.Box {
-          Gtk.ToggleButton {
-            icon-name: "view-grid-symbolic";
-            tooltip-text: _("View Open Tabs");
-            active: bind tab_overview.open bidirectional;
+          Gtk.Button {
+            clicked => $toggle_sidebar();
+            icon-name: "view-list-symbolic";
+            tooltip-text: _("Toggle Workspace Sidebar");
             can-focus: false;
             focus-on-click: false;
           }
@@ -86,7 +86,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
         autohide: bind template.tabs-autohide;
         expand-tabs: bind template.tabs-wide;
         view: tab_view;
-        visible: bind template.tabs-visible;
+        visible: false;
 
         [start]
         Gtk.Box {
@@ -104,7 +104,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
             clicked => $new_tab();
             icon-name: "tab-new-symbolic";
-            tooltip-text: _("New Tab");
+            tooltip-text: _("New Workspace");
             dropdown-tooltip: _("New Split");
             menu-model: split_menu;
             can-focus: false;
@@ -117,14 +117,14 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           orientation: horizontal;
           visible: bind $titlebar_style_is_tabs(template.titlebar-style) as <bool>;
 
-          Gtk.ToggleButton {
+          Gtk.Button {
             styles [
               "flat",
             ]
 
-            icon-name: "view-grid-symbolic";
-            tooltip-text: _("View Open Tabs");
-            active: bind tab_overview.open bidirectional;
+            clicked => $toggle_sidebar();
+            icon-name: "view-list-symbolic";
+            tooltip-text: _("Toggle Workspace Sidebar");
             can-focus: false;
             focus-on-click: false;
           }
@@ -154,18 +154,60 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           visible: bind template.debug;
         }
 
-        Adw.ToastOverlay toast_overlay {
-          Adw.TabView tab_view {
-            notify::n-pages => $notify_n_pages();
-            notify::selected-page => $notify_selected_page();
-            close-page => $close_page();
-            page-attached => $page_attached();
-            page-detached => $page_detached();
-            create-window => $tab_create_window();
-            setup-menu => $setup_tab_menu();
-            menu-model: tab_context_menu;
-            shortcuts: none;
-          }
+        Paned workspace_split_view {
+          orientation: horizontal;
+          position: 280;
+          wide-handle: true;
+          resize-start-child: false;
+          shrink-start-child: false;
+
+          start-child: Adw.Bin {
+            Gtk.Box workspace_sidebar {
+              orientation: vertical;
+
+              Gtk.Box {
+                margin-top: 12;
+                margin-bottom: 6;
+                margin-start: 12;
+                margin-end: 12;
+
+                Gtk.Label {
+                  label: _("Workspaces");
+                  xalign: 0;
+                  styles [
+                    "title-4",
+                  ]
+                }
+              }
+
+              Gtk.ScrolledWindow {
+                hscrollbar-policy: never;
+                vexpand: true;
+
+                Gtk.ListBox workspace_list {
+                  styles [
+                    "navigation-sidebar",
+                  ]
+
+                  row-selected => $workspace_row_selected();
+                }
+              }
+            }
+          };
+
+          end-child: Adw.ToastOverlay toast_overlay {
+            Adw.TabView tab_view {
+              notify::n-pages => $notify_n_pages();
+              notify::selected-page => $notify_selected_page();
+              close-page => $close_page();
+              page-attached => $page_attached();
+              page-detached => $page_detached();
+              create-window => $tab_create_window();
+              setup-menu => $setup_tab_menu();
+              menu-model: tab_context_menu;
+              shortcuts: none;
+            }
+          };
         }
       }
     }
@@ -221,17 +263,17 @@ menu main_menu {
 
   section {
     item {
-      label: _("Change Tab Title…");
+      label: _("Change Workspace Title…");
       action: "win.prompt-tab-title";
     }
 
     item {
-      label: _("New Tab");
+      label: _("New Workspace");
       action: "win.new-tab";
     }
 
     item {
-      label: _("Close Tab");
+      label: _("Close Workspace");
       action: "win.close-tab";
       target: "this";
     }
@@ -317,7 +359,7 @@ menu main_menu {
 
 menu tab_context_menu {
   item {
-    label: _("Change Tab Title…");
+    label: _("Change Workspace Title…");
     action: "win.prompt-context-tab-title";
   }
 }

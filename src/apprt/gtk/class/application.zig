@@ -40,7 +40,7 @@ const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Window = @import("window.zig").Window;
-const Tab = @import("tab.zig").Tab;
+const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
@@ -1170,7 +1170,7 @@ pub const Application = extern struct {
         self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
         self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
         self.syncActionAccelerator("win.close-tab::this", .{ .close_tab = .this });
-        self.syncActionAccelerator("tab.close::this", .{ .close_tab = .this });
+        self.syncActionAccelerator("workspace.close::this", .{ .close_tab = .this });
         self.syncActionAccelerator("win.split-right", .{ .new_split = .right });
         self.syncActionAccelerator("win.split-down", .{ .new_split = .down });
         self.syncActionAccelerator("win.split-left", .{ .new_split = .left });
@@ -1974,7 +1974,7 @@ const Action = struct {
             .surface => |core| {
                 const surface = core.rt_surface.surface;
                 return surface.as(gtk.Widget).activateAction(
-                    "tab.close",
+                    "workspace.close",
                     glib.ext.VariantType.stringFor([:0]const u8),
                     @as([*:0]const u8, @tagName(value)),
                 ) != 0;
@@ -2512,14 +2512,14 @@ const Action = struct {
                     .app => return false,
                     .surface => |v| {
                         const surface = v.rt_surface.surface;
-                        const tab = ext.getAncestor(
-                            Tab,
+                        const workspace_page = ext.getAncestor(
+                            WorkspacePage,
                             surface.as(gtk.Widget),
                         ) orelse {
-                            log.warn("surface is not in a tab, ignoring prompt_tab_title", .{});
+                            log.warn("surface is not in a workspace page, ignoring prompt_tab_title", .{});
                             return false;
                         };
-                        tab.promptTabTitle();
+                        workspace_page.promptWorkspaceTitle();
                         return true;
                     },
                 }
@@ -2682,14 +2682,14 @@ const Action = struct {
             },
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const tab = ext.getAncestor(
-                    Tab,
+                const workspace_page = ext.getAncestor(
+                    WorkspacePage,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a tab, ignoring set_tab_title", .{});
+                    log.warn("surface is not in a workspace page, ignoring set_tab_title", .{});
                     return false;
                 };
-                tab.setTitleOverride(if (value.title.len == 0) null else value.title);
+                workspace_page.setTitleOverride(if (value.title.len == 0) null else value.title);
                 return true;
             },
         }

@@ -15,7 +15,6 @@ const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Window = @import("window.zig").Window;
 const Surface = @import("surface.zig").Surface;
-const Tab = @import("tab.zig").Tab;
 const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);
@@ -243,7 +242,8 @@ pub const CommandPalette = extern struct {
             );
         }
 
-        // Moving to the next tab index creates a new tab and places the pane in it.
+        // Moving to the next page index creates a new workspace page and places
+        // the pane in it.
         self.appendPaneMoveCommand(
             config,
             commands,
@@ -264,7 +264,7 @@ pub const CommandPalette = extern struct {
         _ = self;
         const title = std.fmt.allocPrintSentinel(
             alloc,
-            "Move Pane to Tab {d}",
+            "Move Pane to Workspace {d}",
             .{index},
             0,
         ) catch |err| {
@@ -277,14 +277,14 @@ pub const CommandPalette = extern struct {
             const value = if (create_new)
                 std.fmt.allocPrintSentinel(
                     alloc,
-                    "Move the current pane into a new tab {d}.",
+                    "Move the current pane into a new workspace {d}.",
                     .{index},
                     0,
                 )
             else
                 std.fmt.allocPrintSentinel(
                     alloc,
-                    "Move the current pane into tab {d}, merging it into that tab's layout.",
+                    "Move the current pane into workspace {d}, merging it into that workspace's layout.",
                     .{index},
                     0,
                 );
