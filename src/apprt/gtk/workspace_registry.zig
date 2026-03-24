@@ -74,6 +74,26 @@ pub const SidebarCounts = struct {
     sessions: usize,
 };
 
+pub const SessionRoute = struct {
+    window_id: ids.WindowId,
+    split_id: ids.SplitId,
+    tab_id: ids.TabId,
+    session_id: ids.SessionId,
+};
+
+pub const SelectedSessionDescriptor = struct {
+    route: SessionRoute,
+    split_title: []const u8,
+    tab_title: []const u8,
+    tab_title_override: ?[]const u8 = null,
+    session_title: []const u8,
+    session_title_override: ?[]const u8 = null,
+    cwd: []const u8,
+    focus_state: model.FocusState,
+    activity_state: model.ActivityState,
+    needs_attention: bool = false,
+};
+
 pub fn sidebarCounts(runtime: *const WorkspaceRuntime) SidebarCounts {
     return .{
         .windows = runtime.windows.items.len,
@@ -123,6 +143,43 @@ pub fn visitSidebarRows(
             }
         }
     }
+}
+
+pub fn routeForSession(
+    runtime: *const WorkspaceRuntime,
+    session_id: ids.SessionId,
+) ?SessionRoute {
+    const session = findSession(runtime, session_id) orelse return null;
+    return .{
+        .window_id = session.window_id,
+        .split_id = session.split_id,
+        .tab_id = session.tab_id,
+        .session_id = session.session_id,
+    };
+}
+
+pub fn selectedSessionRoute(runtime: *const WorkspaceRuntime) ?SessionRoute {
+    const session_id = runtime.workspace.selected_session_id orelse return null;
+    return routeForSession(runtime, session_id);
+}
+
+pub fn selectedSessionDescriptor(runtime: *const WorkspaceRuntime) ?SelectedSessionDescriptor {
+    const route = selectedSessionRoute(runtime) orelse return null;
+    const split = findSplit(runtime, route.split_id) orelse return null;
+    const tab = findTab(runtime, route.tab_id) orelse return null;
+    const session = findSession(runtime, route.session_id) orelse return null;
+    return .{
+        .route = route,
+        .split_title = split.title,
+        .tab_title = tab.title,
+        .tab_title_override = tab.title_override,
+        .session_title = session.title,
+        .session_title_override = session.title_override,
+        .cwd = session.cwd,
+        .focus_state = session.focus_state,
+        .activity_state = session.activity_state,
+        .needs_attention = tab.needs_attention,
+    };
 }
 
 pub const SessionIdentityIndex = struct {
@@ -493,6 +550,15 @@ fn validateSelectionRoute(entry: *const WorkspaceRuntime, selection: WorkspaceSe
 
     if (selected_split != null and selected_tab != null and selected_tab.?.split_id != selected_split.?.split_id) {
         return error.SelectedTabOutsideSplit;
+    }
+    if (selected_split != null and selection.selected_window_id != null and selected_split.?.window_id != selection.selected_window_id.?) {
+        return error.SelectedSplitOutsideWindow;
+    }
+    if (selected_tab != null and selection.selected_window_id != null and selected_tab.?.window_id != selection.selected_window_id.?) {
+        return error.SelectedTabOutsideWindow;
+    }
+    if (selected_session != null and selection.selected_window_id != null and selected_session.?.window_id != selection.selected_window_id.?) {
+        return error.SelectedSessionOutsideWindow;
     }
     if (selected_session != null and selected_tab != null and selected_session.?.tab_id != selected_tab.?.tab_id) {
         return error.SelectedSessionOutsideTab;

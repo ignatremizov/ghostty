@@ -2114,6 +2114,10 @@ pub const Surface = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
     }
 
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
     /// Returns the pwd property without a copy.
     pub fn getPwd(self: *Self) ?[:0]const u8 {
         return self.private().pwd;

@@ -14,6 +14,7 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Window = @import("window.zig").Window;
+const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const Surface = @import("surface.zig").Surface;
 const Config = @import("config.zig").Config;
 
@@ -233,11 +234,17 @@ pub const CommandPalette = extern struct {
         var i: c_int = 0;
         while (i < total) : (i += 1) {
             if (i == current) continue;
+            const page = tab_view.getNthPage(i);
+            const workspace_name = workspace_name: {
+                const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse break :workspace_name null;
+                break :workspace_name workspace_page.getSidebarTitle();
+            };
             self.appendPaneMoveCommand(
                 config,
                 commands,
                 alloc,
                 @intCast(i + 1),
+                workspace_name,
                 false,
             );
         }
@@ -249,6 +256,7 @@ pub const CommandPalette = extern struct {
             commands,
             alloc,
             @intCast(total + 1),
+            null,
             true,
         );
     }
@@ -259,39 +267,29 @@ pub const CommandPalette = extern struct {
         commands: *std.ArrayList(*Command),
         alloc: std.mem.Allocator,
         index: usize,
+        workspace_name: ?[:0]const u8,
         create_new: bool,
     ) void {
         _ = self;
-        const title = std.fmt.allocPrintSentinel(
+        const title = formatWorkspaceMoveCommandTitle(
             alloc,
-            "Move Pane to Workspace {d}",
-            .{index},
-            0,
+            index,
+            if (workspace_name) |name| name else null,
+            create_new,
         ) catch |err| {
             log.warn("failed to allocate move-pane command title: {}", .{err});
             return;
         };
         defer alloc.free(title);
 
-        const description = description: {
-            const value = if (create_new)
-                std.fmt.allocPrintSentinel(
-                    alloc,
-                    "Move the current pane into a new workspace {d}.",
-                    .{index},
-                    0,
-                )
-            else
-                std.fmt.allocPrintSentinel(
-                    alloc,
-                    "Move the current pane into workspace {d}, merging it into that workspace's layout.",
-                    .{index},
-                    0,
-                );
-            break :description value catch |err| {
-                log.warn("failed to allocate move-pane command description: {}", .{err});
-                return;
-            };
+        const description = formatWorkspaceMoveCommandDescription(
+            alloc,
+            index,
+            if (workspace_name) |name| name else null,
+            create_new,
+        ) catch |err| {
+            log.warn("failed to allocate move-pane command description: {}", .{err});
+            return;
         };
         defer alloc.free(description);
 
@@ -309,6 +307,113 @@ pub const CommandPalette = extern struct {
             log.warn("failed to add move-pane command to list: {}", .{err});
             return;
         };
+    }
+
+    fn formatWorkspaceMoveCommandTitle(
+        alloc: std.mem.Allocator,
+        index: usize,
+        workspace_name: ?[]const u8,
+        create_new: bool,
+    ) ![:0]u8 {
+        if (create_new or workspace_name == null or workspace_name.?.len == 0) {
+            return std.fmt.allocPrintSentinel(
+                alloc,
+                "Move Pane to Workspace {d}",
+                .{index},
+                0,
+            );
+        }
+
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "Move Pane to Workspace {d}: {s}",
+            .{ index, workspace_name.? },
+            0,
+        );
+    }
+
+    fn formatWorkspaceMoveCommandDescription(
+        alloc: std.mem.Allocator,
+        index: usize,
+        workspace_name: ?[]const u8,
+        create_new: bool,
+    ) ![:0]u8 {
+        if (create_new) {
+            return std.fmt.allocPrintSentinel(
+                alloc,
+                "Move the current pane into a new workspace {d}.",
+                .{index},
+                0,
+            );
+        }
+
+        if (workspace_name) |name| {
+            if (name.len > 0) {
+                return std.fmt.allocPrintSentinel(
+                    alloc,
+                    "Move the current pane into workspace {d} ({s}), merging it into that workspace's layout.",
+                    .{ index, name },
+                    0,
+                );
+            }
+        }
+
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "Move the current pane into workspace {d}, merging it into that workspace's layout.",
+            .{index},
+            0,
+        );
+    }
+
+    test "workspace move commands include existing workspace names" {
+        const testing = std.testing;
+
+        const title = try formatWorkspaceMoveCommandTitle(
+            testing.allocator,
+            2,
+            "ghostty",
+            false,
+        );
+        defer testing.allocator.free(title);
+        try testing.expectEqualStrings("Move Pane to Workspace 2: ghostty", title);
+
+        const description = try formatWorkspaceMoveCommandDescription(
+            testing.allocator,
+            2,
+            "ghostty",
+            false,
+        );
+        defer testing.allocator.free(description);
+        try testing.expectEqualStrings(
+            "Move the current pane into workspace 2 (ghostty), merging it into that workspace's layout.",
+            description,
+        );
+    }
+
+    test "workspace move commands keep new workspace wording generic" {
+        const testing = std.testing;
+
+        const title = try formatWorkspaceMoveCommandTitle(
+            testing.allocator,
+            3,
+            "ghostty",
+            true,
+        );
+        defer testing.allocator.free(title);
+        try testing.expectEqualStrings("Move Pane to Workspace 3", title);
+
+        const description = try formatWorkspaceMoveCommandDescription(
+            testing.allocator,
+            3,
+            "ghostty",
+            true,
+        );
+        defer testing.allocator.free(description);
+        try testing.expectEqualStrings(
+            "Move the current pane into a new workspace 3.",
+            description,
+        );
     }
 
     /// Check if an action is supported on GTK.

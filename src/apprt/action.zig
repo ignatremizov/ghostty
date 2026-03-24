@@ -106,7 +106,10 @@ pub const Action = union(Key) {
     /// Toggle fullscreen mode.
     toggle_fullscreen: Fullscreen,
 
-    /// Toggle tab overview.
+    /// Toggle the workspace sidebar.
+    ///
+    /// This action still uses the legacy `toggle_tab_overview` key for
+    /// compatibility with existing config and C ABI surfaces.
     toggle_tab_overview,
 
     /// Toggle whether window directions are shown.

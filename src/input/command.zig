@@ -739,3 +739,16 @@ test "command defaults" {
     try testing.expectEqual(defaults.len, defaultsC.len);
     try testing.expectEqual(@as(usize, 0), actionCommands(.move_split_to_tab).len);
 }
+
+test "workspace sidebar command uses preferred action string" {
+    const testing = std.testing;
+
+    const commands = actionCommands(.toggle_tab_overview);
+    try testing.expectEqual(@as(usize, 1), commands.len);
+
+    const cval = try commands[0].cval(testing.allocator);
+    defer testing.allocator.free(std.mem.span(cval.action));
+
+    try testing.expectEqualStrings("toggle_workspace_sidebar", std.mem.span(cval.action));
+    try testing.expectEqualStrings("toggle_tab_overview", std.mem.span(cval.action_key));
+}
