@@ -806,11 +806,13 @@ pub const Window = extern struct {
         const title = gtk.Label.new(null);
         title.setXalign(0);
         title.as(gtk.Widget).setHexpand(1);
+        title.setLabel(workspace_page.getSidebarTitle() orelse "");
 
         const subtitle = gtk.Label.new(null);
         subtitle.setXalign(0);
         subtitle.as(gtk.Widget).setHexpand(1);
         subtitle.as(gtk.Widget).addCssClass("dim-label");
+        subtitle.setLabel(workspace_page.getSidebarSubtitle() orelse "");
 
         const badge = gtk.Label.new(null);
         badge.as(gtk.Widget).addCssClass("accent");
@@ -823,25 +825,9 @@ pub const Window = extern struct {
         content.append(badge.as(gtk.Widget));
         row.setChild(content.as(gtk.Widget));
 
-        _ = workspace_page.as(gobject.Object).bindProperty(
-            "sidebar-title",
-            title.as(gobject.Object),
-            "label",
-            .{ .sync_create = true },
-        );
-        _ = workspace_page.as(gobject.Object).bindProperty(
-            "sidebar-subtitle",
-            subtitle.as(gobject.Object),
-            "label",
-            .{ .sync_create = true },
-        );
-        _ = workspace_page.as(gobject.Object).bindProperty(
-            "tooltip",
-            row.as(gobject.Object),
-            "tooltip-text",
-            .{ .sync_create = true },
-        );
         row.as(gobject.Object).setData("workspace-badge", badge);
+        row.as(gobject.Object).setData("workspace-title-label", title);
+        row.as(gobject.Object).setData("workspace-subtitle-label", subtitle);
 
         const gesture = gtk.GestureClick.new();
         gesture.as(gtk.GestureSingle).setButton(3);
@@ -1479,7 +1465,7 @@ pub const Window = extern struct {
                     try priv.session_identity_index.bindSession(session_id, surface_key, session_path);
                     try session_ids.append(alloc, session_id);
 
-                    const title = tab.getEffectiveTitle() orelse surface.getEffectiveTitle() orelse "Ghostty";
+                    const title = surface.getEffectiveTitle() orelse tab.getEffectiveTitle() orelse "Ghostty";
                     const tooltip = tab.getTooltip() orelse surface.getPwd();
                     const session_leaf_id = try std.fmt.allocPrint(
                         runtime.runtimeAllocator(),
@@ -1534,7 +1520,7 @@ pub const Window = extern struct {
                         .split_id = split_id,
                         .layout_node_id = session_leaf_id,
                         .title = title,
-                        .title_override = surface.getEffectiveTitle(),
+                        .title_override = surface.getTitleOverride(),
                         .cwd = surface.getPwd() orelse "",
                         .command = .{ .shell = "" },
                         .focus_state = if (surface.getFocused())
@@ -1759,6 +1745,7 @@ pub const Window = extern struct {
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to refresh workspace registry error={}", .{err});
         };
+        self.syncWorkspaceListDescriptors();
         self.syncWorkspaceListBadges();
     }
 
@@ -1773,7 +1760,7 @@ pub const Window = extern struct {
 
     fn focusWorkspaceSelection(self: *Self, workspace_page: *WorkspacePage) void {
         const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return;
-        const session_id = runtime.workspace.selected_session_id orelse {
+        const route = workspace_registry.selectedSessionRoute(runtime) orelse {
             if (workspace_page.getActiveSurface()) |_| self.scheduleSurfaceFocus();
             return;
         };
@@ -1787,7 +1774,7 @@ pub const Window = extern struct {
                 const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
                 const surface_key = ptrKey(surface);
                 const candidate_session = self.private().session_identity_index.sessionForAttachment(surface_key) orelse continue;
-                if (candidate_session != session_id) continue;
+                if (candidate_session != route.session_id) continue;
                 _ = leaf.selectSurface(surface);
                 self.scheduleSurfaceFocus();
                 return;
@@ -1849,6 +1836,111 @@ pub const Window = extern struct {
             badge.setLabel(text);
             badge.as(gtk.Widget).setVisible(1);
         }
+    }
+
+    fn syncWorkspaceListDescriptors(self: *Self) void {
+        const priv = self.private();
+        const n = priv.tab_view.getNPages();
+        const alloc = Application.default().allocator();
+
+        for (0..@intCast(n)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            const row = priv.workspace_list.getRowAtIndex(@intCast(i)) orelse continue;
+            const title_obj = row.as(gobject.Object).getData("workspace-title-label") orelse continue;
+            const subtitle_obj = row.as(gobject.Object).getData("workspace-subtitle-label") orelse continue;
+            const title_label: *gtk.Label = @ptrCast(@alignCast(title_obj));
+            const subtitle_label: *gtk.Label = @ptrCast(@alignCast(subtitle_obj));
+
+            const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+                title_label.setLabel(workspace_page.getSidebarTitle() orelse "Workspace");
+                subtitle_label.setLabel(workspace_page.getSidebarSubtitle() orelse "");
+                if (workspace_page.getTooltip()) |tooltip|
+                    row.as(gtk.Widget).setTooltipText(tooltip.ptr)
+                else
+                    row.as(gtk.Widget).setTooltipText(null);
+                continue;
+            };
+
+            title_label.setLabel(workspace_page.getSidebarTitle() orelse "Workspace");
+
+            var subtitle_allocated = true;
+            const subtitle = formatWorkspaceSidebarSubtitle(
+                alloc,
+                workspace_page.getSidebarSubtitle(),
+                workspace_registry.sidebarCounts(runtime),
+            ) catch blk: {
+                subtitle_allocated = false;
+                break :blk workspace_page.getSidebarSubtitle() orelse "";
+            };
+            defer if (subtitle_allocated) alloc.free(subtitle);
+            subtitle_label.setLabel(subtitle);
+
+            const tooltip = formatWorkspaceSidebarTooltip(alloc, runtime) catch null;
+            defer if (tooltip) |text| alloc.free(text);
+            if (tooltip) |text|
+                row.as(gtk.Widget).setTooltipText(text.ptr)
+            else if (workspace_page.getTooltip()) |fallback|
+                row.as(gtk.Widget).setTooltipText(fallback.ptr)
+            else
+                row.as(gtk.Widget).setTooltipText(null);
+        }
+    }
+
+    fn formatWorkspaceSidebarSubtitle(
+        alloc: std.mem.Allocator,
+        base_subtitle: ?[:0]const u8,
+        counts: workspace_registry.SidebarCounts,
+    ) ![:0]u8 {
+        const base = if (base_subtitle) |subtitle| subtitle else "";
+        if (counts.sessions <= 1 and counts.tabs <= 1 and counts.splits <= 1) {
+            return std.fmt.allocPrintSentinel(alloc, "{s}", .{base}, 0);
+        }
+
+        if (base.len == 0) {
+            return std.fmt.allocPrintSentinel(alloc, "{d} {s}", .{
+                counts.sessions,
+                if (counts.sessions == 1) "session" else "sessions",
+            }, 0);
+        }
+
+        return std.fmt.allocPrintSentinel(alloc, "{s} • {d} {s}", .{
+            base,
+            counts.sessions,
+            if (counts.sessions == 1) "session" else "sessions",
+        }, 0);
+    }
+
+    fn formatWorkspaceSidebarTooltip(
+        alloc: std.mem.Allocator,
+        runtime: *const workspace_registry.WorkspaceRuntime,
+    ) !?[:0]u8 {
+        const counts = workspace_registry.sidebarCounts(runtime);
+        const descriptor = workspace_registry.selectedSessionDescriptor(runtime);
+
+        if (descriptor) |selected| {
+            const session_title = selected.session_title_override orelse selected.session_title;
+            const tab_title = selected.tab_title_override orelse selected.tab_title;
+            return try std.fmt.allocPrintSentinel(alloc, "{d} {s} • {d} {s}\nSelected split: {s}\nSelected tab: {s}\nSelected session: {s}\nWorking directory: {s}", .{
+                counts.splits,
+                if (counts.splits == 1) "split" else "splits",
+                counts.sessions,
+                if (counts.sessions == 1) "session" else "sessions",
+                selected.split_title,
+                tab_title,
+                session_title,
+                selected.cwd,
+            }, 0);
+        }
+
+        if (counts.sessions == 0) return null;
+        return try std.fmt.allocPrintSentinel(alloc, "{d} {s} • {d} {s}", .{
+            counts.splits,
+            if (counts.splits == 1) "split" else "splits",
+            counts.sessions,
+            if (counts.sessions == 1) "session" else "sessions",
+        }, 0);
     }
 
     /// Returns true if this window needs confirmation before quitting.
@@ -2523,6 +2615,13 @@ pub const Window = extern struct {
         if (workspace_page.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+        _ = gobject.Object.signals.notify.connect(
+            workspace_page.as(gobject.Object),
+            *Self,
+            workspacePageRuntimeStateChanged,
+            self,
+            .{ .detail = "active-surface" },
+        );
         _ = gobject.Object.signals.notify.connect(
             workspace_page.as(gobject.Object),
             *Self,
@@ -3218,3 +3317,123 @@ pub const Window = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+fn testWorkspaceRuntime(
+    alloc: std.mem.Allocator,
+) !struct {
+    registry: workspace_registry.Registry,
+    workspace: *workspace_registry.WorkspaceRuntime,
+} {
+    var registry = workspace_registry.Registry.init(alloc);
+    errdefer registry.deinit();
+
+    const workspace = try registry.createWorkspace(
+        "ghostty",
+        "ghostty",
+        "2026-03-24T00:00:00Z",
+    );
+    try workspace.windows.append(alloc, .{
+        .window_id = workspace_ids.WindowId.init(1),
+        .workspace_id = workspace.workspace.workspace_id,
+        .is_active = true,
+        .is_quick_terminal = false,
+    });
+    try workspace.splits.append(alloc, .{
+        .split_id = workspace_ids.SplitId.init(11),
+        .workspace_id = workspace.workspace.workspace_id,
+        .window_id = workspace_ids.WindowId.init(1),
+        .title = "Main Split",
+        .ordinal = 0,
+        .tab_ids = try workspace.runtimeAllocator().dupe(workspace_ids.TabId, &.{workspace_ids.TabId.init(21)}),
+        .layout_root_id = "split-root-11",
+    });
+    try workspace.tabs.append(alloc, .{
+        .tab_id = workspace_ids.TabId.init(21),
+        .split_id = workspace_ids.SplitId.init(11),
+        .workspace_id = workspace.workspace.workspace_id,
+        .window_id = workspace_ids.WindowId.init(1),
+        .title = "build",
+        .title_override = "logs",
+        .layout_root_id = "tab-root-21",
+        .ordinal = 0,
+        .needs_attention = true,
+    });
+    try workspace.sessions.append(alloc, .{
+        .session_id = workspace_ids.SessionId.init(31),
+        .workspace_id = workspace.workspace.workspace_id,
+        .window_id = workspace_ids.WindowId.init(1),
+        .tab_id = workspace_ids.TabId.init(21),
+        .split_id = workspace_ids.SplitId.init(11),
+        .layout_node_id = "session-leaf-31",
+        .title = "shell",
+        .title_override = "cargo test",
+        .cwd = "/home/ignat/code/ghostty",
+        .command = .{ .shell = "zsh" },
+        .focus_state = .focused,
+        .activity_state = .bell_pending,
+    });
+    workspace.workspace.selected_window_id = workspace_ids.WindowId.init(1);
+    workspace.workspace.selected_split_id = workspace_ids.SplitId.init(11);
+    workspace.workspace.selected_tab_id = workspace_ids.TabId.init(21);
+    workspace.workspace.selected_session_id = workspace_ids.SessionId.init(31);
+
+    return .{
+        .registry = registry,
+        .workspace = workspace,
+    };
+}
+
+test "workspace sidebar subtitle includes session counts when needed" {
+    const testing = std.testing;
+
+    const subtitle = try Window.formatWorkspaceSidebarSubtitle(
+        testing.allocator,
+        "~/code/ghostty",
+        .{
+            .windows = 1,
+            .splits = 2,
+            .tabs = 2,
+            .sessions = 6,
+        },
+    );
+    defer testing.allocator.free(subtitle);
+
+    try testing.expectEqualStrings("~/code/ghostty • 6 sessions", subtitle);
+}
+
+test "workspace sidebar subtitle stays plain for single-session workspaces" {
+    const testing = std.testing;
+
+    const subtitle = try Window.formatWorkspaceSidebarSubtitle(
+        testing.allocator,
+        "~/code/ghostty",
+        .{
+            .windows = 1,
+            .splits = 1,
+            .tabs = 1,
+            .sessions = 1,
+        },
+    );
+    defer testing.allocator.free(subtitle);
+
+    try testing.expectEqualStrings("~/code/ghostty", subtitle);
+}
+
+test "workspace sidebar tooltip summarizes selected runtime session" {
+    const testing = std.testing;
+
+    var fixture = try testWorkspaceRuntime(testing.allocator);
+    defer fixture.registry.deinit();
+
+    const tooltip = (try Window.formatWorkspaceSidebarTooltip(
+        testing.allocator,
+        fixture.workspace,
+    )).?;
+    defer testing.allocator.free(tooltip);
+
+    try testing.expect(std.mem.indexOf(u8, tooltip, "1 split • 1 session") != null);
+    try testing.expect(std.mem.indexOf(u8, tooltip, "Selected split: Main Split") != null);
+    try testing.expect(std.mem.indexOf(u8, tooltip, "Selected tab: logs") != null);
+    try testing.expect(std.mem.indexOf(u8, tooltip, "Selected session: cargo test") != null);
+    try testing.expect(std.mem.indexOf(u8, tooltip, "Working directory: /home/ignat/code/ghostty") != null);
+}

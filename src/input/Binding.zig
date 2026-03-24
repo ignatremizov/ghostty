@@ -594,7 +594,11 @@ pub const Action = union(enum) {
     /// last tab. The destination tab will gain the moved split as a new pane.
     move_split_to_tab: usize,
 
-    /// Toggle the tab overview.
+    /// Toggle the workspace sidebar.
+    ///
+    /// This action still uses the legacy `toggle_tab_overview` tag in the
+    /// runtime for compatibility, but the preferred public action name is
+    /// `toggle_workspace_sidebar`.
     ///
     /// This is only supported on Linux and when the system's libadwaita
     /// version is 1.4 or newer. The current libadwaita version can be
@@ -1262,7 +1266,11 @@ pub const Action = union(enum) {
         // actions so it is optional. The part preceding the colon is the
         // action name.
         const colonIdx = std.mem.indexOf(u8, input, ":");
-        const action = input[0..(colonIdx orelse input.len)];
+        const raw_action = input[0..(colonIdx orelse input.len)];
+        const action = if (std.mem.eql(u8, raw_action, "toggle_workspace_sidebar"))
+            "toggle_tab_overview"
+        else
+            raw_action;
 
         // An action name is always required
         if (action.len == 0) return Error.InvalidFormat;
@@ -1506,6 +1514,7 @@ pub const Action = union(enum) {
         writer: *std.Io.Writer,
     ) !void {
         switch (self) {
+            .toggle_tab_overview => try writer.writeAll("toggle_workspace_sidebar"),
             inline else => |value| {
                 // All actions start with the tag.
                 try writer.print("{s}", .{@tagName(self)});
@@ -3329,7 +3338,28 @@ test "parse: action no parameters" {
         },
         try parseSingle("a=ignore"),
     );
+    try testing.expectEqual(
+        Binding{
+            .trigger = .{ .key = .{ .unicode = 'a' } },
+            .action = .toggle_tab_overview,
+        },
+        try parseSingle("a=toggle_workspace_sidebar"),
+    );
     try testing.expectError(Error.InvalidFormat, parseSingle("a=ignore:A"));
+}
+
+test "format: workspace sidebar action uses preferred public name" {
+    const testing = std.testing;
+    const value: Action = .toggle_tab_overview;
+
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+
+    try value.format(&buf.writer);
+    const rendered = try buf.toOwnedSlice();
+    defer testing.allocator.free(rendered);
+
+    try testing.expectEqualStrings("toggle_workspace_sidebar", rendered);
 }
 
 test "parse: action with string" {

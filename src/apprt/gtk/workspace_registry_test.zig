@@ -469,6 +469,22 @@ test "workspace registry rejects invalid selection routing chains" {
     try testing.expectEqual(session_ids[0], entry.workspace.selected_session_id.?);
     try testing.expectEqual(model.FocusState.focused, entry.sessions.items[0].focus_state);
     try testing.expect(entry.sessions.items[1].focus_state != .focused);
+
+    try testing.expectError(error.SelectedSplitOutsideWindow, registry.updateSelection(workspace_id, .{
+        .selected_window_id = window_ids[0],
+        .selected_split_id = split_ids[1],
+    }));
+    try testing.expectError(error.SelectedTabOutsideWindow, registry.updateSelection(workspace_id, .{
+        .selected_window_id = window_ids[0],
+        .selected_split_id = split_ids[1],
+        .selected_tab_id = tab_ids[1],
+    }));
+    try testing.expectError(error.SelectedSessionOutsideWindow, registry.updateSelection(workspace_id, .{
+        .selected_window_id = window_ids[0],
+        .selected_split_id = split_ids[1],
+        .selected_tab_id = tab_ids[1],
+        .selected_session_id = session_ids[1],
+    }));
 }
 
 test "workspace registry sidebar rows include sessions from every window in one logical workspace" {
@@ -553,4 +569,135 @@ test "workspace registry keeps unattached sessions selectable" {
     try testing.expectEqual(ids.SessionId.init(31), entry.workspace.selected_session_id.?);
     try testing.expectEqual(model.FocusState.focused, entry.sessions.items[0].focus_state);
     try testing.expectEqual(@as(usize, 0), entry.surfaces.items.len);
+}
+
+test "workspace registry resolves selected session route" {
+    const testing = std.testing;
+
+    var registry = registry_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const entry = try registry.createWorkspace("client-a", "client-a", "2026-03-22T00:00:00Z");
+    const workspace_id = entry.workspace.workspace_id;
+
+    const window_ids = [_]ids.WindowId{ ids.WindowId.init(1), ids.WindowId.init(2) };
+    const split_ids = [_]ids.SplitId{ ids.SplitId.init(11), ids.SplitId.init(12) };
+    const tab_ids = [_]ids.TabId{ ids.TabId.init(21), ids.TabId.init(22) };
+    const session_ids = [_]ids.SessionId{ ids.SessionId.init(31), ids.SessionId.init(32) };
+
+    try seedRuntime(
+        testing.allocator,
+        entry,
+        window_ids[0..],
+        split_ids[0..],
+        tab_ids[0..],
+        session_ids[0..],
+    );
+
+    try registry.updateSelection(workspace_id, .{
+        .selected_window_id = window_ids[1],
+        .selected_split_id = split_ids[1],
+        .selected_tab_id = tab_ids[1],
+        .selected_session_id = session_ids[1],
+    });
+
+    const route = registry_mod.selectedSessionRoute(entry).?;
+    try testing.expectEqual(window_ids[1], route.window_id);
+    try testing.expectEqual(split_ids[1], route.split_id);
+    try testing.expectEqual(tab_ids[1], route.tab_id);
+    try testing.expectEqual(session_ids[1], route.session_id);
+}
+
+test "workspace registry exposes selected session descriptors" {
+    const testing = std.testing;
+
+    var registry = registry_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const entry = try registry.createWorkspace("client-a", "client-a", "2026-03-22T00:00:00Z");
+    const workspace_id = entry.workspace.workspace_id;
+
+    try seedRuntime(
+        testing.allocator,
+        entry,
+        &.{ ids.WindowId.init(1), ids.WindowId.init(1) },
+        &.{ ids.SplitId.init(11), ids.SplitId.init(12) },
+        &.{ ids.TabId.init(21), ids.TabId.init(22) },
+        &.{ ids.SessionId.init(31), ids.SessionId.init(32) },
+    );
+    entry.splits.items[1].title = "Right Split";
+    entry.tabs.items[1].title = "build";
+    entry.tabs.items[1].title_override = "logs";
+    entry.sessions.items[1].title = "shell";
+    entry.sessions.items[1].title_override = "cargo test";
+    entry.sessions.items[1].cwd = "/home/ignat/code/ghostty";
+    entry.tabs.items[1].needs_attention = true;
+
+    try registry.updateSelection(workspace_id, .{
+        .selected_window_id = ids.WindowId.init(1),
+        .selected_split_id = ids.SplitId.init(12),
+        .selected_tab_id = ids.TabId.init(22),
+        .selected_session_id = ids.SessionId.init(32),
+    });
+
+    const descriptor = registry_mod.selectedSessionDescriptor(entry).?;
+    try testing.expectEqual(ids.WindowId.init(1), descriptor.route.window_id);
+    try testing.expectEqual(ids.SplitId.init(12), descriptor.route.split_id);
+    try testing.expectEqual(ids.TabId.init(22), descriptor.route.tab_id);
+    try testing.expectEqual(ids.SessionId.init(32), descriptor.route.session_id);
+    try testing.expectEqualStrings("Right Split", descriptor.split_title);
+    try testing.expectEqualStrings("build", descriptor.tab_title);
+    try testing.expectEqualStrings("logs", descriptor.tab_title_override.?);
+    try testing.expectEqualStrings("shell", descriptor.session_title);
+    try testing.expectEqualStrings("cargo test", descriptor.session_title_override.?);
+    try testing.expectEqualStrings("/home/ignat/code/ghostty", descriptor.cwd);
+    try testing.expectEqual(model.FocusState.focused, descriptor.focus_state);
+    try testing.expect(descriptor.needs_attention);
+}
+
+test "workspace registry removes workspaces by id" {
+    const testing = std.testing;
+
+    var registry = registry_mod.Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const alpha = try registry.createWorkspace("alpha", "alpha", "2026-03-22T00:00:00Z");
+    const bravo = try registry.createWorkspace("bravo", "bravo", "2026-03-22T00:00:01Z");
+    const bravo_id = bravo.workspace.workspace_id;
+
+    try testing.expectEqual(@as(usize, 2), registry.workspaces.items.len);
+    try testing.expect(registry.removeWorkspace(alpha.workspace.workspace_id));
+    try testing.expectEqual(@as(usize, 1), registry.workspaces.items.len);
+    try testing.expect(registry.findWorkspace(alpha.workspace.workspace_id) == null);
+    try testing.expectEqual(bravo_id, registry.workspaces.items[0].workspace.workspace_id);
+    try testing.expect(!registry.removeWorkspace(alpha.workspace.workspace_id));
+}
+
+test "workspace session identity index preserves stable paths and attachment pruning" {
+    const testing = std.testing;
+
+    var generator: ids.Generator = .{};
+    var index = registry_mod.SessionIdentityIndex.init(testing.allocator);
+    defer index.deinit();
+
+    const first = try index.resolvePath(&generator, "ws-1/split-1/tab-1");
+    try index.bindSession(first, 101, "ws-1/split-1/tab-1");
+    try testing.expectEqual(first, index.sessionForAttachment(101).?);
+    try testing.expectEqualStrings("ws-1/split-1/tab-1", index.pathForSession(first).?);
+
+    const same = try index.resolvePath(&generator, "ws-1/split-1/tab-1");
+    try testing.expectEqual(first, same);
+
+    const second = try index.resolvePath(&generator, "ws-1/split-2/tab-1");
+    try testing.expect(first != second);
+    try index.bindSession(second, 202, "ws-1/split-2/tab-1");
+    try testing.expectEqual(second, index.sessionForAttachment(202).?);
+
+    try index.pruneAttachments(&.{202});
+    try testing.expect(index.sessionForAttachment(101) == null);
+    try testing.expectEqual(second, index.sessionForAttachment(202).?);
+
+    index.retireSession(second);
+    try testing.expect(index.pathForSession(second) == null);
+    try testing.expect(index.sessionForAttachment(202) == null);
 }

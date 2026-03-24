@@ -3612,11 +3612,12 @@ else
 /// Determines the side of the screen that the GTK tab bar will stick to.
 /// Top, bottom, and hidden are supported. The default is top.
 ///
-/// When `hidden` is set, a tab button displaying the number of tabs will appear
-/// in the title bar. It has the ability to open a tab overview for displaying
-/// tabs. Alternatively, you can use the `toggle_tab_overview` action in a
-/// keybind if your window doesn't have a title bar, or you can switch tabs
-/// with keybinds.
+/// When `hidden` is set, a tab button displaying the number of workspaces will
+/// appear in the title bar. It can reveal the workspace-first navigation UI.
+/// Alternatively, you can use the `toggle_workspace_sidebar` action in a
+/// keybind if your window doesn't have a title bar, or you can switch
+/// workspaces with keybinds. The older `toggle_tab_overview` action name
+/// remains accepted as a compatibility alias.
 @"gtk-tabs-location": GtkTabsLocation = .top,
 
 /// If this is `true`, the titlebar will be hidden when the window is maximized,
