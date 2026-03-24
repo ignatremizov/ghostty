@@ -22,6 +22,13 @@ const log = std.log.scoped(.gtk_ghostty_split_tree);
 
 pub const SplitTree = extern struct {
     const Self = @This();
+    const NewSplitOverrides = struct {
+        command: ?configpkg.Command = null,
+        working_directory: ?[:0]const u8 = null,
+        title: ?[:0]const u8 = null,
+
+        pub const none: @This() = .{};
+    };
     parent_instance: Parent,
     pub const Parent = gtk.Box;
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
@@ -249,13 +256,23 @@ pub const SplitTree = extern struct {
         self: *Self,
         direction: SplitTabs.Tree.Split.Direction,
         parent_: ?*Surface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
+        overrides: NewSplitOverrides,
+    ) Allocator.Error!void {
+        try self.newSplitAtSurface(
+            direction,
+            self.getActiveSurface(),
+            parent_,
+            overrides,
+        );
+    }
 
-            pub const none: @This() = .{};
-        },
+    /// Create a new split relative to a specific anchor surface.
+    pub fn newSplitAtSurface(
+        self: *Self,
+        direction: SplitTabs.Tree.Split.Direction,
+        anchor: ?*Surface,
+        parent_: ?*Surface,
+        overrides: NewSplitOverrides,
     ) Allocator.Error!void {
         const alloc = Application.default().allocator();
 
@@ -299,9 +316,10 @@ pub const SplitTree = extern struct {
             return;
         };
 
-        // The handle we create the split relative to. Today this is the active
-        // surface but this might be the handle of the given parent if we want.
-        const handle = self.getActiveSurfaceHandle() orelse .root;
+        const handle = if (anchor) |surface_anchor|
+            self.findSurfaceHandle(surface_anchor) orelse self.getActiveSurfaceHandle() orelse .root
+        else
+            self.getActiveSurfaceHandle() orelse .root;
 
         // Create our split!
         var new_tree = try old_tree.split(

@@ -47,6 +47,7 @@ const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseCo
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
+const workspace_control = @import("../workspace_control.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -1448,6 +1449,7 @@ pub const Application = extern struct {
         };
 
         ext.actions.add(Self, self, &actions);
+        workspace_control.registerAction(self.as(gio.ActionMap));
     }
 
     /// Setup our global shortcuts.
