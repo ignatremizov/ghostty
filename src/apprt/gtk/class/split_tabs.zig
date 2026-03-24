@@ -169,6 +169,22 @@ pub const SplitTabs = extern struct {
         return self.private().tab_view.getNPages();
     }
 
+    pub fn getTabCount(self: *Self) c_int {
+        return self.private().tab_view.getNPages();
+    }
+
+    pub fn getTabAt(self: *Self, idx: c_int) ?*Tab {
+        const page = self.private().tab_view.getNthPage(idx);
+        const child = page.getChild();
+        return gobject.ext.cast(Tab, child);
+    }
+
+    pub fn getSelectedTab(self: *Self) ?*Tab {
+        const page = self.private().tab_view.getSelectedPage() orelse return null;
+        const child = page.getChild();
+        return gobject.ext.cast(Tab, child);
+    }
+
     pub fn redraw(self: *Self) void {
         const n = self.getSurfaceCount();
         for (0..@intCast(n)) |i| {
@@ -317,6 +333,12 @@ pub const SplitTabs = extern struct {
         };
         if (desired_pos == pos) return false;
         return page_view.reorderPage(page, desired_pos) != 0;
+    }
+
+    pub fn selectSurface(self: *Self, surface: *Surface) bool {
+        const page = self.getPageForSurface(surface) orelse return false;
+        self.private().tab_view.setSelectedPage(page);
+        return true;
     }
 
     pub fn promptActiveTabTitle(self: *Self) void {

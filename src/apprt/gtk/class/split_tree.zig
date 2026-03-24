@@ -189,9 +189,14 @@ pub const SplitTree = extern struct {
 
         /// Used to store state about a pending surface close for the
         /// close dialog.
-        pending_close: ?SplitTabs.Tree.Node.Handle,
+        pending_close: ?PendingClose = null,
 
         pub var offset: c_int = 0;
+    };
+
+    const PendingClose = struct {
+        handle: SplitTabs.Tree.Node.Handle,
+        surface: ?*Surface = null,
     };
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
@@ -738,6 +743,7 @@ pub const SplitTree = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        self.clearPendingClose();
         priv.last_focused.set(null);
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -858,16 +864,19 @@ pub const SplitTree = extern struct {
 
         // Reset our pending close state
         const priv = self.private();
-        priv.pending_close = null;
+        self.clearPendingClose();
 
         // Find the surface in the tree to verify this is valid and
         // set our pending close handle.
-        priv.pending_close = handle: {
+        priv.pending_close = pending_close: {
             const tree = self.getTree() orelse return;
             var it = tree.iterator();
             while (it.next()) |entry| {
                 if (entry.view.containsSurface(surface)) {
-                    break :handle entry.handle;
+                    break :pending_close .{
+                        .handle = entry.handle,
+                        .surface = if (entry.view.getSurfaceCount() > 1) surface.ref() else null,
+                    };
                 }
             }
 
@@ -892,6 +901,13 @@ pub const SplitTree = extern struct {
             self,
             .{},
         );
+        _ = CloseConfirmationDialog.signals.cancel.connect(
+            dialog,
+            *Self,
+            closeConfirmationCancel,
+            self,
+            .{},
+        );
         dialog.present(self.as(gtk.Widget));
     }
 
@@ -912,12 +928,30 @@ pub const SplitTree = extern struct {
         _: ?*CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
-        // Get the handle we're closing
-        const priv = self.private();
-        const handle = priv.pending_close orelse return;
-        priv.pending_close = null;
+        const pending_close = self.private().pending_close orelse return;
+        defer self.clearPendingClose();
 
-        self.removeHandle(handle);
+        if (pending_close.surface) |surface| {
+            _ = self.removeSurface(surface);
+            return;
+        }
+
+        self.removeHandle(pending_close.handle);
+    }
+
+    fn closeConfirmationCancel(
+        _: ?*CloseConfirmationDialog,
+        self: *Self,
+    ) callconv(.c) void {
+        self.clearPendingClose();
+    }
+
+    fn clearPendingClose(self: *Self) void {
+        const priv = self.private();
+        if (priv.pending_close) |pending_close| {
+            if (pending_close.surface) |surface| surface.unref();
+            priv.pending_close = null;
+        }
     }
 
     fn removeHandle(

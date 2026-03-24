@@ -52,6 +52,7 @@ pub const WorkspaceRuntime = struct {
         alloc.free(self.workspace.name);
         alloc.free(self.workspace.slug);
         alloc.free(self.workspace.created_at);
+        alloc.free(self.workspace.updated_at);
         if (self.workspace.snapshot_ref) |snapshot_ref| {
             alloc.free(snapshot_ref.saved_at);
             alloc.free(snapshot_ref.path);
@@ -417,6 +418,7 @@ pub const Registry = struct {
     ) !*WorkspaceRuntime {
         const workspace_id = self.ids.next(.workspace);
         const created_at_owned = try self.allocator.dupe(u8, created_at);
+        const updated_at_owned = try self.allocator.dupe(u8, created_at);
         try self.workspaces.append(self.allocator, .{
             .workspace = .{
                 .workspace_id = workspace_id,
@@ -424,7 +426,7 @@ pub const Registry = struct {
                 .slug = try self.allocator.dupe(u8, slug),
                 .origin = .runtime,
                 .created_at = created_at_owned,
-                .updated_at = created_at_owned,
+                .updated_at = updated_at_owned,
             },
             .runtime_arena = std.heap.ArenaAllocator.init(self.allocator),
         });
@@ -458,6 +460,17 @@ pub const Registry = struct {
             if (entry.workspace.workspace_id == workspace_id) return entry;
         }
         return null;
+    }
+
+    pub fn removeWorkspace(self: *Registry, workspace_id: ids.WorkspaceId) bool {
+        for (self.workspaces.items, 0..) |*entry, index| {
+            if (entry.workspace.workspace_id != workspace_id) continue;
+            entry.deinit(self.allocator);
+            _ = self.workspaces.swapRemove(index);
+            return true;
+        }
+
+        return false;
     }
 };
 

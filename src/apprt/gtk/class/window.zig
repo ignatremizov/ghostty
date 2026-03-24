@@ -31,6 +31,10 @@ const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
+const workspace_ids = @import("../workspace_ids.zig");
+const workspace_attention = @import("../workspace_attention.zig");
+const workspace_model = @import("../workspace_model.zig");
+const workspace_registry = @import("../workspace_registry.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
 
@@ -264,6 +268,15 @@ pub const Window = extern struct {
         pending_context_menu_row: ?*gtk.ListBoxRow = null,
         pending_context_menu_rect: ?gdk.Rectangle = null,
         pending_prompt_workspace_page: ?*WorkspacePage = null,
+        pending_surface_focus_source: ?c_uint = null,
+        disposing_runtime: bool = false,
+        runtime_window_id: ?workspace_ids.WindowId = null,
+        runtime_registry: workspace_registry.Registry,
+        session_identity_index: workspace_registry.SessionIdentityIndex,
+        workspace_ids_by_page: std.AutoHashMap(usize, workspace_ids.WorkspaceId),
+        split_ids_by_leaf: std.AutoHashMap(usize, workspace_ids.SplitId),
+        tab_ids_by_widget: std.AutoHashMap(usize, workspace_ids.TabId),
+        surface_ids_by_widget: std.AutoHashMap(usize, workspace_ids.SurfaceId),
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -308,10 +321,10 @@ pub const Window = extern struct {
         // If our configuration is null then we get the configuration
         // from the application.
         const priv = self.private();
+        const app = Application.default();
 
         const config = config: {
             if (priv.config) |config| break :config config.get();
-            const app = Application.default();
             const config = app.getConfig();
             priv.config = config;
             break :config config.get();
@@ -330,6 +343,12 @@ pub const Window = extern struct {
         // properties are only synced from the currently active page.
         priv.workspace_page_bindings = gobject.BindingGroup.new();
         priv.workspace_page_bindings.bind("title", self.as(gobject.Object), "title", .{});
+        priv.runtime_registry = workspace_registry.Registry.init(app.allocator());
+        priv.session_identity_index = workspace_registry.SessionIdentityIndex.init(app.allocator());
+        priv.workspace_ids_by_page = std.AutoHashMap(usize, workspace_ids.WorkspaceId).init(app.allocator());
+        priv.split_ids_by_leaf = std.AutoHashMap(usize, workspace_ids.SplitId).init(app.allocator());
+        priv.tab_ids_by_widget = std.AutoHashMap(usize, workspace_ids.TabId).init(app.allocator());
+        priv.surface_ids_by_widget = std.AutoHashMap(usize, workspace_ids.SurfaceId).init(app.allocator());
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -346,6 +365,9 @@ pub const Window = extern struct {
             null,
         );
         self.syncWorkspaceListSelection();
+        self.refreshWorkspaceRegistry() catch |err| {
+            log.warn("failed to build initial workspace registry error={}", .{err});
+        };
 
         // Start states based on config.
         if (config.maximize) self.as(gtk.Window).maximize();
@@ -772,11 +794,14 @@ pub const Window = extern struct {
         row.setSelectable(1);
         row.as(gtk.Widget).addCssClass("workspace-row");
 
+        const content = gtk.Box.new(.horizontal, 12);
+        content.as(gtk.Widget).setMarginTop(8);
+        content.as(gtk.Widget).setMarginBottom(8);
+        content.as(gtk.Widget).setMarginStart(12);
+        content.as(gtk.Widget).setMarginEnd(12);
+
         const box = gtk.Box.new(.vertical, 2);
-        box.as(gtk.Widget).setMarginTop(8);
-        box.as(gtk.Widget).setMarginBottom(8);
-        box.as(gtk.Widget).setMarginStart(12);
-        box.as(gtk.Widget).setMarginEnd(12);
+        box.as(gtk.Widget).setHexpand(1);
 
         const title = gtk.Label.new(null);
         title.setXalign(0);
@@ -787,9 +812,16 @@ pub const Window = extern struct {
         subtitle.as(gtk.Widget).setHexpand(1);
         subtitle.as(gtk.Widget).addCssClass("dim-label");
 
+        const badge = gtk.Label.new(null);
+        badge.as(gtk.Widget).addCssClass("accent");
+        badge.as(gtk.Widget).setValign(.center);
+        badge.as(gtk.Widget).setVisible(0);
+
         box.append(title.as(gtk.Widget));
         box.append(subtitle.as(gtk.Widget));
-        row.setChild(box.as(gtk.Widget));
+        content.append(box.as(gtk.Widget));
+        content.append(badge.as(gtk.Widget));
+        row.setChild(content.as(gtk.Widget));
 
         _ = workspace_page.as(gobject.Object).bindProperty(
             "sidebar-title",
@@ -809,6 +841,7 @@ pub const Window = extern struct {
             "tooltip-text",
             .{ .sync_create = true },
         );
+        row.as(gobject.Object).setData("workspace-badge", badge);
 
         const gesture = gtk.GestureClick.new();
         gesture.as(gtk.GestureSingle).setButton(3);
@@ -932,8 +965,13 @@ pub const Window = extern struct {
 
         const priv = self.private();
         const page = priv.tab_view.getNthPage(idx);
-        if (priv.tab_view.getSelectedPage() == page) return;
-        priv.tab_view.setSelectedPage(page);
+        if (priv.tab_view.getSelectedPage() != page) {
+            priv.tab_view.setSelectedPage(page);
+        }
+
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        self.focusWorkspaceSelection(workspace_page);
     }
 
     fn syncWorkspaceListSelection(self: *Self) void {
@@ -1148,6 +1186,34 @@ pub const Window = extern struct {
             self,
             .{},
         );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "focused" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "title" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "pwd" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "bell-ringing" },
+        );
 
         if (!priv.surface_init) {
             _ = Surface.signals.init.connect(
@@ -1305,6 +1371,484 @@ pub const Window = extern struct {
         const child = page.getChild();
         assert(gobject.ext.isA(child, WorkspacePage));
         return gobject.ext.cast(WorkspacePage, child);
+    }
+
+    pub fn getWorkspaceRegistry(self: *Self) *workspace_registry.Registry {
+        return &self.private().runtime_registry;
+    }
+
+    fn refreshWorkspaceRegistry(self: *Self) !void {
+        const priv = self.private();
+        const alloc = Application.default().allocator();
+        const n = priv.tab_view.getNPages();
+
+        var live_workspace_keys: std.ArrayList(usize) = .empty;
+        defer live_workspace_keys.deinit(alloc);
+        var live_split_keys: std.ArrayList(usize) = .empty;
+        defer live_split_keys.deinit(alloc);
+        var live_tab_keys: std.ArrayList(usize) = .empty;
+        defer live_tab_keys.deinit(alloc);
+        var live_surface_keys: std.ArrayList(usize) = .empty;
+        defer live_surface_keys.deinit(alloc);
+
+        for (0..@intCast(n)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            const workspace_key = ptrKey(workspace_page);
+            try live_workspace_keys.append(alloc, workspace_key);
+
+            const runtime = try self.getOrCreateWorkspaceRuntime(workspace_page);
+            runtime.resetRuntime();
+            try self.updateWorkspaceMetadata(runtime, workspace_page);
+            try self.appendWindowRuntime(runtime);
+
+            const active_surface = workspace_page.getActiveSurface();
+            const tree = workspace_page.getSurfaceTree() orelse {
+                runtime.workspace.selected_window_id = priv.runtime_window_id;
+                continue;
+            };
+
+            var split_ids: std.ArrayList(workspace_ids.SplitId) = .empty;
+            defer split_ids.deinit(alloc);
+            var tab_ids: std.ArrayList(workspace_ids.TabId) = .empty;
+            defer tab_ids.deinit(alloc);
+            var session_ids: std.ArrayList(workspace_ids.SessionId) = .empty;
+            defer session_ids.deinit(alloc);
+
+            var it = tree.iterator();
+            var split_ordinal: usize = 0;
+            while (it.next()) |entry| {
+                const leaf = entry.view;
+                const split_key = ptrKey(leaf);
+                try live_split_keys.append(alloc, split_key);
+                const split_id = try self.getOrCreateSplitId(leaf);
+                try split_ids.append(alloc, split_id);
+
+                const split_selected = if (active_surface) |surface|
+                    leaf.containsSurface(surface)
+                else
+                    false;
+                if (split_selected) runtime.workspace.selected_split_id = split_id;
+
+                const split_root_id = try std.fmt.allocPrint(
+                    runtime.runtimeAllocator(),
+                    "split-root-{d}",
+                    .{split_id.raw()},
+                );
+                var split_tab_ids: std.ArrayList(workspace_ids.TabId) = .empty;
+                defer split_tab_ids.deinit(alloc);
+                var split_child_ids: std.ArrayList([]const u8) = .empty;
+                defer split_child_ids.deinit(alloc);
+                var split_attention: workspace_attention.AttentionSummary = .{};
+
+                const tab_count = leaf.getTabCount();
+                for (0..@intCast(tab_count)) |tab_index| {
+                    const tab = leaf.getTabAt(@intCast(tab_index)) orelse continue;
+                    const surface = tab.getSurface() orelse continue;
+                    const tab_key = ptrKey(tab);
+                    const surface_key = ptrKey(surface);
+                    try live_tab_keys.append(alloc, tab_key);
+                    try live_surface_keys.append(alloc, surface_key);
+
+                    const tab_id = try self.getOrCreateTabId(tab);
+                    const surface_id = try self.getOrCreateSurfaceId(surface);
+                    try split_tab_ids.append(alloc, tab_id);
+                    try tab_ids.append(alloc, tab_id);
+
+                    const tab_root_id = try std.fmt.allocPrint(
+                        runtime.runtimeAllocator(),
+                        "tab-root-{d}",
+                        .{tab_id.raw()},
+                    );
+                    try split_child_ids.append(alloc, tab_root_id);
+
+                    const session_path = try std.fmt.allocPrint(
+                        runtime.runtimeAllocator(),
+                        "ws-{d}/split-{d}/tab-{d}",
+                        .{
+                            runtime.workspace.workspace_id.raw(),
+                            split_id.raw(),
+                            tab_id.raw(),
+                        },
+                    );
+                    const session_id = try priv.session_identity_index.resolvePath(
+                        &priv.runtime_registry.ids,
+                        session_path,
+                    );
+                    try priv.session_identity_index.bindSession(session_id, surface_key, session_path);
+                    try session_ids.append(alloc, session_id);
+
+                    const title = tab.getEffectiveTitle() orelse surface.getEffectiveTitle() orelse "Ghostty";
+                    const tooltip = tab.getTooltip() orelse surface.getPwd();
+                    const session_leaf_id = try std.fmt.allocPrint(
+                        runtime.runtimeAllocator(),
+                        "session-leaf-{d}",
+                        .{session_id.raw()},
+                    );
+                    const selected_tab = if (active_surface) |selected|
+                        selected == surface
+                    else
+                        false;
+
+                    if (selected_tab) {
+                        runtime.workspace.selected_tab_id = tab_id;
+                        runtime.workspace.selected_session_id = session_id;
+                    }
+
+                    try runtime.tabs.append(alloc, .{
+                        .tab_id = tab_id,
+                        .split_id = split_id,
+                        .workspace_id = runtime.workspace.workspace_id,
+                        .window_id = priv.runtime_window_id.?,
+                        .title = title,
+                        .title_override = tab.getTitleOverride(),
+                        .tooltip = tooltip,
+                        .layout_root_id = tab_root_id,
+                        .ordinal = tab_index,
+                        .needs_attention = surface.getBellRinging(),
+                    });
+                    try runtime.layout.append(alloc, .{
+                        .layout_node_id = tab_root_id,
+                        .workspace_id = runtime.workspace.workspace_id,
+                        .split_id = split_id,
+                        .tab_id = tab_id,
+                        .node_type = .tab,
+                        .child_ids = try runtime.runtimeAllocator().dupe([]const u8, &.{session_leaf_id}),
+                        .is_selected = selected_tab,
+                    });
+                    try runtime.layout.append(alloc, .{
+                        .layout_node_id = session_leaf_id,
+                        .workspace_id = runtime.workspace.workspace_id,
+                        .split_id = split_id,
+                        .tab_id = tab_id,
+                        .node_type = .session_leaf,
+                        .session_id = session_id,
+                        .is_selected = selected_tab,
+                    });
+                    try runtime.sessions.append(alloc, .{
+                        .session_id = session_id,
+                        .workspace_id = runtime.workspace.workspace_id,
+                        .window_id = priv.runtime_window_id.?,
+                        .tab_id = tab_id,
+                        .split_id = split_id,
+                        .layout_node_id = session_leaf_id,
+                        .title = title,
+                        .title_override = surface.getEffectiveTitle(),
+                        .cwd = surface.getPwd() orelse "",
+                        .command = .{ .shell = "" },
+                        .focus_state = if (surface.getFocused())
+                            .focused
+                        else if (selected_tab)
+                            .last_focused
+                        else
+                            .background,
+                        .activity_state = if (surface.getBellRinging()) .bell_pending else .idle,
+                    });
+                    try runtime.surfaces.append(alloc, .{
+                        .surface_id = surface_id,
+                        .session_id = session_id,
+                        .tab_id = tab_id,
+                        .split_id = split_id,
+                        .window_id = priv.runtime_window_id.?,
+                        .is_realized = surface.as(gtk.Widget).getRealized() != 0,
+                    });
+
+                    split_attention.include(.{
+                        .target_id = .{ .session = session_id },
+                        .unread = surface.getBellRinging(),
+                        .bell = surface.getBellRinging(),
+                    });
+                }
+
+                try runtime.splits.append(alloc, .{
+                    .split_id = split_id,
+                    .workspace_id = runtime.workspace.workspace_id,
+                    .window_id = priv.runtime_window_id.?,
+                    .title = leaf.splitTreeLabel(),
+                    .ordinal = split_ordinal,
+                    .tab_ids = try runtime.runtimeAllocator().dupe(workspace_ids.TabId, split_tab_ids.items),
+                    .layout_root_id = split_root_id,
+                    .needs_attention = split_attention.needs_attention,
+                });
+                try runtime.layout.append(alloc, .{
+                    .layout_node_id = split_root_id,
+                    .workspace_id = runtime.workspace.workspace_id,
+                    .split_id = split_id,
+                    .tab_id = if (split_tab_ids.items.len > 0) split_tab_ids.items[0] else null,
+                    .node_type = .split_root,
+                    .child_ids = try runtime.runtimeAllocator().dupe([]const u8, split_child_ids.items),
+                    .is_selected = split_selected,
+                });
+                runtime.workspace.attention_summary.merge(split_attention);
+                split_ordinal += 1;
+            }
+
+            runtime.workspace.selected_window_id = priv.runtime_window_id;
+            runtime.workspace.split_ids = try runtime.runtimeAllocator().dupe(workspace_ids.SplitId, split_ids.items);
+            runtime.workspace.tab_ids = try runtime.runtimeAllocator().dupe(workspace_ids.TabId, tab_ids.items);
+            runtime.workspace.session_ids = try runtime.runtimeAllocator().dupe(workspace_ids.SessionId, session_ids.items);
+            if (runtime.windows.items.len > 0) {
+                runtime.windows.items[0].split_ids = try runtime.runtimeAllocator().dupe(
+                    workspace_ids.SplitId,
+                    split_ids.items,
+                );
+            }
+        }
+
+        try self.pruneWorkspaceRegistry(live_workspace_keys.items);
+        pruneIdMap(workspace_ids.SplitId, &priv.split_ids_by_leaf, live_split_keys.items);
+        pruneIdMap(workspace_ids.TabId, &priv.tab_ids_by_widget, live_tab_keys.items);
+        pruneIdMap(workspace_ids.SurfaceId, &priv.surface_ids_by_widget, live_surface_keys.items);
+        try priv.session_identity_index.pruneAttachments(live_surface_keys.items);
+    }
+
+    fn getOrCreateWorkspaceRuntime(self: *Self, workspace_page: *WorkspacePage) !*workspace_registry.WorkspaceRuntime {
+        const priv = self.private();
+        const key = ptrKey(workspace_page);
+        if (priv.workspace_ids_by_page.get(key)) |workspace_id| {
+            return priv.runtime_registry.findWorkspace(workspace_id) orelse error.WorkspaceNotFound;
+        }
+
+        const title = workspace_page.getSidebarTitle() orelse workspace_page.getTitleOverride() orelse "workspace";
+        const created_at = try allocUtcTimestamp(Application.default().allocator());
+        defer Application.default().allocator().free(created_at);
+        const title_text: []const u8 = title;
+        const runtime = try priv.runtime_registry.createWorkspace(title_text, title_text, created_at);
+        try priv.workspace_ids_by_page.put(key, runtime.workspace.workspace_id);
+        return runtime;
+    }
+
+    fn updateWorkspaceMetadata(
+        _: *Self,
+        runtime: *workspace_registry.WorkspaceRuntime,
+        workspace_page: *WorkspacePage,
+    ) !void {
+        const alloc = Application.default().allocator();
+        const title = workspace_page.getSidebarTitle() orelse workspace_page.getTitleOverride() orelse "workspace";
+        const title_text: []const u8 = title;
+        const updated_at = try allocUtcTimestamp(alloc);
+
+        alloc.free(runtime.workspace.name);
+        alloc.free(runtime.workspace.slug);
+        alloc.free(runtime.workspace.updated_at);
+        runtime.workspace.name = try alloc.dupe(u8, title_text);
+        runtime.workspace.slug = try alloc.dupe(u8, title_text);
+        runtime.workspace.updated_at = updated_at;
+        runtime.workspace.attention_summary = .{};
+        runtime.workspace.selected_window_id = null;
+        runtime.workspace.selected_split_id = null;
+        runtime.workspace.selected_tab_id = null;
+        runtime.workspace.selected_session_id = null;
+    }
+
+    fn appendWindowRuntime(self: *Self, runtime: *workspace_registry.WorkspaceRuntime) !void {
+        const priv = self.private();
+        if (priv.runtime_window_id == null) {
+            priv.runtime_window_id = priv.runtime_registry.ids.next(.window);
+        }
+        try runtime.windows.append(Application.default().allocator(), .{
+            .window_id = priv.runtime_window_id.?,
+            .workspace_id = runtime.workspace.workspace_id,
+            .is_active = self.as(gtk.Window).isActive() != 0,
+            .is_quick_terminal = self.isQuickTerminal(),
+        });
+    }
+
+    fn pruneWorkspaceRegistry(self: *Self, live_workspace_keys: []const usize) !void {
+        const alloc = Application.default().allocator();
+        const priv = self.private();
+        var stale_workspace_keys: std.ArrayList(usize) = .empty;
+        defer stale_workspace_keys.deinit(alloc);
+
+        var it = priv.workspace_ids_by_page.iterator();
+        while (it.next()) |entry| {
+            if (containsUsize(live_workspace_keys, entry.key_ptr.*)) continue;
+            try stale_workspace_keys.append(alloc, entry.key_ptr.*);
+        }
+
+        for (stale_workspace_keys.items) |key| {
+            const workspace_id = priv.workspace_ids_by_page.get(key) orelse continue;
+            _ = priv.runtime_registry.removeWorkspace(workspace_id);
+            _ = priv.workspace_ids_by_page.remove(key);
+        }
+    }
+
+    fn getOrCreateSplitId(self: *Self, leaf: *SplitTabs) !workspace_ids.SplitId {
+        const priv = self.private();
+        const key = ptrKey(leaf);
+        if (priv.split_ids_by_leaf.get(key)) |id| return id;
+        const id = priv.runtime_registry.ids.next(.split);
+        try priv.split_ids_by_leaf.put(key, id);
+        return id;
+    }
+
+    fn getOrCreateTabId(self: *Self, tab: *Tab) !workspace_ids.TabId {
+        const priv = self.private();
+        const key = ptrKey(tab);
+        if (priv.tab_ids_by_widget.get(key)) |id| return id;
+        const id = priv.runtime_registry.ids.next(.tab);
+        try priv.tab_ids_by_widget.put(key, id);
+        return id;
+    }
+
+    fn getOrCreateSurfaceId(self: *Self, surface: *Surface) !workspace_ids.SurfaceId {
+        const priv = self.private();
+        const key = ptrKey(surface);
+        if (priv.surface_ids_by_widget.get(key)) |id| return id;
+        const id = priv.runtime_registry.ids.next(.surface);
+        try priv.surface_ids_by_widget.put(key, id);
+        return id;
+    }
+
+    fn ptrKey(ptr: anytype) usize {
+        return @intFromPtr(ptr);
+    }
+
+    fn containsUsize(items: []const usize, needle: usize) bool {
+        for (items) |item| {
+            if (item == needle) return true;
+        }
+        return false;
+    }
+
+    fn pruneIdMap(
+        comptime T: type,
+        map: *std.AutoHashMap(usize, T),
+        live_keys: []const usize,
+    ) void {
+        const alloc = Application.default().allocator();
+        var stale_keys: std.ArrayList(usize) = .empty;
+        defer stale_keys.deinit(alloc);
+
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            if (containsUsize(live_keys, entry.key_ptr.*)) continue;
+            stale_keys.append(alloc, entry.key_ptr.*) catch continue;
+        }
+
+        for (stale_keys.items) |key| {
+            _ = map.remove(key);
+        }
+    }
+
+    fn allocUtcTimestamp(alloc: std.mem.Allocator) ![]u8 {
+        const unix_seconds = std.time.timestamp();
+        if (unix_seconds < 0) return error.UnsupportedTimestamp;
+
+        const epoch_seconds = std.time.epoch.EpochSeconds{
+            .secs = @as(u64, @intCast(unix_seconds)),
+        };
+        const epoch_day = epoch_seconds.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_seconds = epoch_seconds.getDaySeconds();
+
+        return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        });
+    }
+
+    fn refreshWorkspaceRegistrySafe(self: *Self) void {
+        if (self.private().disposing_runtime) return;
+        self.refreshWorkspaceRegistry() catch |err| {
+            log.warn("failed to refresh workspace registry error={}", .{err});
+        };
+        self.syncWorkspaceListBadges();
+    }
+
+    fn getWorkspaceRuntimeForPage(
+        self: *Self,
+        workspace_page: *WorkspacePage,
+    ) ?*workspace_registry.WorkspaceRuntime {
+        const priv = self.private();
+        const workspace_id = priv.workspace_ids_by_page.get(ptrKey(workspace_page)) orelse return null;
+        return priv.runtime_registry.findWorkspace(workspace_id);
+    }
+
+    fn focusWorkspaceSelection(self: *Self, workspace_page: *WorkspacePage) void {
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return;
+        const session_id = runtime.workspace.selected_session_id orelse {
+            if (workspace_page.getActiveSurface()) |_| self.scheduleSurfaceFocus();
+            return;
+        };
+
+        const tree = workspace_page.getSurfaceTree() orelse return;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                const surface_key = ptrKey(surface);
+                const candidate_session = self.private().session_identity_index.sessionForAttachment(surface_key) orelse continue;
+                if (candidate_session != session_id) continue;
+                _ = leaf.selectSurface(surface);
+                self.scheduleSurfaceFocus();
+                return;
+            }
+        }
+
+        if (workspace_page.getActiveSurface()) |_| self.scheduleSurfaceFocus();
+    }
+
+    fn scheduleSurfaceFocus(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing_runtime) return;
+        if (priv.pending_surface_focus_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_surface_focus_source = null;
+        }
+        priv.pending_surface_focus_source = glib.idleAdd(idleFocusSurface, self);
+    }
+
+    fn idleFocusSurface(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        priv.pending_surface_focus_source = null;
+        if (priv.disposing_runtime) return 0;
+        const surface = self.getActiveSurface() orelse return 0;
+        surface.grabFocus();
+        return 0;
+    }
+
+    fn syncWorkspaceListBadges(self: *Self) void {
+        const priv = self.private();
+        const n = priv.tab_view.getNPages();
+        var buf: [32:0]u8 = undefined;
+
+        for (0..@intCast(n)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            const row = priv.workspace_list.getRowAtIndex(@intCast(i)) orelse continue;
+            const badge_obj = row.as(gobject.Object).getData("workspace-badge") orelse continue;
+            const badge: *gtk.Label = @ptrCast(@alignCast(badge_obj));
+            const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+                badge.as(gtk.Widget).setVisible(0);
+                continue;
+            };
+
+            const summary = runtime.workspace.attention_summary;
+            if (!summary.needs_attention) {
+                badge.as(gtk.Widget).setVisible(0);
+                continue;
+            }
+
+            const text = if (summary.bell_count > 0)
+                std.fmt.bufPrintZ(&buf, "🔔 {d}", .{summary.bell_count}) catch "🔔"
+            else if (summary.unread_count > 0)
+                std.fmt.bufPrintZ(&buf, "{d}", .{summary.unread_count}) catch "•"
+            else
+                "•";
+            badge.setLabel(text);
+            badge.as(gtk.Widget).setVisible(1);
+        }
     }
 
     /// Returns true if this window needs confirmation before quitting.
@@ -1614,6 +2158,7 @@ pub const Window = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.disposing_runtime = true;
 
         if (priv.handle_active_state_source) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -1642,6 +2187,34 @@ pub const Window = extern struct {
             page.unref();
             priv.pending_prompt_workspace_page = null;
         }
+        if (priv.pending_surface_focus_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_surface_focus_source = null;
+        }
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            _ = gobject.signalHandlersDisconnectMatched(
+                workspace_page.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
+            if (workspace_page.getSurfaceTree()) |tree| {
+                self.disconnectSurfaceHandlers(tree);
+            }
+        }
+        priv.session_identity_index.deinit();
+        priv.workspace_ids_by_page.deinit();
+        priv.split_ids_by_leaf.deinit();
+        priv.tab_ids_by_widget.deinit();
+        priv.surface_ids_by_widget.deinit();
+        priv.runtime_registry.deinit();
 
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
@@ -1906,6 +2479,7 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn tabViewPageAttached(
@@ -1949,6 +2523,28 @@ pub const Window = extern struct {
         if (workspace_page.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+        _ = gobject.Object.signals.notify.connect(
+            workspace_page.as(gobject.Object),
+            *Self,
+            workspacePageRuntimeStateChanged,
+            self,
+            .{ .detail = "title-override" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            workspace_page.as(gobject.Object),
+            *Self,
+            workspacePageRuntimeStateChanged,
+            self,
+            .{ .detail = "sidebar-title" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            workspace_page.as(gobject.Object),
+            *Self,
+            workspacePageRuntimeStateChanged,
+            self,
+            .{ .detail = "sidebar-subtitle" },
+        );
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn tabViewPageDetached(
@@ -1974,6 +2570,7 @@ pub const Window = extern struct {
         if (workspace_page.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
         }
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn tabViewCreateWindow(
@@ -2174,6 +2771,7 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn workspacePageSurfaceAdded(
@@ -2182,6 +2780,7 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.connectSurfaceHandler(surface);
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn workspacePageSurfaceRemoved(
@@ -2198,6 +2797,23 @@ pub const Window = extern struct {
             null,
             self,
         );
+        self.refreshWorkspaceRegistrySafe();
+    }
+
+    fn workspacePageRuntimeStateChanged(
+        _: *gobject.Object,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.refreshWorkspaceRegistrySafe();
+    }
+
+    fn surfaceRuntimeStateChanged(
+        _: *gobject.Object,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.refreshWorkspaceRegistrySafe();
     }
 
     fn actionAbout(

@@ -118,6 +118,19 @@ pub const Tab = extern struct {
         return self.private().surface;
     }
 
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
+    pub fn getEffectiveTitle(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+        return priv.title_override orelse priv.title;
+    }
+
+    pub fn getTooltip(self: *Self) ?[:0]const u8 {
+        return self.private().tooltip;
+    }
+
     fn getSurfaceValue(self: *Self, value: *gobject.Value) void {
         gobject.ext.Value.set(value, self.private().surface);
     }
