@@ -189,7 +189,7 @@ pub const SplitTree = extern struct {
 
         /// Used to store state about a pending surface close for the
         /// close dialog.
-        pending_close: ?PendingClose,
+        pending_close: ?PendingClose = null,
         pending_close_dialog: ?*CloseConfirmationDialog = null,
         empty_leaf_cleanup_source: ?c_uint = null,
 
@@ -903,6 +903,13 @@ pub const SplitTree = extern struct {
             dialog,
             *Self,
             closeConfirmationClose,
+            self,
+            .{},
+        );
+        _ = CloseConfirmationDialog.signals.cancel.connect(
+            dialog,
+            *Self,
+            closeConfirmationCancel,
             self,
             .{},
         );

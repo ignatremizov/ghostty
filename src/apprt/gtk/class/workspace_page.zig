@@ -342,6 +342,22 @@ pub const WorkspacePage = extern struct {
         return self.getSplitTree().getActiveSurface();
     }
 
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
+    pub fn getSidebarTitle(self: *Self) ?[:0]const u8 {
+        return self.private().sidebar_title;
+    }
+
+    pub fn getSidebarSubtitle(self: *Self) ?[:0]const u8 {
+        return self.private().sidebar_subtitle;
+    }
+
+    pub fn getTooltip(self: *Self) ?[:0]const u8 {
+        return self.private().tooltip;
+    }
+
     /// Get the surface tree of this workspace page.
     pub fn getSurfaceTree(self: *Self) ?*SplitTabs.Tree {
         const priv = self.private();
