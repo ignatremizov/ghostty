@@ -291,8 +291,13 @@ menu context_menu_model {
       label: _("Split");
 
       item {
-        label: _("Change Title…");
+        label: _("Change Terminal Title…");
         action: "surface.prompt-title";
+      }
+
+      item {
+        label: _("Change Tab Title…");
+        action: "win.prompt-tab-title";
       }
 
       item {
@@ -330,7 +335,7 @@ menu context_menu_model {
 
       item {
         label: _("Change Workspace Title…");
-        action: "workspace.prompt-tab-title";
+        action: "win.prompt-workspace-title";
       }
 
       item {

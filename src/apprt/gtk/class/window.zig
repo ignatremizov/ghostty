@@ -260,6 +260,10 @@ pub const Window = extern struct {
         /// Workspace page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
+        context_menu_popover: ?*gtk.Popover = null,
+        pending_context_menu_row: ?*gtk.ListBoxRow = null,
+        pending_context_menu_rect: ?gdk.Rectangle = null,
+        pending_prompt_workspace_page: ?*WorkspacePage = null,
 
         // Template bindings
         tab_overview: *adw.TabOverview,
@@ -377,9 +381,10 @@ pub const Window = extern struct {
             .init("close-tab", actionCloseTab, s_variant_type),
             .init("new-tab", actionNewTab, null),
             .init("new-window", actionNewWindow, null),
+            .init("prompt-workspace-title", actionPromptWorkspaceTitle, null),
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
-            .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
+            .init("prompt-context-workspace-title", actionPromptContextWorkspaceTitle, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
             .init("split-left", actionSplitLeft, null),
@@ -753,41 +758,167 @@ pub const Window = extern struct {
 
     fn workspaceListCreateWidget(
         item: *gobject.Object,
-        _: ?*anyopaque,
+        ud: ?*anyopaque,
     ) callconv(.c) *gtk.Widget {
+        const self: *Self = @ptrCast(@alignCast(ud orelse @panic("expected window")));
         const page = gobject.ext.cast(adw.TabPage, item) orelse @panic("expected tab page");
+        const workspace_page = gobject.ext.cast(
+            WorkspacePage,
+            page.getChild(),
+        ) orelse @panic("expected workspace page");
 
         const row = gtk.ListBoxRow.new();
         row.setActivatable(1);
         row.setSelectable(1);
+        row.as(gtk.Widget).addCssClass("workspace-row");
 
-        const box = gtk.Box.new(.horizontal, 0);
-        box.as(gtk.Widget).setMarginTop(6);
-        box.as(gtk.Widget).setMarginBottom(6);
+        const box = gtk.Box.new(.vertical, 2);
+        box.as(gtk.Widget).setMarginTop(8);
+        box.as(gtk.Widget).setMarginBottom(8);
         box.as(gtk.Widget).setMarginStart(12);
         box.as(gtk.Widget).setMarginEnd(12);
 
-        const label = gtk.Label.new(null);
-        label.setXalign(0);
-        label.as(gtk.Widget).setHexpand(1);
+        const title = gtk.Label.new(null);
+        title.setXalign(0);
+        title.as(gtk.Widget).setHexpand(1);
 
-        box.append(label.as(gtk.Widget));
+        const subtitle = gtk.Label.new(null);
+        subtitle.setXalign(0);
+        subtitle.as(gtk.Widget).setHexpand(1);
+        subtitle.as(gtk.Widget).addCssClass("dim-label");
+
+        box.append(title.as(gtk.Widget));
+        box.append(subtitle.as(gtk.Widget));
         row.setChild(box.as(gtk.Widget));
 
-        _ = page.as(gobject.Object).bindProperty(
-            "title",
-            label.as(gobject.Object),
+        _ = workspace_page.as(gobject.Object).bindProperty(
+            "sidebar-title",
+            title.as(gobject.Object),
             "label",
             .{ .sync_create = true },
         );
-        _ = page.as(gobject.Object).bindProperty(
+        _ = workspace_page.as(gobject.Object).bindProperty(
+            "sidebar-subtitle",
+            subtitle.as(gobject.Object),
+            "label",
+            .{ .sync_create = true },
+        );
+        _ = workspace_page.as(gobject.Object).bindProperty(
             "tooltip",
             row.as(gobject.Object),
             "tooltip-text",
             .{ .sync_create = true },
         );
 
+        const gesture = gtk.GestureClick.new();
+        gesture.as(gtk.GestureSingle).setButton(3);
+        _ = gtk.GestureClick.signals.released.connect(
+            gesture,
+            *Self,
+            workspaceRowSecondaryClick,
+            self,
+            .{},
+        );
+        row.as(gtk.Widget).addController(gesture.as(gtk.EventController));
+
         return row.as(gtk.Widget);
+    }
+
+    fn workspaceRowSecondaryClick(
+        gesture: *gtk.GestureClick,
+        _: c_int,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const row_widget = gesture.as(gtk.EventController).getWidget() orelse return;
+        const row = gobject.ext.cast(gtk.ListBoxRow, row_widget) orelse return;
+        const idx = row.getIndex();
+        if (idx < 0) return;
+
+        priv.context_menu_page = priv.tab_view.getNthPage(idx);
+        var list_x: f64 = 0;
+        var list_y: f64 = 0;
+        if (row.as(gtk.Widget).translateCoordinates(
+            priv.workspace_list.as(gtk.Widget),
+            x,
+            y,
+            &list_x,
+            &list_y,
+        ) == 0) return;
+
+        const rect: gdk.Rectangle = .{
+            .f_x = @intFromFloat(list_x),
+            .f_y = @intFromFloat(list_y),
+            .f_width = 1,
+            .f_height = 1,
+        };
+        self.ensureWorkspaceContextMenuPopover();
+        if (priv.context_menu_popover.?.as(gtk.Widget).isVisible() != 0) {
+            priv.pending_context_menu_row = null;
+            priv.pending_context_menu_rect = null;
+            priv.context_menu_popover.?.setPointingTo(&rect);
+            return;
+        }
+
+        self.showWorkspaceContextMenu(rect);
+    }
+
+    fn ensureWorkspaceContextMenuPopover(self: *Self) void {
+        const priv = self.private();
+        if (priv.context_menu_popover != null) return;
+        const rename_button = gtk.Button.newWithLabel(i18n._("Change Workspace Title…"));
+        rename_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            rename_button,
+            *Self,
+            workspaceRowRenameClicked,
+            self,
+            .{},
+        );
+
+        const popover = gtk.Popover.new();
+        popover.setHasArrow(0);
+        popover.setChild(rename_button.as(gtk.Widget));
+        popover.as(gtk.Widget).setParent(priv.workspace_list.as(gtk.Widget));
+        _ = gtk.Popover.signals.closed.connect(
+            popover,
+            *Self,
+            workspaceRowContextMenuClosed,
+            self,
+            .{},
+        );
+
+        priv.context_menu_popover = popover;
+    }
+
+    fn showWorkspaceContextMenu(self: *Self, rect: gdk.Rectangle) void {
+        const priv = self.private();
+        self.ensureWorkspaceContextMenuPopover();
+        priv.context_menu_popover.?.setPointingTo(&rect);
+        priv.context_menu_popover.?.popup();
+    }
+
+    fn workspaceRowRenameClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return;
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        if (priv.pending_prompt_workspace_page) |old_page| old_page.unref();
+        priv.pending_prompt_workspace_page = workspace_page.ref();
+        if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
+            popover.popdown();
+        }
+    }
+
+    fn workspaceRowContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
+        _ = popover;
+        const priv = self.private();
+        if (priv.pending_prompt_workspace_page) |workspace_page| {
+            priv.pending_prompt_workspace_page = null;
+            _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
+        }
     }
 
     fn workspaceListRowSelected(
@@ -1499,6 +1630,18 @@ pub const Window = extern struct {
         }
 
         priv.workspace_page_bindings.setSource(null);
+        priv.context_menu_page = null;
+        if (priv.context_menu_popover) |popover| {
+            popover.popdown();
+            popover.as(gtk.Widget).unparent();
+            priv.context_menu_popover = null;
+        }
+        priv.pending_context_menu_row = null;
+        priv.pending_context_menu_rect = null;
+        if (priv.pending_prompt_workspace_page) |page| {
+            page.unref();
+            priv.pending_prompt_workspace_page = null;
+        }
 
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
@@ -2154,16 +2297,38 @@ pub const Window = extern struct {
         self.performBindingAction(.new_tab);
     }
 
-    fn actionPromptContextTabTitle(
-        _: *gio.SimpleAction,
-        _: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
+    fn idlePromptWorkspaceTitle(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        workspace_page.promptWorkspaceTitle();
+        return 0;
+    }
+
+    fn promptContextWorkspaceTitle(self: *Self) void {
         const priv = self.private();
         const page = priv.context_menu_page orelse return;
         const child = page.getChild();
         const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        workspace_page.promptWorkspaceTitle();
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
+    }
+
+    fn actionPromptContextWorkspaceTitle(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.promptContextWorkspaceTitle();
+    }
+
+    fn actionPromptWorkspaceTitle(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        const workspace_page = self.getSelectedWorkspacePage() orelse return;
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
     }
 
     fn actionPromptSurfaceTitle(
