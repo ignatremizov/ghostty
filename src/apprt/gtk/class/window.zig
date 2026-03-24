@@ -2527,7 +2527,7 @@ pub const Window = extern struct {
         }
 
         // Show a confirmation dialog
-        const dialog: *CloseConfirmationDialog = .new(.tab);
+        const dialog: *CloseConfirmationDialog = .new(.workspace);
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
             *adw.TabPage,
@@ -3317,6 +3317,470 @@ pub const Window = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+pub const WorkspaceControlWorkspace = struct {
+    workspace_id: workspace_ids.WorkspaceId,
+    selected_window_id: ?workspace_ids.WindowId = null,
+    selected_session_id: ?workspace_ids.SessionId = null,
+    name: []const u8,
+    session_count: usize,
+    unread_count: usize,
+    has_attention: bool,
+    selected: bool,
+    restorable: bool,
+
+    pub fn deinit(self: WorkspaceControlWorkspace, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
+
+pub const WorkspaceControlSession = struct {
+    session_id: workspace_ids.SessionId,
+    workspace_id: workspace_ids.WorkspaceId,
+    tab_id: workspace_ids.TabId,
+    title: []const u8,
+    cwd: []const u8,
+    focused: bool,
+    unread: bool,
+    has_attention: bool,
+
+    pub fn deinit(self: WorkspaceControlSession, alloc: std.mem.Allocator) void {
+        alloc.free(self.title);
+        alloc.free(self.cwd);
+    }
+};
+
+pub const WorkspaceControlOpenResult = struct {
+    workspace_id: workspace_ids.WorkspaceId,
+    name: []const u8,
+    selected_window_id: ?workspace_ids.WindowId = null,
+    selected_session_id: ?workspace_ids.SessionId = null,
+};
+
+pub const WorkspaceControlFocusResult = struct {
+    focused_session_id: workspace_ids.SessionId,
+    tab_id: workspace_ids.TabId,
+    window_id: workspace_ids.WindowId,
+};
+
+pub const WorkspaceControlSplitDirection = enum {
+    right,
+    left,
+    up,
+    down,
+};
+
+pub const WorkspaceControlCommand = union(enum) {
+    shell: []const u8,
+    argv: []const []const u8,
+};
+
+pub const WorkspaceControlSplitRequest = struct {
+    session: []const u8,
+    direction: WorkspaceControlSplitDirection,
+    cwd: ?[]const u8 = null,
+    command: ?WorkspaceControlCommand = null,
+};
+
+pub const WorkspaceControlSplitResult = struct {
+    session_id: workspace_ids.SessionId,
+    workspace_id: workspace_ids.WorkspaceId,
+    tab_id: workspace_ids.TabId,
+};
+
+pub const WorkspaceControlCloseResult = struct {
+    closed_session_id: workspace_ids.SessionId,
+};
+
+const WorkspaceControlResolvedWorkspace = struct {
+    window: *Window,
+    workspace_page: *WorkspacePage,
+    runtime: *workspace_registry.WorkspaceRuntime,
+};
+
+const WorkspaceControlResolvedSession = struct {
+    window: *Window,
+    workspace_page: *WorkspacePage,
+    runtime: *workspace_registry.WorkspaceRuntime,
+    leaf: *SplitTabs,
+    surface: *Surface,
+    route: workspace_registry.SessionRoute,
+};
+
+pub fn workspaceControlListAlloc(
+    alloc: std.mem.Allocator,
+) ![]WorkspaceControlWorkspace {
+    const window = maybeWorkspaceControlWindow() orelse return try alloc.alloc(WorkspaceControlWorkspace, 0);
+    refreshWorkspaceControlRuntime(window);
+
+    var results: std.ArrayList(WorkspaceControlWorkspace) = .empty;
+    defer results.deinit(alloc);
+
+    const tab_view = window.getTabView();
+    const selected_page = tab_view.getSelectedPage();
+    const n = tab_view.getNPages();
+    for (0..@intCast(n)) |i| {
+        const page = tab_view.getNthPage(@intCast(i));
+        const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
+        const runtime = window.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+        const summary = runtime.workspace.attention_summary;
+        try results.append(alloc, .{
+            .workspace_id = runtime.workspace.workspace_id,
+            .selected_window_id = runtime.workspace.selected_window_id,
+            .selected_session_id = runtime.workspace.selected_session_id,
+            .name = try alloc.dupe(u8, runtime.workspace.name),
+            .session_count = runtime.sessions.items.len,
+            .unread_count = summary.unread_count,
+            .has_attention = summary.needs_attention,
+            .selected = selected_page != null and selected_page.? == page,
+            .restorable = runtime.workspace.snapshot_ref != null,
+        });
+    }
+
+    return results.toOwnedSlice(alloc);
+}
+
+pub fn workspaceControlListSessionsAlloc(
+    alloc: std.mem.Allocator,
+    workspace_target: ?[]const u8,
+) ![]WorkspaceControlSession {
+    const window = maybeWorkspaceControlWindow() orelse return try alloc.alloc(WorkspaceControlSession, 0);
+    refreshWorkspaceControlRuntime(window);
+
+    const resolved_workspace = resolveWorkspaceControlWorkspace(window, workspace_target) orelse {
+        if (workspace_target != null) return error.WorkspaceNotFound;
+        return try alloc.alloc(WorkspaceControlSession, 0);
+    };
+
+    var results: std.ArrayList(WorkspaceControlSession) = .empty;
+    defer results.deinit(alloc);
+
+    for (resolved_workspace.runtime.sessions.items) |session| {
+        const title = session.title_override orelse session.title;
+        const unread = switch (session.activity_state) {
+            .output_pending, .bell_pending => true,
+            else => false,
+        };
+        const has_attention = switch (session.activity_state) {
+            .bell_pending, .restore_failed => true,
+            else => false,
+        };
+        try results.append(alloc, .{
+            .session_id = session.session_id,
+            .workspace_id = session.workspace_id,
+            .tab_id = session.tab_id,
+            .title = try alloc.dupe(u8, title),
+            .cwd = try alloc.dupe(u8, session.cwd),
+            .focused = session.focus_state == .focused,
+            .unread = unread,
+            .has_attention = has_attention,
+        });
+    }
+
+    return results.toOwnedSlice(alloc);
+}
+
+pub fn workspaceControlOpen(
+    target: []const u8,
+    create: bool,
+) !WorkspaceControlOpenResult {
+    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
+    refreshWorkspaceControlRuntime(window);
+
+    if (resolveWorkspaceControlWorkspace(window, target)) |resolved| {
+        selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+        return .{
+            .workspace_id = resolved.runtime.workspace.workspace_id,
+            .name = resolved.runtime.workspace.name,
+            .selected_window_id = resolved.runtime.workspace.selected_window_id,
+            .selected_session_id = resolved.runtime.workspace.selected_session_id,
+        };
+    }
+
+    if (!create) return error.WorkspaceNotFound;
+
+    const alloc = Application.default().allocator();
+    const title = try alloc.dupeZ(u8, target);
+    defer alloc.free(title);
+    window.newWorkspaceForWindow(null, .{ .title = title });
+    refreshWorkspaceControlRuntime(window);
+
+    const resolved = resolveWorkspaceControlWorkspace(window, null) orelse return error.WorkspaceNotFound;
+    selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+    return .{
+        .workspace_id = resolved.runtime.workspace.workspace_id,
+        .name = resolved.runtime.workspace.name,
+        .selected_window_id = resolved.runtime.workspace.selected_window_id,
+        .selected_session_id = resolved.runtime.workspace.selected_session_id,
+    };
+}
+
+pub fn workspaceControlFocusSession(
+    session_target: []const u8,
+) !WorkspaceControlFocusResult {
+    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
+    refreshWorkspaceControlRuntime(window);
+
+    const resolved = resolveWorkspaceControlSession(window, session_target) orelse return error.SessionNotFound;
+    selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+    _ = resolved.leaf.selectSurface(resolved.surface);
+    resolved.window.as(gtk.Window).present();
+    resolved.surface.grabFocus();
+    refreshWorkspaceControlRuntime(resolved.window);
+
+    return .{
+        .focused_session_id = resolved.route.session_id,
+        .tab_id = resolved.route.tab_id,
+        .window_id = resolved.route.window_id,
+    };
+}
+
+pub fn workspaceControlSplitSession(
+    request: WorkspaceControlSplitRequest,
+) !WorkspaceControlSplitResult {
+    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
+    refreshWorkspaceControlRuntime(window);
+
+    const resolved = resolveWorkspaceControlSession(window, request.session) orelse return error.SessionNotFound;
+    const split_tree = resolved.workspace_page.getSplitTree();
+    const alloc = Application.default().allocator();
+
+    const cwd = if (request.cwd) |value| try alloc.dupeZ(u8, value) else null;
+    defer if (cwd) |value| alloc.free(value);
+
+    const command = if (request.command) |value|
+        try allocWorkspaceControlCommand(alloc, value)
+    else
+        null;
+    defer if (command) |*value| deinitWorkspaceControlCommand(alloc, value);
+
+    try split_tree.newSplitAtSurface(
+        workspaceControlSplitDirection(request.direction),
+        resolved.surface,
+        resolved.surface,
+        .{
+            .command = command,
+            .working_directory = cwd,
+        },
+    );
+    refreshWorkspaceControlRuntime(resolved.window);
+
+    const runtime = resolved.window.getWorkspaceRuntimeForPage(resolved.workspace_page) orelse return error.WorkspaceNotFound;
+    const route = workspace_registry.selectedSessionRoute(runtime) orelse return error.SessionNotFound;
+    return .{
+        .session_id = route.session_id,
+        .workspace_id = runtime.workspace.workspace_id,
+        .tab_id = route.tab_id,
+    };
+}
+
+pub fn workspaceControlCloseSession(
+    session_target: []const u8,
+) !WorkspaceControlCloseResult {
+    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
+    refreshWorkspaceControlRuntime(window);
+
+    const resolved = resolveWorkspaceControlSession(window, session_target) orelse return error.SessionNotFound;
+    if (!resolved.leaf.closeSurface(resolved.surface, .this)) return error.SessionNotFound;
+    refreshWorkspaceControlRuntime(resolved.window);
+
+    return .{
+        .closed_session_id = resolved.route.session_id,
+    };
+}
+
+fn maybeWorkspaceControlWindow() ?*Window {
+    const list = gtk.Window.listToplevels();
+    defer list.free();
+
+    var first: ?*Window = null;
+    var current: ?*glib.List = list;
+    while (current) |node| : (current = node.f_next) {
+        const data = node.f_data orelse continue;
+        const gtk_window: *gtk.Window = @ptrCast(@alignCast(data));
+        const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+        if (first == null) first = window;
+        if (gtk_window.isActive() != 0) return window;
+    }
+
+    return first;
+}
+
+fn refreshWorkspaceControlRuntime(window: *Window) void {
+    window.refreshWorkspaceRegistrySafe();
+}
+
+fn resolveWorkspaceControlWorkspace(
+    window: *Window,
+    target: ?[]const u8,
+) ?WorkspaceControlResolvedWorkspace {
+    const tab_view = window.getTabView();
+    const target_id = if (target) |value| parseWorkspaceControlWorkspaceRef(value) else null;
+    const selected_page = window.getSelectedWorkspacePage();
+    const n = tab_view.getNPages();
+
+    for (0..@intCast(n)) |i| {
+        const page = tab_view.getNthPage(@intCast(i));
+        const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
+        const runtime = window.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+
+        if (target == null) {
+            if (selected_page != null and selected_page.? == workspace_page) {
+                return .{
+                    .window = window,
+                    .workspace_page = workspace_page,
+                    .runtime = runtime,
+                };
+            }
+            continue;
+        }
+
+        if (target_id) |workspace_id| {
+            if (runtime.workspace.workspace_id != workspace_id) continue;
+            return .{
+                .window = window,
+                .workspace_page = workspace_page,
+                .runtime = runtime,
+            };
+        }
+
+        const title = workspace_page.getSidebarTitle() orelse runtime.workspace.name;
+        if (!std.mem.eql(u8, title, target.?)) {
+            if (!std.mem.eql(u8, runtime.workspace.name, target.?)) continue;
+        }
+
+        return .{
+            .window = window,
+            .workspace_page = workspace_page,
+            .runtime = runtime,
+        };
+    }
+
+    return null;
+}
+
+fn resolveWorkspaceControlSession(
+    window: *Window,
+    target: []const u8,
+) ?WorkspaceControlResolvedSession {
+    const session_id = parseWorkspaceControlSessionRef(target) orelse return null;
+    const tab_view = window.getTabView();
+    const n = tab_view.getNPages();
+
+    for (0..@intCast(n)) |i| {
+        const page = tab_view.getNthPage(@intCast(i));
+        const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
+        const runtime = window.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+        const route = workspace_registry.routeForSession(runtime, session_id) orelse continue;
+        const tree = workspace_page.getSurfaceTree() orelse continue;
+
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const surface_count = leaf.getSurfaceCount();
+            for (0..@intCast(surface_count)) |surface_index| {
+                const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse continue;
+                const surface_key = @intFromPtr(surface);
+                const candidate_session = window.private().session_identity_index.sessionForAttachment(surface_key) orelse continue;
+                if (candidate_session != route.session_id) continue;
+                return .{
+                    .window = window,
+                    .workspace_page = workspace_page,
+                    .runtime = runtime,
+                    .leaf = leaf,
+                    .surface = surface,
+                    .route = route,
+                };
+            }
+        }
+    }
+
+    return null;
+}
+
+fn selectWorkspaceControlPage(
+    window: *Window,
+    workspace_page: *WorkspacePage,
+) void {
+    const page = window.getTabView().getPage(workspace_page.as(gtk.Widget));
+    window.getTabView().setSelectedPage(page);
+    window.focusWorkspaceSelection(workspace_page);
+    window.as(gtk.Window).present();
+}
+
+fn parseWorkspaceControlWorkspaceRef(value: []const u8) ?workspace_ids.WorkspaceId {
+    if (std.mem.startsWith(u8, value, "workspace:")) {
+        const raw = std.fmt.parseInt(u64, value["workspace:".len..], 10) catch return null;
+        if (raw == 0) return null;
+        return workspace_ids.WorkspaceId.init(raw);
+    }
+
+    const parsed = workspace_ids.parse(value) catch return null;
+    return switch (parsed) {
+        .workspace => |workspace_id| workspace_id,
+        else => null,
+    };
+}
+
+fn parseWorkspaceControlSessionRef(value: []const u8) ?workspace_ids.SessionId {
+    if (std.mem.startsWith(u8, value, "session:")) {
+        const raw = std.fmt.parseInt(u64, value["session:".len..], 10) catch return null;
+        if (raw == 0) return null;
+        return workspace_ids.SessionId.init(raw);
+    }
+
+    const parsed = workspace_ids.parse(value) catch return null;
+    return switch (parsed) {
+        .session => |session_id| session_id,
+        else => null,
+    };
+}
+
+fn workspaceControlSplitDirection(
+    direction: WorkspaceControlSplitDirection,
+) SplitTabs.Tree.Split.Direction {
+    return switch (direction) {
+        .right => .right,
+        .left => .left,
+        .up => .up,
+        .down => .down,
+    };
+}
+
+fn allocWorkspaceControlCommand(
+    alloc: std.mem.Allocator,
+    command: WorkspaceControlCommand,
+) !configpkg.Command {
+    return switch (command) {
+        .shell => |value| .{ .shell = try alloc.dupeZ(u8, value) },
+        .argv => |argv| blk: {
+            var owned: std.ArrayList([:0]const u8) = .empty;
+            errdefer {
+                for (owned.items) |item| alloc.free(item);
+                owned.deinit(alloc);
+            }
+
+            for (argv) |item| {
+                try owned.append(alloc, try alloc.dupeZ(u8, item));
+            }
+
+            break :blk .{ .direct = try owned.toOwnedSlice(alloc) };
+        },
+    };
+}
+
+fn deinitWorkspaceControlCommand(
+    alloc: std.mem.Allocator,
+    command: *const configpkg.Command,
+) void {
+    switch (command.*) {
+        .shell => |value| alloc.free(value),
+        .direct => |argv| {
+            for (argv) |item| alloc.free(item);
+            alloc.free(argv);
+        },
+    }
+}
 
 fn testWorkspaceRuntime(
     alloc: std.mem.Allocator,

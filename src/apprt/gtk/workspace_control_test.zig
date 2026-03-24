@@ -24,7 +24,7 @@ test "ipc workspace control encodes stable request envelope" {
     try testing.expect(std.mem.indexOf(u8, encoded, "\"params\":{}") != null);
 }
 
-test "ipc workspace control returns stub workspace list response" {
+test "ipc workspace control returns workspace list response" {
     const testing = std.testing;
 
     const request = try workspace_control.encodeRequestAlloc(
@@ -58,7 +58,7 @@ test "ipc workspace control rejects unsupported methods with request id" {
     try testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"invalid_method\"") != null);
 }
 
-test "ipc workspace control validates session split params before stub dispatch" {
+test "ipc workspace control validates session split params before dispatch" {
     const testing = std.testing;
 
     const invalid_direction = try workspace_control.dispatchAlloc(
@@ -72,13 +72,13 @@ test "ipc workspace control validates session split params before stub dispatch"
     try testing.expect(std.mem.indexOf(u8, invalid_direction.response_json, "\"code\":\"invalid_params\"") != null);
 }
 
-test "ipc workspace control only marks session focus as focus-mutating" {
+test "ipc workspace control marks mutating workspace actions as focus-changing" {
     const testing = std.testing;
 
-    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.workspace_open.focusBehavior());
+    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.workspace_open.focusBehavior());
     try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.workspace_restore.focusBehavior());
-    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.session_split.focusBehavior());
-    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.session_close.focusBehavior());
+    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_split.focusBehavior());
+    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_close.focusBehavior());
     try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_focus.focusBehavior());
 }
 
@@ -114,7 +114,7 @@ test "ipc workspace control updates action state with caller-visible JSON" {
     );
     defer testing.allocator.free(request);
 
-    const action = workspace_control.createAction(testing.allocator);
+    const action = workspace_control.createAction();
     defer action.unref();
 
     const parameter = stringVariant(request);
