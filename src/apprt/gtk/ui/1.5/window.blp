@@ -275,6 +275,11 @@ menu main_menu {
   section {
     item {
       label: _("Change Workspace Title…");
+      action: "win.prompt-workspace-title";
+    }
+
+    item {
+      label: _("Change Tab Title…");
       action: "win.prompt-tab-title";
     }
 
@@ -295,8 +300,13 @@ menu main_menu {
       label: _("Split");
 
       item {
-        label: _("Change Title…");
+        label: _("Change Terminal Title…");
         action: "win.prompt-surface-title";
+      }
+
+      item {
+        label: _("Change Tab Title…");
+        action: "win.prompt-tab-title";
       }
 
       item {
@@ -371,6 +381,6 @@ menu main_menu {
 menu tab_context_menu {
   item {
     label: _("Change Workspace Title…");
-    action: "win.prompt-context-tab-title";
+    action: "win.prompt-context-workspace-title";
   }
 }

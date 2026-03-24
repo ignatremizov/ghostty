@@ -125,6 +125,19 @@ pub const TitleDialog = extern struct {
             alertDialogReady,
             self,
         );
+
+        _ = self.ref();
+        _ = glib.timeoutAdd(1, grabInitialFocus, self);
+    }
+
+    fn grabInitialFocus(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.unref();
+
+        const entry = self.private().entry;
+        _ = entry.as(gtk.Widget).grabFocus();
+        entry.as(gtk.Editable).selectRegion(0, -1);
+        return 0;
     }
 
     fn alertDialogReady(
@@ -220,10 +233,12 @@ pub const TitleDialog = extern struct {
 pub const Target = enum(c_int) {
     surface,
     tab,
+    workspace,
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .surface => i18n._("Change Terminal Title"),
-            .tab => i18n._("Change Workspace Title"),
+            .tab => i18n._("Change Tab Title"),
+            .workspace => i18n._("Change Workspace Title"),
         };
     }
 

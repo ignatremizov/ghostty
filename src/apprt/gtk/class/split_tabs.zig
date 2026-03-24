@@ -1,5 +1,6 @@
 const std = @import("std");
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -112,6 +113,10 @@ pub const SplitTabs = extern struct {
         disposing: bool = false,
         pending_close: PendingClosePage = .{},
         pending_close_dialog: ?*CloseConfirmationDialog = null,
+        context_menu_tab: ?*Tab = null,
+        context_menu_popover: ?*gtk.Popover = null,
+        pending_context_menu_rect: ?gdk.Rectangle = null,
+        pending_prompt_tab: ?*Tab = null,
         tab_bar: *adw.TabBar,
         tab_view: *adw.TabView,
         pub var offset: c_int = 0;
@@ -125,6 +130,17 @@ pub const SplitTabs = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+        const gesture = gtk.GestureClick.new();
+        gesture.as(gtk.GestureSingle).setButton(3);
+        gesture.as(gtk.EventController).setPropagationPhase(.capture);
+        _ = gtk.GestureClick.signals.released.connect(
+            gesture,
+            *Self,
+            tabBarSecondaryClick,
+            self,
+            .{},
+        );
+        self.private().tab_bar.as(gtk.Widget).addController(gesture.as(gtk.EventController));
     }
 
     pub fn getHasSurfaces(self: *Self) bool {
@@ -419,11 +435,115 @@ pub const SplitTabs = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
+    fn tabBarSecondaryClick(
+        gesture: *gtk.GestureClick,
+        _: c_int,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        _ = gesture;
+        const page = priv.tab_view.getSelectedPage() orelse return;
+        const child = page.getChild();
+        const tab = gobject.ext.cast(Tab, child) orelse return;
+        priv.context_menu_tab = tab;
+
+        const rect: gdk.Rectangle = .{
+            .f_x = @intFromFloat(x),
+            .f_y = @intFromFloat(y),
+            .f_width = 1,
+            .f_height = 1,
+        };
+        self.ensureContextMenuPopover();
+        if (priv.context_menu_popover.?.as(gtk.Widget).isVisible() != 0) {
+            priv.pending_context_menu_rect = null;
+            priv.context_menu_popover.?.setPointingTo(&rect);
+            return;
+        }
+
+        self.showContextMenu(rect);
+    }
+
+    fn ensureContextMenuPopover(self: *Self) void {
+        const priv = self.private();
+        if (priv.context_menu_popover != null) return;
+
+        const rename_button = gtk.Button.newWithLabel("Change Tab Title…");
+        rename_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            rename_button,
+            *Self,
+            tabBarRenameClicked,
+            self,
+            .{},
+        );
+
+        const popover = gtk.Popover.new();
+        popover.setHasArrow(0);
+        popover.setChild(rename_button.as(gtk.Widget));
+        popover.as(gtk.Widget).setParent(priv.tab_bar.as(gtk.Widget));
+        _ = gtk.Popover.signals.closed.connect(
+            popover,
+            *Self,
+            tabBarContextMenuClosed,
+            self,
+            .{},
+        );
+
+        priv.context_menu_popover = popover;
+    }
+
+    fn showContextMenu(self: *Self, rect: gdk.Rectangle) void {
+        const priv = self.private();
+        self.ensureContextMenuPopover();
+        priv.context_menu_popover.?.setPointingTo(&rect);
+        priv.context_menu_popover.?.popup();
+    }
+
+    fn tabBarRenameClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        const tab = priv.context_menu_tab orelse return;
+        if (priv.pending_prompt_tab) |old_tab| old_tab.unref();
+        priv.pending_prompt_tab = tab.ref();
+        if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
+            popover.popdown();
+        }
+    }
+
+    fn tabBarContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
+        _ = popover;
+        const priv = self.private();
+        priv.context_menu_tab = null;
+        if (priv.pending_prompt_tab) |tab| {
+            priv.pending_prompt_tab = null;
+            _ = glib.idleAdd(idlePromptTabTitle, tab);
+        }
+    }
+
+    fn idlePromptTabTitle(ud: ?*anyopaque) callconv(.c) c_int {
+        const tab: *Tab = @ptrCast(@alignCast(ud orelse return 0));
+        defer tab.unref();
+        tab.promptTitle();
+        return 0;
+    }
+
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.disposing = true;
         self.clearPendingCloseDialog(true);
         if (priv.pending_close.take()) |page| page.unref();
+        priv.context_menu_tab = null;
+        if (priv.context_menu_popover) |popover| {
+            popover.popdown();
+            popover.as(gtk.Widget).unparent();
+            priv.context_menu_popover = null;
+        }
+        priv.pending_context_menu_rect = null;
+        if (priv.pending_prompt_tab) |tab| {
+            tab.unref();
+            priv.pending_prompt_tab = null;
+        }
         _ = gobject.signalHandlersDisconnectMatched(
             priv.tab_view.as(gobject.Object),
             .{ .data = true },
@@ -491,7 +611,6 @@ pub const SplitTabs = extern struct {
             class.bindTemplateCallback("close_page", &tabViewClosePage);
             class.bindTemplateCallback("notify_selected_page", &tabViewSelectedPage);
             class.bindTemplateCallback("page_detached", &tabViewPageDetached);
-
             signals.@"surface-added".impl.register(.{});
             signals.@"surface-removed".impl.register(.{});
 

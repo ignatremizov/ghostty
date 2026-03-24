@@ -8,6 +8,7 @@ const gtk = @import("gtk");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const CoreSurface = @import("../../../Surface.zig");
+const internal_os = @import("../../../os/main.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -140,6 +141,32 @@ pub const WorkspacePage = extern struct {
                 },
             );
         };
+
+        pub const @"sidebar-title" = struct {
+            pub const name = "sidebar-title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("sidebar_title"),
+                },
+            );
+        };
+
+        pub const @"sidebar-subtitle" = struct {
+            pub const name = "sidebar-subtitle";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("sidebar_subtitle"),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -165,6 +192,12 @@ pub const WorkspacePage = extern struct {
 
         /// The manually overridden title from `promptWorkspaceTitle`.
         title_override: ?[:0]const u8 = null,
+
+        /// Stable workspace name shown in the sidebar.
+        sidebar_title: ?[:0]const u8 = null,
+
+        /// Secondary workspace metadata shown in the sidebar.
+        sidebar_subtitle: ?[:0]const u8 = null,
 
         /// The tooltip of this workspace page. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
@@ -288,7 +321,10 @@ pub const WorkspacePage = extern struct {
     }
     pub fn promptWorkspaceTitle(self: *Self) void {
         const priv = self.private();
-        const dialog = TitleDialog.new(.tab, priv.title_override orelse priv.title);
+        const dialog = TitleDialog.new(
+            .workspace,
+            priv.title_override orelse priv.sidebar_title orelse priv.title,
+        );
         _ = TitleDialog.signals.set.connect(
             dialog,
             *Self,
@@ -379,6 +415,14 @@ pub const WorkspacePage = extern struct {
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
+        }
+        if (priv.sidebar_title) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.sidebar_title = null;
+        }
+        if (priv.sidebar_subtitle) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.sidebar_subtitle = null;
         }
 
         gobject.Object.virtual_methods.finalize.call(
@@ -559,6 +603,81 @@ pub const WorkspacePage = extern struct {
         return glib.ext.dupeZ(u8, buf.written());
     }
 
+    fn closureComputedSidebarTitle(
+        _: *Self,
+        pwd_: ?[*:0]const u8,
+        terminal_: ?[*:0]const u8,
+        surface_override_: ?[*:0]const u8,
+        workspace_override_: ?[*:0]const u8,
+        _: *gobject.ParamSpec,
+    ) callconv(.c) ?[*:0]const u8 {
+        if (workspace_override_) |workspace_override| {
+            return glib.ext.dupeZ(u8, std.mem.span(workspace_override));
+        }
+
+        if (pwd_) |pwd| {
+            const path = std.mem.span(pwd);
+            const base = std.fs.path.basename(path);
+            const display = if (base.len > 0) base else path;
+            return glib.ext.dupeZ(u8, display);
+        }
+
+        if (surface_override_) |surface_override| {
+            return glib.ext.dupeZ(u8, std.mem.span(surface_override));
+        }
+
+        if (terminal_) |terminal| {
+            return glib.ext.dupeZ(u8, std.mem.span(terminal));
+        }
+
+        return glib.ext.dupeZ(u8, "Workspace");
+    }
+
+    fn closureComputedSidebarSubtitle(
+        _: *Self,
+        pwd_: ?[*:0]const u8,
+        terminal_: ?[*:0]const u8,
+        surface_override_: ?[*:0]const u8,
+        _: *gobject.ParamSpec,
+    ) callconv(.c) ?[*:0]const u8 {
+        if (pwd_) |pwd| {
+            return dupSidebarPath(std.mem.span(pwd));
+        }
+
+        if (surface_override_) |surface_override| {
+            return glib.ext.dupeZ(u8, std.mem.span(surface_override));
+        }
+
+        if (terminal_) |terminal| {
+            return glib.ext.dupeZ(u8, std.mem.span(terminal));
+        }
+
+        return null;
+    }
+
+    fn dupSidebarPath(path: []const u8) ?[*:0]const u8 {
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = internal_os.home(&home_buf) catch null;
+        if (home) |home_path| {
+            if (std.mem.eql(u8, path, home_path)) {
+                return glib.ext.dupeZ(u8, "~");
+            }
+
+            if (path.len > home_path.len and
+                std.mem.startsWith(u8, path, home_path) and
+                path[home_path.len] == std.fs.path.sep)
+            {
+                var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
+                defer buf.deinit();
+                buf.writer.writeByte('~') catch return glib.ext.dupeZ(u8, path);
+                buf.writer.writeAll(path[home_path.len..]) catch return glib.ext.dupeZ(u8, path);
+                return glib.ext.dupeZ(u8, buf.written());
+            }
+        }
+
+        return glib.ext.dupeZ(u8, path);
+    }
+
     const C = Common(Self, Private);
     pub const as = C.as;
     pub const ref = C.ref;
@@ -591,6 +710,8 @@ pub const WorkspacePage = extern struct {
                 properties.title.impl,
                 properties.@"title-override".impl,
                 properties.tooltip.impl,
+                properties.@"sidebar-title".impl,
+                properties.@"sidebar-subtitle".impl,
             });
 
             // Bindings
@@ -598,6 +719,8 @@ pub const WorkspacePage = extern struct {
 
             // Template Callbacks
             class.bindTemplateCallback("computed_title", &closureComputedTitle);
+            class.bindTemplateCallback("computed_sidebar_title", &closureComputedSidebarTitle);
+            class.bindTemplateCallback("computed_sidebar_subtitle", &closureComputedSidebarSubtitle);
             class.bindTemplateCallback("notify_active_surface", &propActiveSurface);
             class.bindTemplateCallback("notify_tree", &propSplitTree);
 
