@@ -105,6 +105,7 @@ pub const Workspace = struct {
     name: []const u8,
     slug: []const u8,
     origin: WorkspaceOrigin,
+    layout_root_id: ?[]const u8 = null,
     selected_window_id: ?ids.WindowId = null,
     selected_split_id: ?ids.SplitId = null,
     selected_tab_id: ?ids.TabId = null,

@@ -45,6 +45,7 @@ const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialo
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
 const workspace_control = @import("../workspace_control.zig");
+const workspace_ids = @import("../workspace_ids.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -180,6 +181,10 @@ pub const Application = extern struct {
 
         /// The global shortcut logic.
         global_shortcuts: *GlobalShortcuts,
+
+        /// Global runtime id generator shared by every GTK window. Workspace
+        /// control needs these ids to remain unique across the whole app.
+        runtime_ids: workspace_ids.Generator = .{},
 
         /// This is set to true so long as we request a window exactly
         /// once. This prevents quitting the app before we've shown one
@@ -466,6 +471,10 @@ pub const Application = extern struct {
     /// this wherever possible so we get leak detection in debug/tests.
     pub fn allocator(self: *Self) std.mem.Allocator {
         return self.private().core_app.alloc;
+    }
+
+    pub fn runtimeIds(self: *Self) *workspace_ids.Generator {
+        return &self.private().runtime_ids;
     }
 
     /// Get the original language that Ghostty was launched with. This returns a

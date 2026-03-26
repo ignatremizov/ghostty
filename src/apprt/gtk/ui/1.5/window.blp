@@ -383,4 +383,24 @@ menu tab_context_menu {
     label: _("Change Workspace Title…");
     action: "win.prompt-context-workspace-title";
   }
+
+  item {
+    label: _("Save Workspace");
+    action: "win.save-context-workspace";
+  }
+
+  item {
+    label: _("Reveal Snapshot");
+    action: "win.reveal-context-workspace-snapshot";
+  }
+
+  item {
+    label: _("Open Snapshot File…");
+    action: "win.open-context-workspace-snapshot";
+  }
+
+  item {
+    label: _("Delete Workspace");
+    action: "win.close-context-workspace";
+  }
 }

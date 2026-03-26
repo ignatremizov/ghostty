@@ -9,6 +9,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const i18n = @import("../../../os/main.zig").i18n;
+const internal_os = @import("../../../os/main.zig");
 const apprt = @import("../../../apprt.zig");
 const configpkg = @import("../../../config.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
@@ -35,8 +36,19 @@ const workspace_ids = @import("../workspace_ids.zig");
 const workspace_attention = @import("../workspace_attention.zig");
 const workspace_model = @import("../workspace_model.zig");
 const workspace_registry = @import("../workspace_registry.zig");
+const workspace_restore = @import("../workspace_restore.zig");
+const workspace_snapshot = @import("../workspace_snapshot.zig");
+const workspace_storage = @import("../workspace_storage.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
+
+const WorkspaceContextAction = enum {
+    rename,
+    save,
+    open_file,
+    reveal,
+    close,
+};
 
 pub const Window = extern struct {
     const Self = @This();
@@ -265,9 +277,12 @@ pub const Window = extern struct {
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
         context_menu_popover: ?*gtk.Popover = null,
+        workspace_empty_context_popover: ?*gtk.Popover = null,
         pending_context_menu_row: ?*gtk.ListBoxRow = null,
         pending_context_menu_rect: ?gdk.Rectangle = null,
-        pending_prompt_workspace_page: ?*WorkspacePage = null,
+        pending_context_workspace_page: ?*WorkspacePage = null,
+        pending_context_workspace_action: ?WorkspaceContextAction = null,
+        pending_workspace_empty_restore: bool = false,
         pending_surface_focus_source: ?c_uint = null,
         disposing_runtime: bool = false,
         runtime_window_id: ?workspace_ids.WindowId = null,
@@ -364,6 +379,18 @@ pub const Window = extern struct {
             self,
             null,
         );
+        {
+            const gesture = gtk.GestureClick.new();
+            gesture.as(gtk.GestureSingle).setButton(3);
+            _ = gtk.GestureClick.signals.released.connect(
+                gesture,
+                *Self,
+                workspaceListSecondaryClick,
+                self,
+                .{},
+            );
+            priv.workspace_list.as(gtk.Widget).addController(gesture.as(gtk.EventController));
+        }
         self.syncWorkspaceListSelection();
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to build initial workspace registry error={}", .{err});
@@ -407,6 +434,10 @@ pub const Window = extern struct {
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
             .init("prompt-context-workspace-title", actionPromptContextWorkspaceTitle, null),
+            .init("save-context-workspace", actionSaveContextWorkspace, null),
+            .init("open-context-workspace-snapshot", actionOpenContextWorkspaceSnapshot, null),
+            .init("reveal-context-workspace-snapshot", actionRevealContextWorkspaceSnapshot, null),
+            .init("close-context-workspace", actionCloseContextWorkspace, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
             .init("split-left", actionSplitLeft, null),
@@ -884,9 +915,37 @@ pub const Window = extern struct {
         self.showWorkspaceContextMenu(rect);
     }
 
+    fn workspaceListSecondaryClick(
+        _: *gtk.GestureClick,
+        _: c_int,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.workspace_list.getRowAtY(@intFromFloat(y)) != null) return;
+
+        const rect: gdk.Rectangle = .{
+            .f_x = @intFromFloat(x),
+            .f_y = @intFromFloat(y),
+            .f_width = 1,
+            .f_height = 1,
+        };
+        self.ensureWorkspaceEmptyContextMenuPopover();
+        if (priv.workspace_empty_context_popover.?.as(gtk.Widget).isVisible() != 0) {
+            priv.pending_workspace_empty_restore = false;
+            priv.workspace_empty_context_popover.?.setPointingTo(&rect);
+            return;
+        }
+
+        self.showWorkspaceEmptyContextMenu(rect);
+    }
+
     fn ensureWorkspaceContextMenuPopover(self: *Self) void {
         const priv = self.private();
         if (priv.context_menu_popover != null) return;
+        const content = gtk.Box.new(.vertical, 0);
+
         const rename_button = gtk.Button.newWithLabel(i18n._("Change Workspace Title…"));
         rename_button.as(gtk.Widget).setHalign(.fill);
         _ = gtk.Button.signals.clicked.connect(
@@ -897,9 +956,56 @@ pub const Window = extern struct {
             .{},
         );
 
+        const save_button = gtk.Button.newWithLabel(i18n._("Save Workspace"));
+        save_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            save_button,
+            *Self,
+            workspaceRowSaveClicked,
+            self,
+            .{},
+        );
+
+        const reveal_button = gtk.Button.newWithLabel(i18n._("Reveal Snapshot"));
+        reveal_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            reveal_button,
+            *Self,
+            workspaceRowRevealClicked,
+            self,
+            .{},
+        );
+
+        const open_button = gtk.Button.newWithLabel(i18n._("Open Snapshot File…"));
+        open_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            open_button,
+            *Self,
+            workspaceRowOpenSnapshotClicked,
+            self,
+            .{},
+        );
+
+        const delete_button = gtk.Button.newWithLabel(i18n._("Delete Workspace"));
+        delete_button.as(gtk.Widget).setHalign(.fill);
+        delete_button.as(gtk.Widget).addCssClass("destructive-action");
+        _ = gtk.Button.signals.clicked.connect(
+            delete_button,
+            *Self,
+            workspaceRowDeleteClicked,
+            self,
+            .{},
+        );
+
+        content.append(rename_button.as(gtk.Widget));
+        content.append(save_button.as(gtk.Widget));
+        content.append(reveal_button.as(gtk.Widget));
+        content.append(open_button.as(gtk.Widget));
+        content.append(delete_button.as(gtk.Widget));
+
         const popover = gtk.Popover.new();
         popover.setHasArrow(0);
-        popover.setChild(rename_button.as(gtk.Widget));
+        popover.setChild(content.as(gtk.Widget));
         popover.as(gtk.Widget).setParent(priv.workspace_list.as(gtk.Widget));
         _ = gtk.Popover.signals.closed.connect(
             popover,
@@ -912,6 +1018,37 @@ pub const Window = extern struct {
         priv.context_menu_popover = popover;
     }
 
+    fn ensureWorkspaceEmptyContextMenuPopover(self: *Self) void {
+        const priv = self.private();
+        if (priv.workspace_empty_context_popover != null) return;
+
+        const content = gtk.Box.new(.vertical, 0);
+        const restore_button = gtk.Button.newWithLabel(i18n._("Restore Workspace…"));
+        restore_button.as(gtk.Widget).setHalign(.fill);
+        _ = gtk.Button.signals.clicked.connect(
+            restore_button,
+            *Self,
+            workspaceEmptyRestoreClicked,
+            self,
+            .{},
+        );
+        content.append(restore_button.as(gtk.Widget));
+
+        const popover = gtk.Popover.new();
+        popover.setHasArrow(0);
+        popover.setChild(content.as(gtk.Widget));
+        popover.as(gtk.Widget).setParent(priv.workspace_list.as(gtk.Widget));
+        _ = gtk.Popover.signals.closed.connect(
+            popover,
+            *Self,
+            workspaceEmptyContextMenuClosed,
+            self,
+            .{},
+        );
+
+        priv.workspace_empty_context_popover = popover;
+    }
+
     fn showWorkspaceContextMenu(self: *Self, rect: gdk.Rectangle) void {
         const priv = self.private();
         self.ensureWorkspaceContextMenuPopover();
@@ -919,13 +1056,53 @@ pub const Window = extern struct {
         priv.context_menu_popover.?.popup();
     }
 
+    fn showWorkspaceEmptyContextMenu(self: *Self, rect: gdk.Rectangle) void {
+        const priv = self.private();
+        self.ensureWorkspaceEmptyContextMenuPopover();
+        priv.workspace_empty_context_popover.?.setPointingTo(&rect);
+        priv.workspace_empty_context_popover.?.popup();
+    }
+
     fn workspaceRowRenameClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueWorkspaceRowContextAction(button, .rename);
+    }
+
+    fn workspaceRowSaveClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueWorkspaceRowContextAction(button, .save);
+    }
+
+    fn workspaceRowRevealClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueWorkspaceRowContextAction(button, .reveal);
+    }
+
+    fn workspaceRowOpenSnapshotClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueWorkspaceRowContextAction(button, .open_file);
+    }
+
+    fn workspaceRowDeleteClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueWorkspaceRowContextAction(button, .close);
+    }
+
+    fn workspaceEmptyRestoreClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const priv = self.private();
+        priv.pending_workspace_empty_restore = true;
+        if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
+            popover.popdown();
+        }
+    }
+
+    fn queueWorkspaceRowContextAction(
+        self: *Self,
+        button: *gtk.Button,
+        action: WorkspaceContextAction,
+    ) void {
         const priv = self.private();
         const page = priv.context_menu_page orelse return;
         const child = page.getChild();
         const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        if (priv.pending_prompt_workspace_page) |old_page| old_page.unref();
-        priv.pending_prompt_workspace_page = workspace_page.ref();
+        if (priv.pending_context_workspace_page) |old_page| old_page.unref();
+        priv.pending_context_workspace_page = workspace_page.ref();
+        priv.pending_context_workspace_action = action;
         if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
             popover.popdown();
         }
@@ -934,10 +1111,27 @@ pub const Window = extern struct {
     fn workspaceRowContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
         _ = popover;
         const priv = self.private();
-        if (priv.pending_prompt_workspace_page) |workspace_page| {
-            priv.pending_prompt_workspace_page = null;
-            _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
+        if (priv.pending_context_workspace_page) |workspace_page| {
+            priv.pending_context_workspace_page = null;
+            const action = priv.pending_context_workspace_action orelse .rename;
+            priv.pending_context_workspace_action = null;
+            switch (action) {
+                .rename => _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page),
+                .save => _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page),
+                .open_file => _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page),
+                .reveal => _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page),
+                .close => _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page),
+            }
         }
+    }
+
+    fn workspaceEmptyContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
+        _ = popover;
+        const priv = self.private();
+        if (!priv.pending_workspace_empty_restore) return;
+        priv.pending_workspace_empty_restore = false;
+        _ = self.ref();
+        _ = glib.idleAdd(idleShowRestoreWorkspaceCommands, self);
     }
 
     fn workspaceListRowSelected(
@@ -1363,6 +1557,94 @@ pub const Window = extern struct {
         return &self.private().runtime_registry;
     }
 
+    const WorkspaceLayoutProjection = struct {
+        layout_root_id: []const u8,
+        representative_split_id: workspace_ids.SplitId,
+        contains_selected_split: bool,
+    };
+
+    const WorkspaceLeafLayoutRef = struct {
+        split_id: workspace_ids.SplitId,
+        layout_root_id: []const u8,
+        is_selected: bool,
+    };
+
+    fn workspaceLayoutDirection(
+        layout: SplitTabs.Tree.Split.Layout,
+    ) workspace_model.SplitDirection {
+        return switch (layout) {
+            .horizontal => .right,
+            .vertical => .down,
+        };
+    }
+
+    fn appendWorkspaceLayoutProjection(
+        self: *Self,
+        runtime: *workspace_registry.WorkspaceRuntime,
+        tree: *const SplitTabs.Tree,
+        handle: SplitTabs.Tree.Node.Handle,
+        leaf_layout_by_handle: *const std.AutoHashMap(usize, WorkspaceLeafLayoutRef),
+    ) !WorkspaceLayoutProjection {
+        const node = tree.nodes[handle.idx()];
+        return switch (node) {
+            .leaf => blk: {
+                const leaf_ref = leaf_layout_by_handle.get(handle.idx()) orelse return error.WorkspaceLayoutLeafMissing;
+                break :blk .{
+                    .layout_root_id = leaf_ref.layout_root_id,
+                    .representative_split_id = leaf_ref.split_id,
+                    .contains_selected_split = leaf_ref.is_selected,
+                };
+            },
+            .split => |split| blk: {
+                const left = try appendWorkspaceLayoutProjection(
+                    self,
+                    runtime,
+                    tree,
+                    split.left,
+                    leaf_layout_by_handle,
+                );
+                const right = try appendWorkspaceLayoutProjection(
+                    self,
+                    runtime,
+                    tree,
+                    split.right,
+                    leaf_layout_by_handle,
+                );
+                const contains_selected_split = left.contains_selected_split or right.contains_selected_split;
+                const representative_split_id = if (left.contains_selected_split)
+                    left.representative_split_id
+                else if (right.contains_selected_split)
+                    right.representative_split_id
+                else
+                    left.representative_split_id;
+                const layout_root_id = try std.fmt.allocPrint(
+                    runtime.runtimeAllocator(),
+                    "workspace-layout-{d}-{d}",
+                    .{ runtime.workspace.workspace_id.raw(), handle.idx() },
+                );
+                try runtime.layout.append(Application.default().allocator(), .{
+                    .layout_node_id = layout_root_id,
+                    .workspace_id = runtime.workspace.workspace_id,
+                    .split_id = representative_split_id,
+                    .tab_id = null,
+                    .node_type = .split,
+                    .split_direction = workspaceLayoutDirection(split.layout),
+                    .ratio = split.ratio,
+                    .child_ids = try runtime.runtimeAllocator().dupe(
+                        []const u8,
+                        &.{ left.layout_root_id, right.layout_root_id },
+                    ),
+                    .is_selected = contains_selected_split,
+                });
+                break :blk .{
+                    .layout_root_id = layout_root_id,
+                    .representative_split_id = representative_split_id,
+                    .contains_selected_split = contains_selected_split,
+                };
+            },
+        };
+    }
+
     fn refreshWorkspaceRegistry(self: *Self) !void {
         const priv = self.private();
         const alloc = Application.default().allocator();
@@ -1401,6 +1683,8 @@ pub const Window = extern struct {
             defer tab_ids.deinit(alloc);
             var session_ids: std.ArrayList(workspace_ids.SessionId) = .empty;
             defer session_ids.deinit(alloc);
+            var leaf_layout_by_handle = std.AutoHashMap(usize, WorkspaceLeafLayoutRef).init(alloc);
+            defer leaf_layout_by_handle.deinit();
 
             var it = tree.iterator();
             var split_ordinal: usize = 0;
@@ -1459,7 +1743,7 @@ pub const Window = extern struct {
                         },
                     );
                     const session_id = try priv.session_identity_index.resolvePath(
-                        &priv.runtime_registry.ids,
+                        Application.default().runtimeIds(),
                         session_path,
                     );
                     try priv.session_identity_index.bindSession(session_id, surface_key, session_path);
@@ -1512,6 +1796,9 @@ pub const Window = extern struct {
                         .session_id = session_id,
                         .is_selected = selected_tab,
                     });
+                    var launch_command = try surface.cloneLaunchCommand(runtime.runtimeAllocator());
+                    defer if (launch_command) |*command| command.deinit(runtime.runtimeAllocator());
+
                     try runtime.sessions.append(alloc, .{
                         .session_id = session_id,
                         .workspace_id = runtime.workspace.workspace_id,
@@ -1522,7 +1809,10 @@ pub const Window = extern struct {
                         .title = title,
                         .title_override = surface.getTitleOverride(),
                         .cwd = surface.getPwd() orelse "",
-                        .command = .{ .shell = "" },
+                        .command = try workspaceModelCommandFromSurfaceAlloc(
+                            runtime.runtimeAllocator(),
+                            launch_command,
+                        ),
                         .focus_state = if (surface.getFocused())
                             .focused
                         else if (selected_tab)
@@ -1566,8 +1856,23 @@ pub const Window = extern struct {
                     .child_ids = try runtime.runtimeAllocator().dupe([]const u8, split_child_ids.items),
                     .is_selected = split_selected,
                 });
+                try leaf_layout_by_handle.put(entry.handle.idx(), .{
+                    .split_id = split_id,
+                    .layout_root_id = split_root_id,
+                    .is_selected = split_selected,
+                });
                 runtime.workspace.attention_summary.merge(split_attention);
                 split_ordinal += 1;
+            }
+
+            if (tree.nodes.len > 0) {
+                const projection = try self.appendWorkspaceLayoutProjection(
+                    runtime,
+                    tree,
+                    .root,
+                    &leaf_layout_by_handle,
+                );
+                runtime.workspace.layout_root_id = projection.layout_root_id;
             }
 
             runtime.workspace.selected_window_id = priv.runtime_window_id;
@@ -1593,14 +1898,22 @@ pub const Window = extern struct {
         const priv = self.private();
         const key = ptrKey(workspace_page);
         if (priv.workspace_ids_by_page.get(key)) |workspace_id| {
-            return priv.runtime_registry.findWorkspace(workspace_id) orelse error.WorkspaceNotFound;
+            if (priv.runtime_registry.findWorkspace(workspace_id)) |runtime| {
+                return runtime;
+            }
+            _ = priv.workspace_ids_by_page.remove(key);
         }
 
         const title = workspace_page.getSidebarTitle() orelse workspace_page.getTitleOverride() orelse "workspace";
         const created_at = try allocUtcTimestamp(Application.default().allocator());
         defer Application.default().allocator().free(created_at);
         const title_text: []const u8 = title;
-        const runtime = try priv.runtime_registry.createWorkspace(title_text, title_text, created_at);
+        const runtime = try priv.runtime_registry.createWorkspaceWithId(
+            Application.default().runtimeIds().next(.workspace),
+            title_text,
+            title_text,
+            created_at,
+        );
         try priv.workspace_ids_by_page.put(key, runtime.workspace.workspace_id);
         return runtime;
     }
@@ -1631,7 +1944,7 @@ pub const Window = extern struct {
     fn appendWindowRuntime(self: *Self, runtime: *workspace_registry.WorkspaceRuntime) !void {
         const priv = self.private();
         if (priv.runtime_window_id == null) {
-            priv.runtime_window_id = priv.runtime_registry.ids.next(.window);
+            priv.runtime_window_id = Application.default().runtimeIds().next(.window);
         }
         try runtime.windows.append(Application.default().allocator(), .{
             .window_id = priv.runtime_window_id.?,
@@ -1664,7 +1977,7 @@ pub const Window = extern struct {
         const priv = self.private();
         const key = ptrKey(leaf);
         if (priv.split_ids_by_leaf.get(key)) |id| return id;
-        const id = priv.runtime_registry.ids.next(.split);
+        const id = Application.default().runtimeIds().next(.split);
         try priv.split_ids_by_leaf.put(key, id);
         return id;
     }
@@ -1673,7 +1986,7 @@ pub const Window = extern struct {
         const priv = self.private();
         const key = ptrKey(tab);
         if (priv.tab_ids_by_widget.get(key)) |id| return id;
-        const id = priv.runtime_registry.ids.next(.tab);
+        const id = Application.default().runtimeIds().next(.tab);
         try priv.tab_ids_by_widget.put(key, id);
         return id;
     }
@@ -1682,7 +1995,7 @@ pub const Window = extern struct {
         const priv = self.private();
         const key = ptrKey(surface);
         if (priv.surface_ids_by_widget.get(key)) |id| return id;
-        const id = priv.runtime_registry.ids.next(.surface);
+        const id = Application.default().runtimeIds().next(.surface);
         try priv.surface_ids_by_widget.put(key, id);
         return id;
     }
@@ -1740,7 +2053,7 @@ pub const Window = extern struct {
         });
     }
 
-    fn refreshWorkspaceRegistrySafe(self: *Self) void {
+    pub fn refreshWorkspaceRegistrySafe(self: *Self) void {
         if (self.private().disposing_runtime) return;
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to refresh workspace registry error={}", .{err});
@@ -1749,13 +2062,15 @@ pub const Window = extern struct {
         self.syncWorkspaceListBadges();
     }
 
-    fn getWorkspaceRuntimeForPage(
+    pub fn getWorkspaceRuntimeForPage(
         self: *Self,
         workspace_page: *WorkspacePage,
     ) ?*workspace_registry.WorkspaceRuntime {
         const priv = self.private();
         const workspace_id = priv.workspace_ids_by_page.get(ptrKey(workspace_page)) orelse return null;
-        return priv.runtime_registry.findWorkspace(workspace_id);
+        if (priv.runtime_registry.findWorkspace(workspace_id)) |runtime| return runtime;
+        _ = priv.workspace_ids_by_page.remove(ptrKey(workspace_page));
+        return null;
     }
 
     fn focusWorkspaceSelection(self: *Self, workspace_page: *WorkspacePage) void {
@@ -2273,12 +2588,19 @@ pub const Window = extern struct {
             popover.as(gtk.Widget).unparent();
             priv.context_menu_popover = null;
         }
+        if (priv.workspace_empty_context_popover) |popover| {
+            popover.popdown();
+            popover.as(gtk.Widget).unparent();
+            priv.workspace_empty_context_popover = null;
+        }
         priv.pending_context_menu_row = null;
         priv.pending_context_menu_rect = null;
-        if (priv.pending_prompt_workspace_page) |page| {
+        if (priv.pending_context_workspace_page) |page| {
             page.unref();
-            priv.pending_prompt_workspace_page = null;
+            priv.pending_context_workspace_page = null;
         }
+        priv.pending_context_workspace_action = null;
+        priv.pending_workspace_empty_restore = false;
         if (priv.pending_surface_focus_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_surface_focus_source = null;
@@ -2301,17 +2623,17 @@ pub const Window = extern struct {
                 self.disconnectSurfaceHandlers(tree);
             }
         }
+        gtk.Widget.disposeTemplate(
+            self.as(gtk.Widget),
+            getGObjectType(),
+        );
+
         priv.session_identity_index.deinit();
         priv.workspace_ids_by_page.deinit();
         priv.split_ids_by_leaf.deinit();
         priv.tab_ids_by_widget.deinit();
         priv.surface_ids_by_widget.deinit();
         priv.runtime_registry.deinit();
-
-        gtk.Widget.disposeTemplate(
-            self.as(gtk.Widget),
-            getGObjectType(),
-        );
 
         gobject.Object.virtual_methods.dispose.call(
             Class.parent,
@@ -2652,6 +2974,8 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
+        if (self.private().disposing_runtime) return;
+
         // We need to get the workspace page to disconnect the signals.
         const child = page.getChild();
         const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
@@ -2668,6 +2992,13 @@ pub const Window = extern struct {
         // Remove the tree handlers
         if (workspace_page.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
+        }
+
+        const priv = self.private();
+        const page_key = ptrKey(workspace_page);
+        if (priv.workspace_ids_by_page.get(page_key)) |workspace_id| {
+            _ = priv.runtime_registry.removeWorkspace(workspace_id);
+            _ = priv.workspace_ids_by_page.remove(page_key);
         }
         self.refreshWorkspaceRegistrySafe();
     }
@@ -3019,6 +3350,45 @@ pub const Window = extern struct {
         return 0;
     }
 
+    fn idleSaveWorkspacePage(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
+        window.saveWorkspacePage(workspace_page);
+        return 0;
+    }
+
+    fn idleCloseWorkspacePage(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
+        window.closeWorkspacePage(workspace_page);
+        return 0;
+    }
+
+    fn idleRevealWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
+        window.revealWorkspaceSnapshot(workspace_page);
+        return 0;
+    }
+
+    fn idleOpenWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
+        window.openWorkspaceSnapshot(workspace_page);
+        return 0;
+    }
+
+    fn idleShowRestoreWorkspaceCommands(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.unref();
+        self.showRestoreWorkspaceCommands();
+        return 0;
+    }
+
     fn promptContextWorkspaceTitle(self: *Self) void {
         const priv = self.private();
         const page = priv.context_menu_page orelse return;
@@ -3028,12 +3398,106 @@ pub const Window = extern struct {
         _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
     }
 
+    fn saveContextWorkspace(self: *Self) void {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return;
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page);
+    }
+
+    fn closeContextWorkspace(self: *Self) void {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return;
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page);
+    }
+
+    fn revealContextWorkspaceSnapshot(self: *Self) void {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return;
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page);
+    }
+
+    fn openContextWorkspaceSnapshot(self: *Self) void {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return;
+        const child = page.getChild();
+        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
+        _ = workspace_page.ref();
+        _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page);
+    }
+
+    fn getOrCreateCommandPalette(self: *Window) *CommandPalette {
+        const priv = self.private();
+        return priv.command_palette.get() orelse command_palette: {
+            const command_palette = CommandPalette.new();
+
+            _ = gobject.Object.bindProperty(
+                self.as(gobject.Object),
+                "config",
+                command_palette.as(gobject.Object),
+                "config",
+                .{ .sync_create = true },
+            );
+
+            _ = CommandPalette.signals.trigger.connect(
+                command_palette,
+                *Window,
+                signalCommandPaletteTrigger,
+                self,
+                .{},
+            );
+
+            priv.command_palette.set(command_palette);
+            break :command_palette command_palette;
+        };
+    }
+
     fn actionPromptContextWorkspaceTitle(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
         self.promptContextWorkspaceTitle();
+    }
+
+    fn actionSaveContextWorkspace(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.saveContextWorkspace();
+    }
+
+    fn actionCloseContextWorkspace(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.closeContextWorkspace();
+    }
+
+    fn actionRevealContextWorkspaceSnapshot(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.revealContextWorkspaceSnapshot();
+    }
+
+    fn actionOpenContextWorkspaceSnapshot(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        self.openContextWorkspaceSnapshot();
     }
 
     fn actionPromptWorkspaceTitle(
@@ -3060,6 +3524,161 @@ pub const Window = extern struct {
         self: *Window,
     ) callconv(.c) void {
         self.performBindingAction(.prompt_tab_title);
+    }
+
+    fn saveWorkspacePage(self: *Self, workspace_page: *WorkspacePage) void {
+        const alloc = Application.default().allocator();
+        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| {
+            log.warn("failed to save workspace error={}", .{err});
+            self.addToast(i18n._("Failed to save workspace"));
+            return;
+        };
+        defer result.deinit(alloc);
+        const title = std.fmt.allocPrintSentinel(alloc, "{s}: {s}", .{
+            i18n._("Workspace saved"),
+            std.fs.path.basename(result.path),
+        }, 0) catch {
+            self.addToast(i18n._("Workspace saved"));
+            return;
+        };
+        defer alloc.free(title);
+        self.addToast(title);
+    }
+
+    fn closeWorkspacePage(self: *Self, workspace_page: *WorkspacePage) void {
+        const page = self.private().tab_view.getPage(workspace_page.as(gtk.Widget));
+        self.private().tab_view.closePage(page);
+    }
+
+    fn revealWorkspaceSnapshot(self: *Self, workspace_page: *WorkspacePage) void {
+        const alloc = Application.default().allocator();
+        const snapshot_path = workspaceSnapshotPathAlloc(self, alloc, workspace_page) catch |err| {
+            log.warn("failed to resolve workspace snapshot path error={}", .{err});
+            self.addToast(i18n._("Failed to reveal workspace snapshot"));
+            return;
+        } orelse {
+            self.addToast(i18n._("Save the workspace before revealing its snapshot"));
+            return;
+        };
+        defer alloc.free(snapshot_path);
+
+        _ = revealPathInFileManager(snapshot_path) catch |err| {
+            log.warn("failed to reveal workspace snapshot error={}", .{err});
+            self.addToast(i18n._("Failed to reveal workspace snapshot"));
+            return;
+        };
+    }
+
+    fn openWorkspaceSnapshot(self: *Self, workspace_page: *WorkspacePage) void {
+        const alloc = Application.default().allocator();
+        const snapshot_path = workspaceSnapshotPathAlloc(self, alloc, workspace_page) catch |err| {
+            log.warn("failed to resolve workspace snapshot path error={}", .{err});
+            self.addToast(i18n._("Failed to open workspace snapshot"));
+            return;
+        } orelse {
+            self.addToast(i18n._("Save the workspace before opening its snapshot"));
+            return;
+        };
+        defer alloc.free(snapshot_path);
+
+        internal_os.open(alloc, .text, snapshot_path) catch |err| {
+            log.warn("failed to open workspace snapshot error={}", .{err});
+            self.addToast(i18n._("Failed to open workspace snapshot"));
+            return;
+        };
+    }
+
+    pub fn showRestoreWorkspaceCommands(self: *Window) void {
+        const alloc = Application.default().allocator();
+        var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
+            log.warn("failed to read restore workspace catalog error={}", .{err});
+            self.addToast(i18n._("Failed to load saved workspaces"));
+            return;
+        };
+        defer catalog.deinit(alloc);
+
+        if (catalog.entries.len == 0) {
+            self.addToast(i18n._("No saved workspaces to restore"));
+            return;
+        }
+
+        const command_palette = self.getOrCreateCommandPalette();
+        defer command_palette.unref();
+        command_palette.presentQuery(self, "Restore Workspace");
+    }
+
+    pub fn restoreSavedWorkspace(self: *Window, target: []const u8) void {
+        const alloc = Application.default().allocator();
+        var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
+            log.warn("failed to read restore workspace catalog error={}", .{err});
+            self.addToast(i18n._("Failed to load saved workspaces"));
+            return;
+        };
+        defer catalog.deinit(alloc);
+
+        const entry = findSavedWorkspaceCatalogEntry(catalog.entries, target) orelse {
+            self.addToast(i18n._("Saved workspace snapshot not found"));
+            return;
+        };
+
+        var dir = workspace_storage.openDefaultStorageDirAlloc(alloc) catch |err| {
+            log.warn("failed to open workspace storage directory error={}", .{err});
+            self.addToast(i18n._("Failed to restore workspace"));
+            return;
+        } orelse {
+            self.addToast(i18n._("No saved workspaces to restore"));
+            return;
+        };
+        defer dir.close();
+
+        const storage = workspace_storage.Storage.init(alloc, dir);
+        var snapshot_value = storage.readSnapshotAlloc(alloc, entry.path) catch |err| {
+            log.warn("failed to load workspace snapshot error={}", .{err});
+            self.addToast(i18n._("Failed to restore workspace"));
+            return;
+        };
+        defer snapshot_value.deinit(alloc);
+
+        var plan = workspace_restore.planAlloc(alloc, snapshot_value) catch |err| {
+            log.warn("failed to plan workspace restore error={}", .{err});
+            self.addToast(i18n._("Saved workspace snapshot is invalid"));
+            return;
+        };
+        defer plan.deinit(alloc);
+
+        const results = workspaceControlRestoreAlloc(self, alloc, snapshot_value, &plan) catch |err| switch (err) {
+            error.TabMultiSessionUnsupported => {
+                self.addToast(i18n._("Restore does not yet support multiple sessions inside one tab"));
+                return;
+            },
+            error.WorkspaceSessionEnvUnsupported => {
+                self.addToast(i18n._("Restore does not yet support per-session environment overrides"));
+                return;
+            },
+            error.WorkspaceLayoutMissing,
+            error.WorkspaceLayoutInvalid,
+            => {
+                self.addToast(i18n._("Saved workspace snapshot is missing a valid layout"));
+                return;
+            },
+            else => {
+                log.warn("failed to replay workspace restore error={}", .{err});
+                self.addToast(i18n._("Failed to restore workspace"));
+                return;
+            },
+        };
+        defer {
+            for (results.failed_sessions) |failure| {
+                alloc.free(failure.code);
+                alloc.free(failure.message);
+            }
+            alloc.free(results.failed_sessions);
+            alloc.free(results.restored_session_ids);
+            if (results.selection_fallback) |selection_fallback| alloc.free(selection_fallback.reason);
+        }
+
+        self.as(gtk.Window).present();
+        self.addToast(i18n._("Workspace restored"));
     }
 
     fn actionSplitRight(
@@ -3157,40 +3776,7 @@ pub const Window = extern struct {
     ///
     /// TODO: accept the surface that toggled the command palette as a parameter
     fn toggleCommandPalette(self: *Window) void {
-        const priv = self.private();
-
-        // Get a reference to a command palette. First check the weak reference
-        // that we save to see if we already have one stored. If we don't then
-        // create a new one.
-        const command_palette = priv.command_palette.get() orelse command_palette: {
-            // Create a fresh command palette.
-            const command_palette = CommandPalette.new();
-
-            // Synchronize our config to the command palette's config.
-            _ = gobject.Object.bindProperty(
-                self.as(gobject.Object),
-                "config",
-                command_palette.as(gobject.Object),
-                "config",
-                .{ .sync_create = true },
-            );
-
-            // Listen to the activate signal to know if the user selected an option in
-            // the command palette.
-            _ = CommandPalette.signals.trigger.connect(
-                command_palette,
-                *Window,
-                signalCommandPaletteTrigger,
-                self,
-                .{},
-            );
-
-            // Save a weak reference to the command palette. We use a weak reference to avoid
-            // reference counting cycles that might cause problems later.
-            priv.command_palette.set(command_palette);
-
-            break :command_palette command_palette;
-        };
+        const command_palette = self.getOrCreateCommandPalette();
         defer command_palette.unref();
 
         // Tell the command palette to toggle itself. If the dialog gets
@@ -3392,7 +3978,26 @@ pub const WorkspaceControlCloseResult = struct {
     closed_session_id: workspace_ids.SessionId,
 };
 
-const WorkspaceControlResolvedWorkspace = struct {
+pub const WorkspaceControlSaveResult = struct {
+    workspace_id: workspace_ids.WorkspaceId,
+    snapshot_id: workspace_ids.SnapshotId,
+    saved_at: []const u8,
+    path: []const u8,
+
+    pub fn deinit(self: *const WorkspaceControlSaveResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.saved_at);
+        alloc.free(self.path);
+    }
+};
+
+pub const WorkspaceControlRestoreUnsupported = error{
+    TabMultiSessionUnsupported,
+    WorkspaceLayoutMissing,
+    WorkspaceLayoutInvalid,
+    WorkspaceSessionEnvUnsupported,
+};
+
+pub const WorkspaceControlResolvedWorkspace = struct {
     window: *Window,
     workspace_page: *WorkspacePage,
     runtime: *workspace_registry.WorkspaceRuntime,
@@ -3408,21 +4013,21 @@ const WorkspaceControlResolvedSession = struct {
 };
 
 pub fn workspaceControlListAlloc(
+    self: *Window,
     alloc: std.mem.Allocator,
 ) ![]WorkspaceControlWorkspace {
-    const window = maybeWorkspaceControlWindow() orelse return try alloc.alloc(WorkspaceControlWorkspace, 0);
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
     var results: std.ArrayList(WorkspaceControlWorkspace) = .empty;
     defer results.deinit(alloc);
 
-    const tab_view = window.getTabView();
+    const tab_view = self.getTabView();
     const selected_page = tab_view.getSelectedPage();
     const n = tab_view.getNPages();
     for (0..@intCast(n)) |i| {
         const page = tab_view.getNthPage(@intCast(i));
         const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
-        const runtime = window.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
         const summary = runtime.workspace.attention_summary;
         try results.append(alloc, .{
             .workspace_id = runtime.workspace.workspace_id,
@@ -3441,13 +4046,13 @@ pub fn workspaceControlListAlloc(
 }
 
 pub fn workspaceControlListSessionsAlloc(
+    self: *Window,
     alloc: std.mem.Allocator,
     workspace_target: ?[]const u8,
 ) ![]WorkspaceControlSession {
-    const window = maybeWorkspaceControlWindow() orelse return try alloc.alloc(WorkspaceControlSession, 0);
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
-    const resolved_workspace = resolveWorkspaceControlWorkspace(window, workspace_target) orelse {
+    const resolved_workspace = resolveWorkspaceControlWorkspace(self, workspace_target) orelse {
         if (workspace_target != null) return error.WorkspaceNotFound;
         return try alloc.alloc(WorkspaceControlSession, 0);
     };
@@ -3481,13 +4086,13 @@ pub fn workspaceControlListSessionsAlloc(
 }
 
 pub fn workspaceControlOpen(
+    self: *Window,
     target: []const u8,
     create: bool,
 ) !WorkspaceControlOpenResult {
-    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
-    if (resolveWorkspaceControlWorkspace(window, target)) |resolved| {
+    if (resolveWorkspaceControlWorkspace(self, target)) |resolved| {
         selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
         return .{
             .workspace_id = resolved.runtime.workspace.workspace_id,
@@ -3502,10 +4107,10 @@ pub fn workspaceControlOpen(
     const alloc = Application.default().allocator();
     const title = try alloc.dupeZ(u8, target);
     defer alloc.free(title);
-    window.newWorkspaceForWindow(null, .{ .title = title });
-    refreshWorkspaceControlRuntime(window);
+    self.newWorkspaceForWindow(null, .{ .title = title });
+    refreshWorkspaceControlRuntime(self);
 
-    const resolved = resolveWorkspaceControlWorkspace(window, null) orelse return error.WorkspaceNotFound;
+    const resolved = resolveWorkspaceControlWorkspace(self, null) orelse return error.WorkspaceNotFound;
     selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
     return .{
         .workspace_id = resolved.runtime.workspace.workspace_id,
@@ -3516,12 +4121,12 @@ pub fn workspaceControlOpen(
 }
 
 pub fn workspaceControlFocusSession(
+    self: *Window,
     session_target: []const u8,
 ) !WorkspaceControlFocusResult {
-    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
-    const resolved = resolveWorkspaceControlSession(window, session_target) orelse return error.SessionNotFound;
+    const resolved = resolveWorkspaceControlSession(self, session_target) orelse return error.SessionNotFound;
     selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
     _ = resolved.leaf.selectSurface(resolved.surface);
     resolved.window.as(gtk.Window).present();
@@ -3536,12 +4141,12 @@ pub fn workspaceControlFocusSession(
 }
 
 pub fn workspaceControlSplitSession(
+    self: *Window,
     request: WorkspaceControlSplitRequest,
 ) !WorkspaceControlSplitResult {
-    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
-    const resolved = resolveWorkspaceControlSession(window, request.session) orelse return error.SessionNotFound;
+    const resolved = resolveWorkspaceControlSession(self, request.session) orelse return error.SessionNotFound;
     const split_tree = resolved.workspace_page.getSplitTree();
     const alloc = Application.default().allocator();
 
@@ -3575,12 +4180,12 @@ pub fn workspaceControlSplitSession(
 }
 
 pub fn workspaceControlCloseSession(
+    self: *Window,
     session_target: []const u8,
 ) !WorkspaceControlCloseResult {
-    const window = maybeWorkspaceControlWindow() orelse return error.NotReady;
-    refreshWorkspaceControlRuntime(window);
+    refreshWorkspaceControlRuntime(self);
 
-    const resolved = resolveWorkspaceControlSession(window, session_target) orelse return error.SessionNotFound;
+    const resolved = resolveWorkspaceControlSession(self, session_target) orelse return error.SessionNotFound;
     if (!resolved.leaf.closeSurface(resolved.surface, .this)) return error.SessionNotFound;
     refreshWorkspaceControlRuntime(resolved.window);
 
@@ -3589,28 +4194,596 @@ pub fn workspaceControlCloseSession(
     };
 }
 
-fn maybeWorkspaceControlWindow() ?*Window {
-    const list = gtk.Window.listToplevels();
-    defer list.free();
+pub fn saveWorkspaceAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+) !WorkspaceControlSaveResult {
+    self.refreshWorkspaceRegistrySafe();
+    const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
 
-    var first: ?*Window = null;
-    var current: ?*glib.List = list;
-    while (current) |node| : (current = node.f_next) {
-        const data = node.f_data orelse continue;
-        const gtk_window: *gtk.Window = @ptrCast(@alignCast(data));
-        const window = gobject.ext.cast(Window, gtk_window) orelse continue;
-        if (first == null) first = window;
-        if (gtk_window.isActive() != 0) return window;
+    const saved_at = try workspace_snapshot.currentUtcTimestampAlloc(alloc);
+    errdefer alloc.free(saved_at);
+    const snapshot_id = Application.default().runtimeIds().next(.snapshot);
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(alloc, snapshot_id, saved_at, runtime);
+    defer snapshot_value.deinit(alloc);
+
+    var dir = try workspaceStorageDirCreateAlloc(alloc);
+    defer dir.close();
+    const storage = workspace_storage.Storage.init(alloc, dir);
+    const path = try storage.writeCheckpoint(snapshot_value);
+    errdefer alloc.free(path);
+
+    updateWorkspaceSnapshotRefAlloc(alloc, runtime, snapshot_id, saved_at, path);
+    return .{
+        .workspace_id = runtime.workspace.workspace_id,
+        .snapshot_id = snapshot_id,
+        .saved_at = saved_at,
+        .path = path,
+    };
+}
+
+pub fn workspaceControlRestoreAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    value: workspace_snapshot.Snapshot,
+    plan: *const workspace_restore.Plan,
+) !workspace_model.RestoreResults {
+    try validateWorkspaceRestoreReplaySupported(value, plan);
+
+    const tab_view = self.getTabView();
+    const page = self.newEmptyWorkspacePage(tab_view.getNPages());
+    errdefer tab_view.closePage(page);
+
+    const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse return error.WorkspaceNotFound;
+    const page_key = @intFromPtr(workspace_page);
+    const priv = self.private();
+    const had_previous_workspace = priv.workspace_ids_by_page.get(page_key) != null;
+    const previous_workspace_id = priv.workspace_ids_by_page.get(page_key);
+    errdefer {
+        if (priv.workspace_ids_by_page.get(page_key)) |workspace_id| {
+            _ = priv.runtime_registry.removeWorkspace(workspace_id);
+            _ = priv.workspace_ids_by_page.remove(page_key);
+        }
+        if (had_previous_workspace and previous_workspace_id != null) {
+            priv.workspace_ids_by_page.put(page_key, previous_workspace_id.?) catch {};
+        }
     }
 
-    return first;
+    if (priv.workspace_ids_by_page.get(page_key)) |existing_workspace_id| {
+        _ = priv.runtime_registry.removeWorkspace(existing_workspace_id);
+        _ = priv.workspace_ids_by_page.remove(page_key);
+    }
+    Application.default().runtimeIds().observe(plan.workspace_id);
+    try priv.workspace_ids_by_page.put(page_key, plan.workspace_id);
+
+    if (value.workspace.name.len > 0) {
+        const title_override = try alloc.dupeZ(u8, value.workspace.name);
+        defer alloc.free(title_override);
+        workspace_page.setTitleOverride(title_override);
+    }
+
+    var built_tree = try buildWorkspaceRestoreTreeAlloc(self, alloc, value, plan);
+    defer built_tree.deinit();
+    workspace_page.getSplitTree().setTree(&built_tree);
+
+    self.refreshWorkspaceRegistrySafe();
+    const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
+
+    const window_id = runtime.windows.items[0].window_id;
+    var outcomes = try alloc.alloc(workspace_restore.ReplayOutcome, plan.sessions.len);
+    defer alloc.free(outcomes);
+    for (plan.sessions, 0..) |session, index| {
+        outcomes[index] = .{ .restored = .{
+            .session_id = session.session_id,
+            .window_id = window_id,
+            .split_id = session.split_id,
+            .tab_id = session.tab_id,
+        } };
+    }
+
+    const finalized = try workspace_restore.finalizeAlloc(alloc, plan, outcomes);
+    defer finalized.deinit(alloc);
+
+    try runtimeRegistrySelectionFromRestore(self, runtime, finalized.selection);
+    selectWorkspaceControlPage(self, workspace_page);
+    self.refreshWorkspaceRegistrySafe();
+
+    return cloneRestoreResultsAlloc(alloc, finalized.results);
 }
 
 fn refreshWorkspaceControlRuntime(window: *Window) void {
     window.refreshWorkspaceRegistrySafe();
 }
 
-fn resolveWorkspaceControlWorkspace(
+fn validateWorkspaceRestoreReplaySupported(
+    value: workspace_snapshot.Snapshot,
+    plan: *const workspace_restore.Plan,
+) !void {
+    if (value.workspace.layout_root_node_id == null) return error.WorkspaceLayoutMissing;
+
+    for (plan.tabs) |tab| {
+        if (tab.session_len != 1) return error.TabMultiSessionUnsupported;
+    }
+
+    for (value.sessions) |session| {
+        if (session.env_overrides.len > 0) return error.WorkspaceSessionEnvUnsupported;
+    }
+
+    for (value.layout) |entry| {
+        if (entry.node_type != .split) continue;
+        if (entry.tab_id != null) continue;
+        const child_ids = entry.child_ids orelse return error.WorkspaceLayoutInvalid;
+        if (child_ids.len != 2) return error.WorkspaceLayoutInvalid;
+    }
+}
+
+fn buildWorkspaceRestoreTreeAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    value: workspace_snapshot.Snapshot,
+    plan: *const workspace_restore.Plan,
+) !SplitTabs.Tree {
+    var split_map = std.AutoHashMap(workspace_ids.SplitId, workspace_snapshot.SplitRecord).init(alloc);
+    defer split_map.deinit();
+    var split_root_map = std.StringHashMap(workspace_ids.SplitId).init(alloc);
+    defer split_root_map.deinit();
+    var layout_map = std.StringHashMap(workspace_snapshot.LayoutNodeRecord).init(alloc);
+    defer layout_map.deinit();
+
+    for (value.splits) |split| {
+        try split_map.put(split.split_id, split);
+        try split_root_map.put(split.root_layout_node_id, split.split_id);
+    }
+    for (value.layout) |entry| {
+        try layout_map.put(entry.layout_node_id, entry);
+    }
+
+    const root_layout_node_id = value.workspace.layout_root_node_id orelse return error.WorkspaceLayoutMissing;
+    return buildWorkspaceRestoreTreeFromNodeAlloc(
+        self,
+        alloc,
+        plan,
+        &split_map,
+        &split_root_map,
+        &layout_map,
+        root_layout_node_id,
+        value.workspace.workspace_id,
+    );
+}
+
+fn buildWorkspaceRestoreTreeFromNodeAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    plan: *const workspace_restore.Plan,
+    split_map: *const std.AutoHashMap(workspace_ids.SplitId, workspace_snapshot.SplitRecord),
+    split_root_map: *const std.StringHashMap(workspace_ids.SplitId),
+    layout_map: *const std.StringHashMap(workspace_snapshot.LayoutNodeRecord),
+    layout_node_id: []const u8,
+    workspace_id: workspace_ids.WorkspaceId,
+) !SplitTabs.Tree {
+    const entry = layout_map.get(layout_node_id) orelse return error.WorkspaceLayoutInvalid;
+    return switch (entry.node_type) {
+        .split_root => blk: {
+            const split_id = split_root_map.get(layout_node_id) orelse return error.WorkspaceLayoutInvalid;
+            const split = split_map.get(split_id) orelse return error.WorkspaceLayoutInvalid;
+            break :blk try buildWorkspaceRestoreLeafTreeAlloc(self, alloc, plan, split, workspace_id);
+        },
+        .split => blk: {
+            if (entry.tab_id != null) return error.TabMultiSessionUnsupported;
+            const child_ids = entry.child_ids orelse return error.WorkspaceLayoutInvalid;
+            if (child_ids.len != 2) return error.WorkspaceLayoutInvalid;
+
+            var left = try buildWorkspaceRestoreTreeFromNodeAlloc(
+                self,
+                alloc,
+                plan,
+                split_map,
+                split_root_map,
+                layout_map,
+                child_ids[0],
+                workspace_id,
+            );
+            defer left.deinit();
+            var right = try buildWorkspaceRestoreTreeFromNodeAlloc(
+                self,
+                alloc,
+                plan,
+                split_map,
+                split_root_map,
+                layout_map,
+                child_ids[1],
+                workspace_id,
+            );
+            defer right.deinit();
+
+            const direction: SplitTabs.Tree.Split.Direction = switch (entry.split_direction orelse return error.WorkspaceLayoutInvalid) {
+                .right => .right,
+                .down => .down,
+                else => return error.WorkspaceLayoutInvalid,
+            };
+            const ratio = @as(f16, @floatCast(entry.ratio orelse 0.5));
+            break :blk try left.split(alloc, .root, direction, ratio, &right);
+        },
+        else => error.WorkspaceLayoutInvalid,
+    };
+}
+
+fn buildWorkspaceRestoreLeafTreeAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    plan: *const workspace_restore.Plan,
+    split: workspace_snapshot.SplitRecord,
+    workspace_id: workspace_ids.WorkspaceId,
+) !SplitTabs.Tree {
+    const split_plan = findRestoreSplitPlan(plan, split.split_id) orelse return error.WorkspaceLayoutInvalid;
+    if (split_plan.tab_len == 0) return error.WorkspaceLayoutInvalid;
+
+    const first_tab_plan = plan.tabs[split_plan.tab_start];
+    const first_session_plan = plan.sessions[first_tab_plan.session_start];
+    var first_surface = try createRestoreSurfaceAlloc(alloc, first_session_plan);
+    defer first_surface.unref();
+    _ = first_surface.refSink();
+
+    const split_tabs = SplitTabs.new(first_surface);
+    defer split_tabs.unref();
+    _ = split_tabs.refSink();
+
+    bindRestoredSplitId(self, split_tabs, split.split_id) catch return error.OutOfMemory;
+    const first_tab = split_tabs.getTabAt(0) orelse return error.WorkspaceLayoutInvalid;
+    bindRestoredTabId(self, first_tab, first_tab_plan.tab_id) catch return error.OutOfMemory;
+    try bindRestoredSessionIdentityAlloc(self, alloc, workspace_id, split.split_id, first_tab_plan.tab_id, first_session_plan.session_id, first_surface);
+    if (first_tab_plan.title_override) |title_override| {
+        const title_override_z = try alloc.dupeZ(u8, title_override);
+        defer alloc.free(title_override_z);
+        first_tab.setTitleOverride(title_override_z);
+    }
+
+    var selected_surface: ?*Surface = if (first_tab_plan.selected_hint) first_surface else null;
+
+    var tab_offset: usize = 1;
+    while (tab_offset < split_plan.tab_len) : (tab_offset += 1) {
+        const tab_plan = plan.tabs[split_plan.tab_start + tab_offset];
+        const session_plan = plan.sessions[tab_plan.session_start];
+        var surface = try createRestoreSurfaceAlloc(alloc, session_plan);
+        defer surface.unref();
+        _ = surface.refSink();
+
+        _ = split_tabs.addSurface(surface, tab_plan.selected_hint);
+        const tab = split_tabs.getTabAt(@intCast(tab_offset)) orelse return error.WorkspaceLayoutInvalid;
+        bindRestoredTabId(self, tab, tab_plan.tab_id) catch return error.OutOfMemory;
+        try bindRestoredSessionIdentityAlloc(self, alloc, workspace_id, split.split_id, tab_plan.tab_id, session_plan.session_id, surface);
+        if (tab_plan.title_override) |title_override| {
+            const title_override_z = try alloc.dupeZ(u8, title_override);
+            defer alloc.free(title_override_z);
+            tab.setTitleOverride(title_override_z);
+        }
+        if (tab_plan.selected_hint) selected_surface = surface;
+    }
+
+    if (selected_surface) |surface| {
+        _ = split_tabs.selectSurface(surface);
+    }
+
+    return SplitTabs.Tree.init(alloc, split_tabs);
+}
+
+fn createRestoreSurfaceAlloc(
+    alloc: std.mem.Allocator,
+    session: workspace_restore.SessionPlan,
+) !*Surface {
+    var command = try allocRestoreCommand(alloc, session.command);
+    defer if (command) |*value| deinitRestoreCommand(alloc, value);
+    const cwd = try alloc.dupeZ(u8, session.cwd);
+    defer alloc.free(cwd);
+    const title_override = if (session.title_override) |value|
+        try alloc.dupeZ(u8, value)
+    else
+        null;
+    defer if (title_override) |value| alloc.free(value);
+
+    const surface = Surface.new(.{
+        .command = command,
+        .working_directory = cwd,
+        .title = title_override,
+    });
+    if (session.cwd.len > 0) {
+        surface.setPwd(cwd);
+        if (title_override == null) {
+            const display_cwd = try allocRestoreDisplayPath(alloc, session.cwd);
+            defer alloc.free(display_cwd);
+            const display_cwd_z = try alloc.dupeZ(u8, display_cwd);
+            defer alloc.free(display_cwd_z);
+            surface.setTitle(display_cwd_z);
+        }
+    }
+    return surface;
+}
+
+fn allocRestoreDisplayPath(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = internal_os.home(&home_buf) catch null;
+    if (home) |home_path| {
+        if (std.mem.eql(u8, path, home_path)) {
+            return try alloc.dupe(u8, "~");
+        }
+
+        if (path.len > home_path.len and
+            std.mem.startsWith(u8, path, home_path) and
+            path[home_path.len] == std.fs.path.sep)
+        {
+            return try std.fmt.allocPrint(alloc, "~{s}", .{path[home_path.len..]});
+        }
+    }
+
+    return try alloc.dupe(u8, path);
+}
+
+fn allocRestoreCommand(
+    alloc: std.mem.Allocator,
+    command: workspace_model.Command,
+) !?configpkg.Command {
+    return switch (command) {
+        .shell => |value| .{ .shell = try alloc.dupeZ(u8, value) },
+        .argv => |argv| blk: {
+            var copied = try alloc.alloc([:0]const u8, argv.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (copied[0..initialized]) |item| alloc.free(item);
+                alloc.free(copied);
+            }
+            for (argv, 0..) |item, index| {
+                copied[index] = try alloc.dupeZ(u8, item);
+                initialized = index + 1;
+            }
+            break :blk .{ .direct = copied };
+        },
+    };
+}
+
+fn deinitRestoreCommand(
+    alloc: std.mem.Allocator,
+    command: *configpkg.Command,
+) void {
+    switch (command.*) {
+        .shell => |value| alloc.free(value),
+        .direct => |argv| {
+            for (argv) |item| alloc.free(item);
+            alloc.free(argv);
+        },
+    }
+}
+
+fn findRestoreSplitPlan(
+    plan: *const workspace_restore.Plan,
+    split_id: workspace_ids.SplitId,
+) ?workspace_restore.SplitPlan {
+    for (plan.splits) |split| {
+        if (split.split_id == split_id) return split;
+    }
+    return null;
+}
+
+fn bindRestoredSplitId(
+    self: *Window,
+    leaf: *SplitTabs,
+    split_id: workspace_ids.SplitId,
+) !void {
+    Application.default().runtimeIds().observe(split_id);
+    try self.private().split_ids_by_leaf.put(@intFromPtr(leaf), split_id);
+}
+
+fn bindRestoredTabId(
+    self: *Window,
+    tab: *Tab,
+    tab_id: workspace_ids.TabId,
+) !void {
+    Application.default().runtimeIds().observe(tab_id);
+    try self.private().tab_ids_by_widget.put(@intFromPtr(tab), tab_id);
+}
+
+fn bindRestoredSessionIdentityAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_id: workspace_ids.WorkspaceId,
+    split_id: workspace_ids.SplitId,
+    tab_id: workspace_ids.TabId,
+    session_id: workspace_ids.SessionId,
+    surface: *Surface,
+) !void {
+    Application.default().runtimeIds().observe(session_id);
+    const session_path = try std.fmt.allocPrint(
+        alloc,
+        "ws-{d}/split-{d}/tab-{d}",
+        .{ workspace_id.raw(), split_id.raw(), tab_id.raw() },
+    );
+    defer alloc.free(session_path);
+    try self.private().session_identity_index.bindSession(
+        session_id,
+        @intFromPtr(surface),
+        session_path,
+    );
+}
+
+fn runtimeRegistrySelectionFromRestore(
+    self: *Window,
+    runtime: *workspace_registry.WorkspaceRuntime,
+    selection: workspace_restore.SelectionResolution,
+) !void {
+    if (runtime.sessions.items.len == 0) return;
+
+    const selected_route = selected_route: {
+        if (selection.session_id) |selected_session_id| {
+            if (workspace_registry.routeForSession(runtime, selected_session_id)) |route| {
+                break :selected_route route;
+            }
+        }
+        if (workspace_registry.selectedSessionRoute(runtime)) |route| {
+            break :selected_route route;
+        }
+        const first_session = runtime.sessions.items[0];
+        break :selected_route workspace_registry.SessionRoute{
+            .window_id = first_session.window_id,
+            .split_id = first_session.split_id,
+            .tab_id = first_session.tab_id,
+            .session_id = first_session.session_id,
+        };
+    };
+
+    try self.getWorkspaceRegistry().updateSelection(runtime.workspace.workspace_id, .{
+        .selected_window_id = selected_route.window_id,
+        .selected_split_id = selected_route.split_id,
+        .selected_tab_id = selected_route.tab_id,
+        .selected_session_id = selected_route.session_id,
+    });
+}
+
+fn cloneRestoreResultsAlloc(
+    alloc: std.mem.Allocator,
+    value: workspace_model.RestoreResults,
+) !workspace_model.RestoreResults {
+    var failed_sessions = try alloc.alloc(workspace_model.RestoreFailure, value.failed_sessions.len);
+    errdefer alloc.free(failed_sessions);
+    for (value.failed_sessions, 0..) |failure, index| {
+        failed_sessions[index] = .{
+            .session_id = failure.session_id,
+            .code = try alloc.dupe(u8, failure.code),
+            .message = try alloc.dupe(u8, failure.message),
+        };
+    }
+    errdefer {
+        for (failed_sessions) |failure| {
+            alloc.free(failure.code);
+            alloc.free(failure.message);
+        }
+        alloc.free(failed_sessions);
+    }
+
+    return .{
+        .restored_workspace_id = value.restored_workspace_id,
+        .restored_session_ids = try alloc.dupe(workspace_ids.SessionId, value.restored_session_ids),
+        .failed_sessions = failed_sessions,
+        .selection_fallback = if (value.selection_fallback) |fallback| .{
+            .window_id = fallback.window_id,
+            .tab_id = fallback.tab_id,
+            .session_id = fallback.session_id,
+            .reason = try alloc.dupe(u8, fallback.reason),
+        } else null,
+    };
+}
+
+fn workspaceStorageDirCreateAlloc(
+    alloc: std.mem.Allocator,
+) !std.fs.Dir {
+    const storage_path = try internal_os.xdg.state(alloc, .{
+        .subdir = "ghostty/workspaces",
+    });
+    defer alloc.free(storage_path);
+    std.fs.makeDirAbsolute(storage_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return try std.fs.openDirAbsolute(storage_path, .{});
+}
+
+fn updateWorkspaceSnapshotRefAlloc(
+    alloc: std.mem.Allocator,
+    runtime: anytype,
+    snapshot_id: workspace_ids.SnapshotId,
+    saved_at: []const u8,
+    path: []const u8,
+) void {
+    if (runtime.workspace.snapshot_ref) |*snapshot_ref| {
+        alloc.free(snapshot_ref.saved_at);
+        alloc.free(snapshot_ref.path);
+    }
+    runtime.workspace.snapshot_ref = .{
+        .snapshot_id = snapshot_id,
+        .saved_at = alloc.dupe(u8, saved_at) catch return,
+        .path = alloc.dupe(u8, path) catch return,
+    };
+}
+
+fn revealPathInFileManager(path: []const u8) !void {
+    var err: ?*glib.Error = null;
+    defer if (err) |e| e.free();
+
+    const dbus = gio.busGetSync(.session, null, &err) orelse return error.DBusUnavailable;
+    defer dbus.unref();
+    if (err != null) return error.DBusUnavailable;
+
+    const path_z = try std.heap.c_allocator.dupeZ(u8, path);
+    defer std.heap.c_allocator.free(path_z);
+    const uri_z = glib.filenameToUri(path_z, null, &err) orelse return error.InvalidPath;
+    defer glib.free(uri_z);
+    if (err != null) return error.InvalidPath;
+
+    const params_type = glib.VariantType.new("(ass)");
+    defer params_type.free();
+    const params_builder = glib.VariantBuilder.new(params_type);
+    defer params_builder.unref();
+
+    const uris_type = glib.VariantType.new("as");
+    defer uris_type.free();
+    params_builder.open(uris_type);
+    params_builder.add("s", uri_z);
+    params_builder.close();
+    params_builder.add("s", "");
+
+    const params = params_builder.end();
+    const reply = dbus.callSync(
+        "org.freedesktop.FileManager1",
+        "/org/freedesktop/FileManager1",
+        "org.freedesktop.FileManager1",
+        "ShowItems",
+        params,
+        null,
+        .{},
+        -1,
+        null,
+        &err,
+    ) orelse return error.RevealFailed;
+    defer reply.unref();
+    if (err != null) return error.RevealFailed;
+}
+
+fn workspaceSnapshotPathAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+) !?[]u8 {
+    self.refreshWorkspaceRegistrySafe();
+    const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return null;
+    const snapshot_ref = runtime.workspace.snapshot_ref orelse return null;
+
+    const storage_path = try internal_os.xdg.state(alloc, .{
+        .subdir = "ghostty/workspaces",
+    });
+    defer alloc.free(storage_path);
+    return try std.fs.path.join(alloc, &.{ storage_path, snapshot_ref.path });
+}
+
+fn findSavedWorkspaceCatalogEntry(
+    entries: []const workspace_snapshot.CatalogEntry,
+    target: []const u8,
+) ?workspace_snapshot.CatalogEntry {
+    for (entries) |entry| {
+        if (entry.workspace_key) |workspace_key| {
+            if (std.mem.eql(u8, workspace_key, target)) return entry;
+        }
+    }
+
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.workspace_name, target)) return entry;
+    }
+
+    return null;
+}
+
+pub fn resolveWorkspaceControlWorkspace(
     window: *Window,
     target: ?[]const u8,
 ) ?WorkspaceControlResolvedWorkspace {
@@ -3767,6 +4940,43 @@ fn allocWorkspaceControlCommand(
             break :blk .{ .direct = try owned.toOwnedSlice(alloc) };
         },
     };
+}
+
+fn workspaceModelCommandFromSurfaceAlloc(
+    alloc: std.mem.Allocator,
+    command: ?configpkg.Command,
+) !workspace_model.Command {
+    if (command) |owned| {
+        return switch (owned) {
+            .shell => |value| .{ .shell = try alloc.dupe(u8, value) },
+            .direct => |argv| blk: {
+                var copied: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (copied.items) |item| alloc.free(item);
+                    copied.deinit(alloc);
+                }
+                for (argv) |item| {
+                    try copied.append(alloc, try alloc.dupe(u8, item));
+                }
+                break :blk .{ .argv = try copied.toOwnedSlice(alloc) };
+            },
+        };
+    }
+
+    if (std.process.getEnvVarOwned(alloc, "SHELL")) |shell| {
+        return .{ .shell = shell };
+    } else |_| {}
+
+    if (@import("builtin").os.tag == .windows) {
+        return .{ .shell = try alloc.dupe(u8, "cmd.exe") };
+    }
+
+    const passwd = try internal_os.passwd.get(alloc);
+    if (passwd.shell) |shell| {
+        return .{ .shell = shell };
+    }
+
+    return .{ .shell = try alloc.dupe(u8, "sh") };
 }
 
 fn deinitWorkspaceControlCommand(

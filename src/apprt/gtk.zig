@@ -12,6 +12,9 @@ pub const workspace_ids = @import("gtk/workspace_ids.zig");
 pub const workspace_registry = @import("gtk/workspace_registry.zig");
 pub const workspace_model = @import("gtk/workspace_model.zig");
 pub const workspace_attention = @import("gtk/workspace_attention.zig");
+pub const workspace_snapshot = @import("gtk/workspace_snapshot.zig");
+pub const workspace_storage = @import("gtk/workspace_storage.zig");
+pub const workspace_restore = @import("gtk/workspace_restore.zig");
 pub const workspace_control = @import("gtk/workspace_control.zig");
 
 test {

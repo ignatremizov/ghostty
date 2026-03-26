@@ -22,6 +22,14 @@ const show_face = @import("show_face.zig");
 const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const toggle_quick_terminal = @import("toggle_quick_terminal.zig");
+const workspace_list = @import("workspace_list.zig");
+const workspace_open = @import("workspace_open.zig");
+const workspace_save = @import("workspace_save.zig");
+const workspace_restore = @import("workspace_restore.zig");
+const workspace_list_sessions = @import("workspace_list_sessions.zig");
+const workspace_focus_session = @import("workspace_focus_session.zig");
+const workspace_split = @import("workspace_split.zig");
+const workspace_close_session = @import("workspace_close_session.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -80,6 +88,30 @@ pub const Action = enum {
 
     // Use IPC to tell the running Ghostty to toggle the quick terminal.
     @"toggle-quick-terminal",
+
+    // Query workspaces from a running Ghostty instance.
+    @"workspace-list",
+
+    // Open or create a workspace in a running Ghostty instance.
+    @"workspace-open",
+
+    // Save the current snapshot for a workspace in a running Ghostty instance.
+    @"workspace-save",
+
+    // Restore a workspace in a running Ghostty instance.
+    @"workspace-restore",
+
+    // List sessions from a workspace in a running Ghostty instance.
+    @"workspace-list-sessions",
+
+    // Focus a session in a running Ghostty instance.
+    @"workspace-focus-session",
+
+    // Create a split from a session in a running Ghostty instance.
+    @"workspace-split",
+
+    // Close a session in a running Ghostty instance.
+    @"workspace-close-session",
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -162,6 +194,14 @@ pub const Action = enum {
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
             .@"toggle-quick-terminal" => try toggle_quick_terminal.run(alloc),
+            .@"workspace-list" => try workspace_list.run(alloc),
+            .@"workspace-open" => try workspace_open.run(alloc),
+            .@"workspace-save" => try workspace_save.run(alloc),
+            .@"workspace-restore" => try workspace_restore.run(alloc),
+            .@"workspace-list-sessions" => try workspace_list_sessions.run(alloc),
+            .@"workspace-focus-session" => try workspace_focus_session.run(alloc),
+            .@"workspace-split" => try workspace_split.run(alloc),
+            .@"workspace-close-session" => try workspace_close_session.run(alloc),
         };
     }
 
@@ -169,6 +209,7 @@ pub const Action = enum {
     /// path from the root src/ directory.
     pub fn file(comptime self: Action) []const u8 {
         comptime {
+            @setEvalBranchQuota(10_000);
             const filename = filename: {
                 const tag = @tagName(self);
                 var filename: [tag.len]u8 = undefined;
@@ -204,6 +245,14 @@ pub const Action = enum {
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
                 .@"toggle-quick-terminal" => toggle_quick_terminal.Options,
+                .@"workspace-list" => workspace_list.Options,
+                .@"workspace-open" => workspace_open.Options,
+                .@"workspace-save" => workspace_save.Options,
+                .@"workspace-restore" => workspace_restore.Options,
+                .@"workspace-list-sessions" => workspace_list_sessions.Options,
+                .@"workspace-focus-session" => workspace_focus_session.Options,
+                .@"workspace-split" => workspace_split.Options,
+                .@"workspace-close-session" => workspace_close_session.Options,
             };
         }
     }

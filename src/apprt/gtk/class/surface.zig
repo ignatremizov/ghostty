@@ -2096,7 +2096,25 @@ pub const Surface = extern struct {
         const priv = self.private();
         if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title = null;
-        if (title) |v| priv.title = glib.ext.dupeZ(u8, v);
+        if (title) |v| {
+            const title_slice: []const u8 = v;
+            if (priv.pwd) |pwd| {
+                const pwd_slice: []const u8 = pwd;
+                if (std.mem.eql(u8, title_slice, pwd_slice)) {
+                    const display = allocDisplayPath(Application.default().allocator(), pwd_slice) catch null;
+                    if (display) |display_path| {
+                        defer Application.default().allocator().free(display_path);
+                        priv.title = glib.ext.dupeZ(u8, display_path);
+                    } else {
+                        priv.title = glib.ext.dupeZ(u8, v);
+                    }
+                } else {
+                    priv.title = glib.ext.dupeZ(u8, v);
+                }
+            } else {
+                priv.title = glib.ext.dupeZ(u8, v);
+            }
+        }
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
     }
 
@@ -2114,6 +2132,15 @@ pub const Surface = extern struct {
         return self.private().title_override;
     }
 
+    pub fn cloneLaunchCommand(self: *Self, alloc: std.mem.Allocator) !?configpkg.Command {
+        const priv = self.private();
+        if (priv.overrides.command) |command| return try command.clone(alloc);
+        if (priv.config) |config_obj| {
+            if (config_obj.get().command) |command| return try command.clone(alloc);
+        }
+        return null;
+    }
+
     /// Returns the pwd property without a copy.
     pub fn getPwd(self: *Self) ?[:0]const u8 {
         return self.private().pwd;
@@ -2126,6 +2153,25 @@ pub const Surface = extern struct {
         priv.pwd = null;
         if (pwd) |v| priv.pwd = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
+    }
+
+    fn allocDisplayPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = internal_os.home(&home_buf) catch null;
+        if (home) |home_path| {
+            if (std.mem.eql(u8, path, home_path)) {
+                return try alloc.dupe(u8, "~");
+            }
+
+            if (path.len > home_path.len and
+                std.mem.startsWith(u8, path, home_path) and
+                path[home_path.len] == std.fs.path.sep)
+            {
+                return try std.fmt.allocPrint(alloc, "~{s}", .{path[home_path.len..]});
+            }
+        }
+
+        return try alloc.dupe(u8, path);
     }
 
     /// Returns the focus state of this surface.
