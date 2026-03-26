@@ -8,7 +8,6 @@ const gtk = @import("gtk");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const CoreSurface = @import("../../../Surface.zig");
-const internal_os = @import("../../../os/main.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -125,7 +124,39 @@ pub const WorkspacePage = extern struct {
                 ?[:0]const u8,
                 .{
                     .default = null,
-                    .accessor = C.privateStringFieldAccessor("title"),
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getComputedTitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedTitle,
+                            .setter_transfer = .full,
+                        },
+                    ),
+                    .explicit_notify = true,
+                },
+            );
+        };
+        pub const @"surface-title" = struct {
+            pub const name = "surface-title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getSurfaceTitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedSurfaceTitle,
+                            .setter_transfer = .full,
+                        },
+                    ),
+                    .explicit_notify = true,
                 },
             );
         };
@@ -150,7 +181,17 @@ pub const WorkspacePage = extern struct {
                 ?[:0]const u8,
                 .{
                     .default = null,
-                    .accessor = C.privateStringFieldAccessor("sidebar_title"),
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getSidebarTitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedSidebarTitle,
+                            .setter_transfer = .full,
+                        },
+                    ),
+                    .explicit_notify = true,
                 },
             );
         };
@@ -163,7 +204,17 @@ pub const WorkspacePage = extern struct {
                 ?[:0]const u8,
                 .{
                     .default = null,
-                    .accessor = C.privateStringFieldAccessor("sidebar_subtitle"),
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getSidebarSubtitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedSidebarSubtitle,
+                            .setter_transfer = .full,
+                        },
+                    ),
+                    .explicit_notify = true,
                 },
             );
         };
@@ -190,6 +241,10 @@ pub const WorkspacePage = extern struct {
         /// The title of this workspace page. This is usually bound to the active surface.
         title: ?[:0]const u8 = null,
 
+        /// Effective title copied from the active surface only while no
+        /// workspace-level title override masks it.
+        surface_title: ?[:0]const u8 = null,
+
         /// The manually overridden title from `promptWorkspaceTitle`.
         title_override: ?[:0]const u8 = null,
 
@@ -204,6 +259,7 @@ pub const WorkspacePage = extern struct {
 
         // Template bindings
         split_tree: *SplitTree,
+        title_source_bindings: ?*gobject.BindingGroup = null,
 
         pub var offset: c_int = 0;
     };
@@ -282,6 +338,16 @@ pub const WorkspacePage = extern struct {
 
         // Init our actions
         self.initActionMap();
+
+        const priv = self.private();
+        priv.title_source_bindings = gobject.BindingGroup.new();
+        priv.title_source_bindings.?.bind(
+            "effective-title",
+            self.as(gobject.Object),
+            properties.@"surface-title".name,
+            .{},
+        );
+        self.syncTitleSource();
     }
 
     fn initActionMap(self: *Self) void {
@@ -306,9 +372,14 @@ pub const WorkspacePage = extern struct {
     /// unless this is unset (null).
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
+        if (optionalStringEql(
+            priv.title_override,
+            if (title) |value| value else null,
+        )) return;
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title_override = null;
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
+        self.syncTitleSource();
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
     }
     fn titleDialogSet(
@@ -346,12 +417,95 @@ pub const WorkspacePage = extern struct {
         return self.private().title_override;
     }
 
+    fn getComputedTitle(self: *Self) ?[:0]const u8 {
+        return self.private().title;
+    }
+
+    fn getSurfaceTitle(self: *Self) ?[:0]const u8 {
+        return self.private().surface_title;
+    }
+
+    fn setComputedTitle(self: *Self, title: ?[:0]const u8) void {
+        self.replaceComputedString(
+            &self.private().title,
+            title,
+            properties.title.impl.param_spec,
+        );
+    }
+
+    fn setComputedSurfaceTitle(self: *Self, title: ?[:0]const u8) void {
+        self.replaceComputedString(
+            &self.private().surface_title,
+            title,
+            properties.@"surface-title".impl.param_spec,
+        );
+    }
+
+    fn syncTitleSource(self: *Self) void {
+        const priv = self.private();
+        const source = if (priv.title_override == null)
+            if (self.getActiveSurface()) |surface| surface.as(gobject.Object) else null
+        else
+            null;
+        const bindings = priv.title_source_bindings orelse return;
+        bindings.setSource(source);
+        if (source == null) self.setComputedSurfaceTitle(null);
+    }
+
     pub fn getSidebarTitle(self: *Self) ?[:0]const u8 {
         return self.private().sidebar_title;
     }
 
+    pub fn setSidebarTitle(self: *Self, title: ?[:0]const u8) void {
+        self.setComputedSidebarTitle(
+            if (title) |value| glib.ext.dupeZ(u8, value) else null,
+        );
+    }
+
     pub fn getSidebarSubtitle(self: *Self) ?[:0]const u8 {
         return self.private().sidebar_subtitle;
+    }
+
+    fn setComputedSidebarTitle(self: *Self, title: ?[:0]const u8) void {
+        self.replaceComputedString(
+            &self.private().sidebar_title,
+            title,
+            properties.@"sidebar-title".impl.param_spec,
+        );
+    }
+
+    fn setComputedSidebarSubtitle(self: *Self, title: ?[:0]const u8) void {
+        self.replaceComputedString(
+            &self.private().sidebar_subtitle,
+            title,
+            properties.@"sidebar-subtitle".impl.param_spec,
+        );
+    }
+
+    fn replaceComputedString(
+        self: *Self,
+        field: *?[:0]const u8,
+        value: ?[:0]const u8,
+        param_spec: *gobject.ParamSpec,
+    ) void {
+        if (optionalStringEql(field.*, value)) {
+            if (value) |unchanged| glib.free(@ptrCast(@constCast(unchanged)));
+            return;
+        }
+        if (field.*) |current| glib.free(@ptrCast(@constCast(current)));
+        field.* = value;
+        self.as(gobject.Object).notifyByPspec(param_spec);
+    }
+
+    fn optionalStringEql(
+        current: ?[:0]const u8,
+        next: ?[:0]const u8,
+    ) bool {
+        if (current) |current_value| {
+            const next_value = next orelse return false;
+            return std.mem.eql(u8, current_value, next_value);
+        }
+        return next == null;
     }
 
     pub fn getTooltip(self: *Self) ?[:0]const u8 {
@@ -402,6 +556,11 @@ pub const WorkspacePage = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        if (priv.title_source_bindings) |bindings| {
+            bindings.setSource(null);
+            bindings.unref();
+            priv.title_source_bindings = null;
+        }
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
@@ -427,6 +586,10 @@ pub const WorkspacePage = extern struct {
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
+        }
+        if (priv.surface_title) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.surface_title = null;
         }
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
@@ -474,6 +637,7 @@ pub const WorkspacePage = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        self.syncTitleSource();
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
@@ -564,8 +728,7 @@ pub const WorkspacePage = extern struct {
     fn closureComputedTitle(
         _: *Self,
         config_: ?*Config,
-        terminal_: ?[*:0]const u8,
-        surface_override_: ?[*:0]const u8,
+        surface_title_: ?[*:0]const u8,
         workspace_override_: ?[*:0]const u8,
         zoomed_: c_int,
         bell_ringing_: c_int,
@@ -585,12 +748,15 @@ pub const WorkspacePage = extern struct {
             };
 
             const plain = workspace_override_ orelse
-                surface_override_ orelse
-                terminal_ orelse
+                surface_title_ orelse
                 config_title orelse
                 break :plain default;
             break :plain std.mem.span(plain);
         };
+
+        if (!zoomed and !bell_ringing) {
+            return glib.ext.dupeZ(u8, plain);
+        }
 
         // We don't need a config in every case, but if we don't have a config
         // let's just assume something went terribly wrong and use our
@@ -621,9 +787,7 @@ pub const WorkspacePage = extern struct {
 
     fn closureComputedSidebarTitle(
         _: *Self,
-        pwd_: ?[*:0]const u8,
-        terminal_: ?[*:0]const u8,
-        surface_override_: ?[*:0]const u8,
+        derived_: ?[*:0]const u8,
         workspace_override_: ?[*:0]const u8,
         _: *gobject.ParamSpec,
     ) callconv(.c) ?[*:0]const u8 {
@@ -631,67 +795,11 @@ pub const WorkspacePage = extern struct {
             return glib.ext.dupeZ(u8, std.mem.span(workspace_override));
         }
 
-        if (pwd_) |pwd| {
-            const path = std.mem.span(pwd);
-            const base = std.fs.path.basename(path);
-            const display = if (base.len > 0) base else path;
-            return glib.ext.dupeZ(u8, display);
-        }
-
-        if (surface_override_) |surface_override| {
-            return glib.ext.dupeZ(u8, std.mem.span(surface_override));
-        }
-
-        if (terminal_) |terminal| {
-            return glib.ext.dupeZ(u8, std.mem.span(terminal));
+        if (derived_) |derived| {
+            return glib.ext.dupeZ(u8, std.mem.span(derived));
         }
 
         return glib.ext.dupeZ(u8, "Workspace");
-    }
-
-    fn closureComputedSidebarSubtitle(
-        _: *Self,
-        pwd_: ?[*:0]const u8,
-        terminal_: ?[*:0]const u8,
-        surface_override_: ?[*:0]const u8,
-        _: *gobject.ParamSpec,
-    ) callconv(.c) ?[*:0]const u8 {
-        if (pwd_) |pwd| {
-            return dupSidebarPath(std.mem.span(pwd));
-        }
-
-        if (surface_override_) |surface_override| {
-            return glib.ext.dupeZ(u8, std.mem.span(surface_override));
-        }
-
-        if (terminal_) |terminal| {
-            return glib.ext.dupeZ(u8, std.mem.span(terminal));
-        }
-
-        return null;
-    }
-
-    fn dupSidebarPath(path: []const u8) ?[*:0]const u8 {
-        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const home = internal_os.home(&home_buf) catch null;
-        if (home) |home_path| {
-            if (std.mem.eql(u8, path, home_path)) {
-                return glib.ext.dupeZ(u8, "~");
-            }
-
-            if (path.len > home_path.len and
-                std.mem.startsWith(u8, path, home_path) and
-                path[home_path.len] == std.fs.path.sep)
-            {
-                var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
-                defer buf.deinit();
-                buf.writer.writeByte('~') catch return glib.ext.dupeZ(u8, path);
-                buf.writer.writeAll(path[home_path.len..]) catch return glib.ext.dupeZ(u8, path);
-                return glib.ext.dupeZ(u8, buf.written());
-            }
-        }
-
-        return glib.ext.dupeZ(u8, path);
     }
 
     const C = Common(Self, Private);
@@ -724,6 +832,7 @@ pub const WorkspacePage = extern struct {
                 properties.@"split-tree".impl,
                 properties.@"surface-tree".impl,
                 properties.title.impl,
+                properties.@"surface-title".impl,
                 properties.@"title-override".impl,
                 properties.tooltip.impl,
                 properties.@"sidebar-title".impl,
@@ -736,7 +845,6 @@ pub const WorkspacePage = extern struct {
             // Template Callbacks
             class.bindTemplateCallback("computed_title", &closureComputedTitle);
             class.bindTemplateCallback("computed_sidebar_title", &closureComputedSidebarTitle);
-            class.bindTemplateCallback("computed_sidebar_subtitle", &closureComputedSidebarSubtitle);
             class.bindTemplateCallback("notify_active_surface", &propActiveSurface);
             class.bindTemplateCallback("notify_tree", &propSplitTree);
 

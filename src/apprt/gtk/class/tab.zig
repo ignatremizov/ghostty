@@ -51,7 +51,17 @@ pub const Tab = extern struct {
                 ?[:0]const u8,
                 .{
                     .default = null,
-                    .accessor = C.privateStringFieldAccessor("title"),
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getComputedTitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedTitle,
+                            .setter_transfer = .full,
+                        },
+                    ),
+                    .explicit_notify = true,
                 },
             );
         };
@@ -120,6 +130,32 @@ pub const Tab = extern struct {
 
     pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
         return self.private().title_override;
+    }
+
+    fn getComputedTitle(self: *Self) ?[:0]const u8 {
+        return self.private().title;
+    }
+
+    fn setComputedTitle(self: *Self, title: ?[:0]const u8) void {
+        const priv = self.private();
+        if (optionalStringEql(priv.title, title)) {
+            if (title) |unchanged| glib.free(@ptrCast(@constCast(unchanged)));
+            return;
+        }
+        if (priv.title) |current| glib.free(@ptrCast(@constCast(current)));
+        priv.title = title;
+        self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
+    }
+
+    fn optionalStringEql(
+        current: ?[:0]const u8,
+        next: ?[:0]const u8,
+    ) bool {
+        if (current) |current_value| {
+            const next_value = next orelse return false;
+            return std.mem.eql(u8, current_value, next_value);
+        }
+        return next == null;
     }
 
     pub fn getEffectiveTitle(self: *Self) ?[:0]const u8 {
@@ -209,26 +245,29 @@ pub const Tab = extern struct {
 
     fn closureComputedTitle(
         _: *Self,
-        terminal_: ?[*:0]const u8,
-        surface_override_: ?[*:0]const u8,
+        surface_title_: ?[*:0]const u8,
         tab_override_: ?[*:0]const u8,
+        unread_pending_: c_int,
         bell_ringing_: c_int,
         _: *gobject.ParamSpec,
     ) callconv(.c) ?[*:0]const u8 {
         const plain = std.mem.span(
             tab_override_ orelse
-                surface_override_ orelse
-                terminal_ orelse
+                surface_title_ orelse
                 "Ghostty",
         );
 
-        if (bell_ringing_ == 0) {
+        if (bell_ringing_ == 0 and unread_pending_ == 0) {
             return glib.ext.dupeZ(u8, plain);
         }
 
         var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
         defer buf.deinit();
-        buf.writer.writeAll("🔔 ") catch return glib.ext.dupeZ(u8, plain);
+        if (bell_ringing_ != 0) {
+            buf.writer.writeAll("🔔 ") catch return glib.ext.dupeZ(u8, plain);
+        } else {
+            buf.writer.writeAll("• ") catch return glib.ext.dupeZ(u8, plain);
+        }
         buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
         return glib.ext.dupeZ(u8, buf.written());
     }

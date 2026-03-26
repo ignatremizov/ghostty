@@ -104,6 +104,23 @@ test "workspace attention acknowledge clear removes bell state" {
     try testing.expect(!state.clearForAcknowledge("2026-03-22T10:10:00Z"));
 }
 
+test "workspace attention preserves focused bell events until acknowledged" {
+    const testing = std.testing;
+
+    var state = sessionState(8);
+    try testing.expect(state.observeBell(.{
+        .event_at = "2026-03-22T10:10:30Z",
+        .is_focused = true,
+    }));
+    try testing.expect(state.hasAttention());
+    try testing.expect(state.unread);
+    try testing.expect(state.bell);
+    try testing.expectEqual(attention.Source.bell, state.source);
+    try testing.expectEqualStrings("2026-03-22T10:10:30Z", state.last_event_at.?);
+    try testing.expect(state.clearForAcknowledge("2026-03-22T10:10:31Z"));
+    try testing.expect(!state.hasAttention());
+}
+
 test "workspace attention session close clear drops pending state from workspace summary" {
     const testing = std.testing;
 

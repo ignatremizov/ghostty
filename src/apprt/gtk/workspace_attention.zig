@@ -134,8 +134,6 @@ pub const AttentionState = struct {
     }
 
     pub fn observeBell(self: *AttentionState, context: EventContext) bool {
-        if (context.is_focused) return false;
-
         self.markBell(context.event_at);
         return true;
     }
