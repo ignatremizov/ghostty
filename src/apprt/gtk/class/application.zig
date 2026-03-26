@@ -1033,6 +1033,17 @@ pub const Application = extern struct {
             \\ * Splits
             \\ */
             \\
+            \\.window .split-tabs.needs-attention {
+            \\  outline-color: color-mix(
+            \\    in srgb,
+            \\    var(--accent-color),
+            \\    transparent 35%
+            \\  );
+            \\  outline-width: 3px;
+            \\  outline-style: solid;
+            \\  outline-offset: -3px;
+            \\}
+            \\
             \\.window .split paned > separator {
             \\  background-color: color-mix(
             \\    in srgb,

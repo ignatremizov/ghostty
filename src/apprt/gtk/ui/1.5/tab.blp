@@ -8,7 +8,7 @@ template $GhosttyTab: Box {
   orientation: vertical;
   hexpand: true;
   vexpand: true;
-  title: bind $computed_title(template.surface as <$GhosttySurface>.title, template.surface as <$GhosttySurface>.title-override, template.title-override, template.surface as <$GhosttySurface>.bell-ringing) as <string>;
+  title: bind $computed_title(template.surface as <$GhosttySurface>.title, template.surface as <$GhosttySurface>.title-override, template.title-override, template.surface as <$GhosttySurface>.unread-pending, template.surface as <$GhosttySurface>.bell-ringing) as <string>;
   tooltip: bind template.surface as <$GhosttySurface>.pwd;
 
   $GhostttySurfaceScrolledWindow surface_scrolled_window {

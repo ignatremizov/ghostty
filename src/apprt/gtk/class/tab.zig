@@ -212,6 +212,7 @@ pub const Tab = extern struct {
         terminal_: ?[*:0]const u8,
         surface_override_: ?[*:0]const u8,
         tab_override_: ?[*:0]const u8,
+        unread_pending_: c_int,
         bell_ringing_: c_int,
         _: *gobject.ParamSpec,
     ) callconv(.c) ?[*:0]const u8 {
@@ -222,13 +223,17 @@ pub const Tab = extern struct {
                 "Ghostty",
         );
 
-        if (bell_ringing_ == 0) {
+        if (bell_ringing_ == 0 and unread_pending_ == 0) {
             return glib.ext.dupeZ(u8, plain);
         }
 
         var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
         defer buf.deinit();
-        buf.writer.writeAll("🔔 ") catch return glib.ext.dupeZ(u8, plain);
+        if (bell_ringing_ != 0) {
+            buf.writer.writeAll("🔔 ") catch return glib.ext.dupeZ(u8, plain);
+        } else {
+            buf.writer.writeAll("• ") catch return glib.ext.dupeZ(u8, plain);
+        }
         buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
         return glib.ext.dupeZ(u8, buf.written());
     }

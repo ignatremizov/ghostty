@@ -1394,6 +1394,20 @@ pub const Window = extern struct {
             self,
             .{ .detail = "bell-ringing" },
         );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "unread-pending" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface.as(gobject.Object),
+            *Self,
+            surfaceRuntimeStateChanged,
+            self,
+            .{ .detail = "child-exited" },
+        );
 
         if (!priv.surface_init) {
             _ = Surface.signals.init.connect(
@@ -1766,6 +1780,17 @@ pub const Window = extern struct {
                         runtime.workspace.selected_session_id = session_id;
                     }
 
+                    const bell_ringing = surface.getBellRinging();
+                    const unread_pending = surface.getUnreadPending() or bell_ringing;
+                    const activity_state: workspace_model.ActivityState = if (bell_ringing)
+                        .bell_pending
+                    else if (unread_pending)
+                        .output_pending
+                    else if (surface.getChildExited())
+                        .exited
+                    else
+                        .idle;
+
                     try runtime.tabs.append(alloc, .{
                         .tab_id = tab_id,
                         .split_id = split_id,
@@ -1776,7 +1801,7 @@ pub const Window = extern struct {
                         .tooltip = tooltip,
                         .layout_root_id = tab_root_id,
                         .ordinal = tab_index,
-                        .needs_attention = surface.getBellRinging(),
+                        .needs_attention = unread_pending,
                     });
                     try runtime.layout.append(alloc, .{
                         .layout_node_id = tab_root_id,
@@ -1819,7 +1844,8 @@ pub const Window = extern struct {
                             .last_focused
                         else
                             .background,
-                        .activity_state = if (surface.getBellRinging()) .bell_pending else .idle,
+                        .activity_state = activity_state,
+                        .last_output_at = surface.getLastOutputAt(),
                     });
                     try runtime.surfaces.append(alloc, .{
                         .surface_id = surface_id,
@@ -1828,12 +1854,14 @@ pub const Window = extern struct {
                         .split_id = split_id,
                         .window_id = priv.runtime_window_id.?,
                         .is_realized = surface.as(gtk.Widget).getRealized() != 0,
+                        .last_bell_at = surface.getLastBellAt(),
+                        .last_output_at = surface.getLastOutputAt(),
                     });
 
                     split_attention.include(.{
                         .target_id = .{ .session = session_id },
-                        .unread = surface.getBellRinging(),
-                        .bell = surface.getBellRinging(),
+                        .unread = unread_pending,
+                        .bell = bell_ringing,
                     });
                 }
 

@@ -26,6 +26,7 @@ const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
+const workspace_snapshot = @import("../workspace_snapshot.zig");
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
@@ -182,6 +183,42 @@ pub const Surface = extern struct {
                         Private,
                         &Private.offset,
                         "mapped",
+                    ),
+                },
+            );
+        };
+
+        pub const @"unread-pending" = struct {
+            pub const name = "unread-pending";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "unread_pending",
+                    ),
+                },
+            );
+        };
+
+        pub const @"split-attention" = struct {
+            pub const name = "split-attention";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "split_attention",
                     ),
                 },
             );
@@ -614,6 +651,13 @@ pub const Surface = extern struct {
         /// focus only work if a widget is mapped.
         mapped: bool = false,
 
+        /// Background attention only starts after the surface has lost focus
+        /// at least once after an actual user interaction. This avoids
+        /// counting initial startup activity on newly created or restored
+        /// background tabs as unread.
+        attention_armed: bool = false,
+        attention_ready: bool = false,
+
         /// Whether this surface is "zoomed" or not. A zoomed surface
         /// shows up taking the full bounds of a split view.
         zoom: bool = false,
@@ -665,6 +709,27 @@ pub const Surface = extern struct {
 
         /// True when the child has exited.
         child_exited: bool = false,
+
+        /// True when background activity occurred since this surface last had
+        /// focus. This is cleared when the surface regains focus or when the
+        /// owning session closes.
+        unread_pending: bool = false,
+
+        /// Last background output timestamp in UTC, if we recorded one.
+        last_output_at: ?[:0]const u8 = null,
+
+        /// Last bell timestamp in UTC, if we recorded one.
+        last_bell_at: ?[:0]const u8 = null,
+
+        /// The first terminal-driven title/pwd updates are startup bootstrap,
+        /// not missed background activity.
+        suppress_next_title_attention: bool = true,
+        suppress_next_pwd_attention: bool = true,
+        suppress_next_command_finish_attention: bool = true,
+
+        /// True when another non-selected tab in the same split leaf needs
+        /// attention, so the currently visible pane can show a border.
+        split_attention: bool = false,
 
         // Progress bar
         progress_bar_timer: ?c_uint = null,
@@ -887,15 +952,17 @@ pub const Surface = extern struct {
         _: *Self,
         config_: ?*Config,
         bell_ringing_: c_int,
+        split_attention_: c_int,
     ) callconv(.c) c_int {
         const bell_ringing = bell_ringing_ != 0;
+        const split_attention = split_attention_ != 0;
 
         // If the bell isn't ringing exit early because when the surface is
         // first created there's a race between this code being run and the
         // config being set on the surface. That way we don't overwhelm people
         // with the warning that we issue if the config isn't set and overwhelm
         // ourselves with large numbers of bug reports.
-        if (!bell_ringing) return @intFromBool(false);
+        if (!bell_ringing and !split_attention) return @intFromBool(false);
 
         const config = if (config_) |v| v.get() else {
             log.warn("config unavailable for computing whether border should be shown, likely bug", .{});
@@ -1193,6 +1260,12 @@ pub const Surface = extern struct {
         const app = Application.default();
         const alloc = app.allocator();
         const priv: *Private = self.private();
+
+        if (priv.suppress_next_command_finish_attention) {
+            priv.suppress_next_command_finish_attention = false;
+        } else {
+            self.markBackgroundOutput();
+        }
 
         const notify_next_command_finish = notify: {
             const simple_action_group = priv.action_group orelse break :notify false;
@@ -2034,6 +2107,14 @@ pub const Surface = extern struct {
             glib.free(@ptrCast(@constCast(v)));
             priv.pwd = null;
         }
+        if (priv.last_output_at) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.last_output_at = null;
+        }
+        if (priv.last_bell_at) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.last_bell_at = null;
+        }
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
@@ -2094,6 +2175,10 @@ pub const Surface = extern struct {
     /// title. For manually set titles see `setTitleOverride`.
     pub fn setTitle(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
+        const changed = if (priv.title) |current|
+            title == null or !std.mem.eql(u8, current, title.?)
+        else
+            title != null;
         if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title = null;
         if (title) |v| {
@@ -2113,6 +2198,13 @@ pub const Surface = extern struct {
                 }
             } else {
                 priv.title = glib.ext.dupeZ(u8, v);
+            }
+        }
+        if (changed) {
+            if (priv.suppress_next_title_attention) {
+                priv.suppress_next_title_attention = false;
+            } else {
+                self.markBackgroundOutput();
             }
         }
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
@@ -2149,9 +2241,20 @@ pub const Surface = extern struct {
     /// Set the pwd for this surface, copies the value.
     pub fn setPwd(self: *Self, pwd: ?[:0]const u8) void {
         const priv = self.private();
+        const changed = if (priv.pwd) |current|
+            pwd == null or !std.mem.eql(u8, current, pwd.?)
+        else
+            pwd != null;
         if (priv.pwd) |v| glib.free(@ptrCast(@constCast(v)));
         priv.pwd = null;
         if (pwd) |v| priv.pwd = glib.ext.dupeZ(u8, v);
+        if (changed) {
+            if (priv.suppress_next_pwd_attention) {
+                priv.suppress_next_pwd_attention = false;
+            } else {
+                self.markBackgroundOutput();
+            }
+        }
         self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
     }
 
@@ -2331,6 +2434,33 @@ pub const Surface = extern struct {
         return self.private().bell_ringing;
     }
 
+    pub fn getUnreadPending(self: *Self) bool {
+        return self.private().unread_pending;
+    }
+
+    pub fn getSplitAttention(self: *Self) bool {
+        return self.private().split_attention;
+    }
+
+    pub fn getChildExited(self: *Self) bool {
+        return self.private().child_exited;
+    }
+
+    pub fn getLastOutputAt(self: *Self) ?[:0]const u8 {
+        return self.private().last_output_at;
+    }
+
+    pub fn getLastBellAt(self: *Self) ?[:0]const u8 {
+        return self.private().last_bell_at;
+    }
+
+    pub fn setSplitAttention(self: *Self, attention: bool) void {
+        const priv = self.private();
+        if (priv.split_attention == attention) return;
+        priv.split_attention = attention;
+        self.as(gobject.Object).notifyByPspec(properties.@"split-attention".impl.param_spec);
+    }
+
     pub fn setBellRinging(self: *Self, ringing: bool) void {
         // Prevent duplicate change notifications if the signals we emit
         // in this function cause this state to change again.
@@ -2339,13 +2469,66 @@ pub const Surface = extern struct {
 
         // Logic around bell reaction happens on every event even if we're
         // already in the ringing state.
-        if (ringing) self.ringBell();
+        if (ringing) {
+            self.recordBellActivity();
+            self.ringBell();
+        }
 
         // Property change only happens on actual state change
         const priv = self.private();
         if (priv.bell_ringing == ringing) return;
         priv.bell_ringing = ringing;
         self.as(gobject.Object).notifyByPspec(properties.@"bell-ringing".impl.param_spec);
+    }
+
+    fn markBackgroundOutput(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+        if (priv.focused) return;
+        if (!priv.attention_armed) return;
+        if (priv.core_surface == null) return;
+        if (priv.child_exited) return;
+
+        self.updateTimestampField(&priv.last_output_at);
+
+        if (priv.unread_pending) return;
+        priv.unread_pending = true;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn recordBellActivity(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+        if (priv.core_surface == null) return;
+        if (!priv.attention_armed) return;
+
+        self.updateTimestampField(&priv.last_bell_at);
+
+        if (priv.focused or priv.child_exited) return;
+        if (priv.unread_pending) return;
+        priv.unread_pending = true;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn clearUnreadPending(self: *Self) void {
+        const priv = self.private();
+        if (!priv.unread_pending) return;
+        priv.unread_pending = false;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn updateTimestampField(_: *Self, field: *?[:0]const u8) void {
+        const alloc = Application.default().allocator();
+        const fresh = allocUtcTimestampZ(alloc) catch return;
+        defer alloc.free(fresh);
+        if (field.*) |value| glib.free(@ptrCast(@constCast(value)));
+        field.* = glib.ext.dupeZ(u8, fresh);
+    }
+
+    fn allocUtcTimestampZ(alloc: std.mem.Allocator) ![:0]u8 {
+        const ts = try workspace_snapshot.currentUtcTimestampAlloc(alloc);
+        defer alloc.free(ts);
+        return try alloc.dupeZ(u8, ts);
     }
 
     pub fn setError(self: *Self, v: bool) void {
@@ -2844,6 +3027,7 @@ pub const Surface = extern struct {
         gtk_mods: gdk.ModifierType,
         self: *Self,
     ) callconv(.c) c_int {
+        self.noteUserInteraction();
         return @intFromBool(self.keyEvent(
             .press,
             ec_key,
@@ -2887,8 +3071,14 @@ pub const Surface = extern struct {
         self.scheduleIdleFocus();
         self.as(gobject.Object).notifyByPspec(properties.focused.impl.param_spec);
 
-        // Bell stops ringing as soon as we gain focus
-        if (focused) self.setBellRinging(false);
+        if (focused) {
+            self.clearUnreadPending();
+
+            // Bell stops ringing as soon as we gain focus
+            self.setBellRinging(false);
+        } else {
+            priv.attention_armed = priv.attention_ready;
+        }
     }
 
     /// The focus callback must be triggered on an idle loop source because
@@ -2933,6 +3123,7 @@ pub const Surface = extern struct {
         y: f64,
         self: *Self,
     ) callconv(.c) void {
+        self.noteUserInteraction();
         const event = gesture.as(gtk.EventController).getCurrentEvent() orelse return;
 
         // Bell stops ringing if any mouse button is pressed.
@@ -3310,6 +3501,7 @@ pub const Surface = extern struct {
         bytes: [*:0]u8,
         self: *Self,
     ) callconv(.c) void {
+        self.noteUserInteraction();
         const priv = self.private();
         const str = std.mem.sliceTo(bytes, 0);
 
@@ -3386,6 +3578,10 @@ pub const Surface = extern struct {
                 log.warn("error in key callback err={}", .{err});
             };
         }
+    }
+
+    fn noteUserInteraction(self: *Self) void {
+        self.private().attention_ready = true;
     }
 
     fn glareaRealize(
@@ -3824,6 +4020,8 @@ pub const Surface = extern struct {
                 properties.@"font-size-request".impl,
                 properties.focused.impl,
                 properties.mapped.impl,
+                properties.@"split-attention".impl,
+                properties.@"unread-pending".impl,
                 properties.@"key-sequence".impl,
                 properties.@"key-table".impl,
                 properties.@"min-size".impl,

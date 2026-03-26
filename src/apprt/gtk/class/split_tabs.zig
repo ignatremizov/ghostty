@@ -108,6 +108,7 @@ pub const SplitTabs = extern struct {
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+        self.as(gtk.Widget).addCssClass("split-tabs");
         const gesture = gtk.GestureClick.new();
         gesture.as(gtk.GestureSingle).setButton(3);
         gesture.as(gtk.EventController).setPropagationPhase(.capture);
@@ -218,6 +219,21 @@ pub const SplitTabs = extern struct {
         const tab = Tab.new(surface);
         const page = priv.tab_view.append(tab.as(gtk.Widget));
 
+        _ = gobject.Object.signals.notify.connect(
+            surface,
+            *Self,
+            surfaceAttentionChanged,
+            self,
+            .{ .detail = "unread-pending" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface,
+            *Self,
+            surfaceAttentionChanged,
+            self,
+            .{ .detail = "bell-ringing" },
+        );
+
         _ = tab.as(gobject.Object).bindProperty(
             "title",
             page.as(gobject.Object),
@@ -235,6 +251,7 @@ pub const SplitTabs = extern struct {
             priv.tab_view.setSelectedPage(page);
         }
 
+        self.syncSplitAttention();
         self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
         signals.@"surface-added".impl.emit(self, null, .{surface}, null);
@@ -359,11 +376,13 @@ pub const SplitTabs = extern struct {
     fn tabViewSelectedPage(_: *adw.TabView, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         if (self.private().disposing) return;
         const page = self.private().tab_view.getSelectedPage() orelse {
+            self.syncSplitAttention();
             self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
             return;
         };
         page.setNeedsAttention(@intFromBool(false));
         const surface = self.getPageSurface(page) orelse return;
+        self.syncSplitAttention();
         surface.grabFocus();
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
@@ -413,10 +432,62 @@ pub const SplitTabs = extern struct {
     fn tabViewPageDetached(_: *adw.TabView, page: *adw.TabPage, _: c_int, self: *Self) callconv(.c) void {
         if (self.private().disposing) return;
         if (self.getPageSurface(page)) |surface| {
+            _ = gobject.signalHandlersDisconnectMatched(
+                surface.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
+            surface.setSplitAttention(false);
             signals.@"surface-removed".impl.emit(self, null, .{surface}, null);
         }
+        self.syncSplitAttention();
         self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    fn surfaceAttentionChanged(_: *Surface, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
+        if (self.private().disposing) return;
+        self.syncSplitAttention();
+    }
+
+    fn syncSplitAttention(self: *Self) void {
+        const selected_page = self.private().tab_view.getSelectedPage();
+        var hidden_attention = false;
+        var selected_attention = false;
+
+        const page_count = self.private().tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = self.private().tab_view.getNthPage(@intCast(i));
+            const surface = self.getPageSurface(page) orelse continue;
+            const needs_attention = surface.getUnreadPending() or surface.getBellRinging();
+            if (selected_page != null and page == selected_page.?) {
+                selected_attention = needs_attention;
+                continue;
+            }
+            if (needs_attention) {
+                hidden_attention = true;
+                break;
+            }
+        }
+
+        const leaf_attention = hidden_attention or (page_count <= 1 and selected_attention);
+
+        for (0..@intCast(page_count)) |i| {
+            const page = self.private().tab_view.getNthPage(@intCast(i));
+            const surface = self.getPageSurface(page) orelse continue;
+            const show_border = selected_page != null and page == selected_page.? and leaf_attention;
+            surface.setSplitAttention(show_border);
+        }
+
+        if (leaf_attention) {
+            self.as(gtk.Widget).addCssClass("needs-attention");
+        } else {
+            self.as(gtk.Widget).removeCssClass("needs-attention");
+        }
     }
 
     fn tabBarSecondaryClick(
@@ -517,6 +588,21 @@ pub const SplitTabs = extern struct {
         priv.disposing = true;
         priv.pending_close_page = null;
         priv.context_menu_tab = null;
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const surface = self.getPageSurface(page) orelse continue;
+            _ = gobject.signalHandlersDisconnectMatched(
+                surface.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
+            surface.setSplitAttention(false);
+        }
         if (priv.context_menu_popover) |popover| {
             popover.popdown();
             popover.as(gtk.Widget).unparent();
