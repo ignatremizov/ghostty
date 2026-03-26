@@ -37,6 +37,7 @@ pub const WorkspaceRuntime = struct {
 
     pub fn resetRuntime(self: *WorkspaceRuntime) void {
         _ = self.runtime_arena.reset(.retain_capacity);
+        self.workspace.layout_root_id = null;
         self.workspace.split_ids = &.{};
         self.workspace.session_ids = &.{};
         self.workspace.tab_ids = &.{};
@@ -473,7 +474,17 @@ pub const Registry = struct {
         slug: []const u8,
         created_at: []const u8,
     ) !*WorkspaceRuntime {
-        const workspace_id = self.ids.next(.workspace);
+        return self.createWorkspaceWithId(self.ids.next(.workspace), name, slug, created_at);
+    }
+
+    pub fn createWorkspaceWithId(
+        self: *Registry,
+        workspace_id: ids.WorkspaceId,
+        name: []const u8,
+        slug: []const u8,
+        created_at: []const u8,
+    ) !*WorkspaceRuntime {
+        self.ids.observe(workspace_id);
         const created_at_owned = try self.allocator.dupe(u8, created_at);
         const updated_at_owned = try self.allocator.dupe(u8, created_at);
         try self.workspaces.append(self.allocator, .{

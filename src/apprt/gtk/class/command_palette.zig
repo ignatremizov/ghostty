@@ -17,6 +17,8 @@ const Window = @import("window.zig").Window;
 const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const Surface = @import("surface.zig").Surface;
 const Config = @import("config.zig").Config;
+const workspace_snapshot = @import("../workspace_snapshot.zig");
+const workspace_storage = @import("../workspace_storage.zig");
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);
 
@@ -170,6 +172,7 @@ pub const CommandPalette = extern struct {
             log.warn("failed to collect jump commands: {}", .{err});
         };
 
+        self.collectDynamicRestoreCommands(config, &commands, alloc);
         self.collectRegularCommands(config, &commands, alloc);
 
         // Sort commands
@@ -259,6 +262,57 @@ pub const CommandPalette = extern struct {
             null,
             true,
         );
+    }
+
+    fn collectDynamicRestoreCommands(
+        self: *CommandPalette,
+        config: *Config,
+        commands: *std.ArrayList(*Command),
+        alloc: std.mem.Allocator,
+    ) void {
+        _ = self;
+
+        var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
+            log.warn("failed to read workspace catalog: {}", .{err});
+            return;
+        };
+        defer catalog.deinit(alloc);
+
+        for (catalog.entries) |entry| {
+            const target = if (entry.workspace_key) |workspace_key|
+                workspace_key
+            else
+                entry.workspace_name;
+
+            const title = formatWorkspaceRestoreCommandTitle(
+                alloc,
+                entry.workspace_name,
+            ) catch |err| {
+                log.warn("failed to allocate restore command title: {}", .{err});
+                continue;
+            };
+            defer alloc.free(title);
+
+            const description = formatWorkspaceRestoreCommandDescription(
+                alloc,
+                entry,
+            ) catch |err| {
+                log.warn("failed to allocate restore command description: {}", .{err});
+                continue;
+            };
+            defer alloc.free(description);
+
+            const cmd = Command.newRestore(config, target, title, description) catch |err| {
+                log.warn("failed to create restore command: {}", .{err});
+                continue;
+            };
+            errdefer cmd.unref();
+
+            commands.append(alloc, cmd) catch |err| {
+                log.warn("failed to add restore command to list: {}", .{err});
+                continue;
+            };
+        }
     }
 
     fn appendPaneMoveCommand(
@@ -416,6 +470,58 @@ pub const CommandPalette = extern struct {
         );
     }
 
+    fn formatWorkspaceRestoreCommandTitle(
+        alloc: std.mem.Allocator,
+        workspace_name: []const u8,
+    ) ![:0]u8 {
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "Restore Workspace: {s}",
+            .{workspace_name},
+            0,
+        );
+    }
+
+    fn formatWorkspaceRestoreCommandDescription(
+        alloc: std.mem.Allocator,
+        entry: workspace_snapshot.CatalogEntry,
+    ) ![:0]u8 {
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "Restore {s} from {s} (saved {s}).",
+            .{ entry.workspace_name, entry.path, entry.saved_at },
+            0,
+        );
+    }
+
+    test "workspace restore commands include saved snapshot details" {
+        const testing = std.testing;
+
+        const title = try formatWorkspaceRestoreCommandTitle(
+            testing.allocator,
+            "work",
+        );
+        defer testing.allocator.free(title);
+        try testing.expectEqualStrings("Restore Workspace: work", title);
+
+        const description = try formatWorkspaceRestoreCommandDescription(
+            testing.allocator,
+            .{
+                .snapshot_id = .init(7),
+                .workspace_id = .init(3),
+                .workspace_key = null,
+                .workspace_name = "work",
+                .saved_at = "2026-03-26T10:00:00Z",
+                .path = "snapshot-7.json",
+            },
+        );
+        defer testing.allocator.free(description);
+        try testing.expectEqualStrings(
+            "Restore work from snapshot-7.json (saved 2026-03-26T10:00:00Z).",
+            description,
+        );
+    }
+
     /// Check if an action is supported on GTK.
     fn isActionSupportedOnGtk(action: input.Binding.Action) bool {
         return switch (action) {
@@ -482,10 +588,12 @@ pub const CommandPalette = extern struct {
         const a_sort_key = switch (a.private().data) {
             .regular => return false,
             .jump => |*ja| ja.sort_key,
+            .restore => return false,
         };
         const b_sort_key = switch (b.private().data) {
             .regular => return false,
             .jump => |*jb| jb.sort_key,
+            .restore => return false,
         };
 
         return a_sort_key < b_sort_key;
@@ -539,6 +647,20 @@ pub const CommandPalette = extern struct {
         _ = priv.search.as(gtk.Widget).grabFocus();
     }
 
+    pub fn presentQuery(self: *CommandPalette, window: *Window, query: []const u8) void {
+        const priv = self.private();
+        priv.window.set(window);
+
+        self.rebuildCommands();
+        const alloc = Application.default().allocator();
+        const query_z = alloc.dupeZ(u8, query) catch return;
+        defer alloc.free(query_z);
+        priv.search.as(gtk.Editable).setText(query_z);
+        priv.dialog.present(window.as(gtk.Widget));
+        _ = priv.search.as(gtk.Widget).grabFocus();
+        priv.search.as(gtk.Editable).selectRegion(0, -1);
+    }
+
     /// Helper function to send a signal containing the action that should be
     /// performed.
     fn activated(self: *CommandPalette, pos: c_uint) void {
@@ -561,6 +683,15 @@ pub const CommandPalette = extern struct {
             const surface = cmd.getJumpSurface() orelse return;
             defer surface.unref();
             surface.present();
+            return;
+        }
+
+        if (cmd.isRestore()) {
+            const window = priv.window.get() orelse return;
+            defer window.unref();
+
+            const workspace_target = cmd.getRestoreTarget() orelse return;
+            window.restoreSavedWorkspace(workspace_target);
             return;
         }
 
@@ -753,6 +884,7 @@ const Command = extern struct {
         pub const CommandData = union(enum) {
             regular: RegularData,
             jump: JumpData,
+            restore: RestoreData,
         };
 
         pub const RegularData = struct {
@@ -766,6 +898,12 @@ const Command = extern struct {
             title: ?[:0]const u8 = null,
             description: ?[:0]const u8 = null,
             sort_key: usize,
+        };
+
+        pub const RestoreData = struct {
+            workspace_target: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+            description: ?[:0]const u8 = null,
         };
     };
 
@@ -805,6 +943,29 @@ const Command = extern struct {
         return self;
     }
 
+    pub fn newRestore(
+        config: *Config,
+        workspace_target: []const u8,
+        title: []const u8,
+        description: []const u8,
+    ) Allocator.Error!*Self {
+        const self = gobject.ext.newInstance(Self, .{
+            .config = config,
+        });
+        errdefer self.unref();
+
+        const priv = self.private();
+        priv.data = .{
+            .restore = .{
+                .workspace_target = try priv.arena.allocator().dupeZ(u8, workspace_target),
+                .title = try priv.arena.allocator().dupeZ(u8, title),
+                .description = try priv.arena.allocator().dupeZ(u8, description),
+            },
+        };
+
+        return self;
+    }
+
     fn init(self: *Self, _: *Class) callconv(.c) void {
         // NOTE: we do not watch for changes to the config here as the command
         // palette will destroy and recreate this object if/when the config
@@ -827,6 +988,7 @@ const Command = extern struct {
             .jump => |*j| {
                 j.surface.set(null);
             },
+            .restore => {},
         }
 
         gobject.Object.virtual_methods.dispose.call(
@@ -853,7 +1015,7 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
-            .jump => return null,
+            .jump, .restore => return null,
         };
 
         if (regular.action_key) |action_key| return action_key;
@@ -873,7 +1035,7 @@ const Command = extern struct {
 
         const regular = switch (priv.data) {
             .regular => |*r| r,
-            .jump => return null,
+            .jump, .restore => return null,
         };
 
         if (regular.action) |action| return action;
@@ -916,6 +1078,7 @@ const Command = extern struct {
 
                 return j.title;
             },
+            .restore => |*r| return r.title,
         }
     }
 
@@ -942,6 +1105,7 @@ const Command = extern struct {
 
                 return j.description;
             },
+            .restore => |*r| return r.description,
         }
     }
 
@@ -955,6 +1119,7 @@ const Command = extern struct {
         return switch (priv.data) {
             .regular => |*r| r.command.action,
             .jump => null,
+            .restore => null,
         };
     }
 
@@ -971,6 +1136,20 @@ const Command = extern struct {
         return switch (priv.data) {
             .regular => null,
             .jump => |*j| j.surface.get(),
+            .restore => null,
+        };
+    }
+
+    pub fn isRestore(self: *Self) bool {
+        const priv = self.private();
+        return priv.data == .restore;
+    }
+
+    pub fn getRestoreTarget(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+        return switch (priv.data) {
+            .regular, .jump => null,
+            .restore => |*r| r.workspace_target,
         };
     }
 

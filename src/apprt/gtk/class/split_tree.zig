@@ -1531,7 +1531,11 @@ const SplitTreeSplit = extern struct {
             self.as(gtk.Widget),
         ) orelse return 0;
         const tree = split_tree.getTree() orelse return 0;
-        const split: *const SplitTabs.Tree.Split = &tree.nodes[priv.handle.idx()].split;
+        if (priv.handle.idx() >= tree.nodes.len) return 0;
+        const split: *const SplitTabs.Tree.Split = switch (tree.nodes[priv.handle.idx()]) {
+            .split => |*split| split,
+            .leaf => return 0,
+        };
 
         // Current, min, and max positions as pixels.
         const pos = paned.getPosition();
