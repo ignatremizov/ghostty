@@ -728,6 +728,7 @@ pub const SplitTree = extern struct {
         }
 
         self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
     fn getTreeValue(self: *Self, value: *gobject.Value) void {

@@ -158,52 +158,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
           shrink-start-child: false;
 
           start-child: Adw.Bin {
-            Gtk.Box workspace_sidebar {
-              orientation: vertical;
-
-              Gtk.Box {
-                margin-top: 12;
-                margin-bottom: 6;
-                margin-start: 12;
-                margin-end: 12;
-
-                Gtk.Label {
-                  label: _("Workspaces");
-                  xalign: 0;
-                  styles [
-                    "title-4",
-                  ]
-                }
-              }
-
-              Gtk.ScrolledWindow {
-                hscrollbar-policy: never;
-                vexpand: true;
-
-                Gtk.ListBox workspace_list {
-                  styles [
-                    "navigation-sidebar",
-                  ]
-
-                  row-selected => $workspace_row_selected();
-                }
-              }
-
-              Gtk.Box {
-                margin-top: 8;
-                margin-bottom: 12;
-                margin-start: 12;
-                margin-end: 12;
-
-                Gtk.Button {
-                  clicked => $new_workspace();
-                  icon-name: "list-add-symbolic";
-                  label: _("New Workspace");
-                  halign: fill;
-                  hexpand: true;
-                }
-              }
-            }
+            $GhosttyWorkspaceSidebar workspace_sidebar {}
           };
 
           end-child: Adw.ToastOverlay toast_overlay {
