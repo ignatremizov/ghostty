@@ -29,6 +29,7 @@ const SplitTabs = @import("split_tabs.zig").SplitTabs;
 const Surface = @import("surface.zig").Surface;
 const Tab = @import("tab.zig").Tab;
 const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
+const WorkspaceSidebar = @import("workspace_sidebar.zig").WorkspaceSidebar;
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -41,14 +42,6 @@ const workspace_snapshot = @import("../workspace_snapshot.zig");
 const workspace_storage = @import("../workspace_storage.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
-
-const WorkspaceContextAction = enum {
-    rename,
-    save,
-    open_file,
-    reveal,
-    close,
-};
 
 pub const Window = extern struct {
     const Self = @This();
@@ -276,13 +269,6 @@ pub const Window = extern struct {
         /// Workspace page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
-        context_menu_popover: ?*gtk.Popover = null,
-        workspace_empty_context_popover: ?*gtk.Popover = null,
-        pending_context_menu_row: ?*gtk.ListBoxRow = null,
-        pending_context_menu_rect: ?gdk.Rectangle = null,
-        pending_context_workspace_page: ?*WorkspacePage = null,
-        pending_context_workspace_action: ?WorkspaceContextAction = null,
-        pending_workspace_empty_restore: bool = false,
         pending_surface_focus_source: ?c_uint = null,
         disposing_runtime: bool = false,
         runtime_window_id: ?workspace_ids.WindowId = null,
@@ -300,8 +286,7 @@ pub const Window = extern struct {
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
         workspace_split_view: *gtk.Paned,
-        workspace_sidebar: *gtk.Box,
-        workspace_list: *gtk.ListBox,
+        workspace_sidebar: *WorkspaceSidebar,
         workspace_sidebar_position: c_int = 280,
 
         pub var offset: c_int = 0;
@@ -372,26 +357,64 @@ pub const Window = extern struct {
         // Initialize our actions
         self.initActionMap();
 
-        priv.workspace_list.setSelectionMode(.browse);
-        priv.workspace_list.bindModel(
-            priv.tab_view.getPages().as(gio.ListModel),
-            workspaceListCreateWidget,
+        priv.workspace_sidebar.bindModel(priv.tab_view.getPages().as(gio.ListModel));
+        _ = WorkspaceSidebar.signals.@"workspace-selected".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarWorkspaceSelected,
             self,
-            null,
+            .{},
         );
-        {
-            const gesture = gtk.GestureClick.new();
-            gesture.as(gtk.GestureSingle).setButton(3);
-            _ = gtk.GestureClick.signals.released.connect(
-                gesture,
-                *Self,
-                workspaceListSecondaryClick,
-                self,
-                .{},
-            );
-            priv.workspace_list.as(gtk.Widget).addController(gesture.as(gtk.EventController));
-        }
-        self.syncWorkspaceListSelection();
+        _ = WorkspaceSidebar.signals.@"new-workspace".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarNewWorkspace,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"prompt-workspace-title".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarPromptWorkspaceTitle,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"save-workspace".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarSaveWorkspace,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"reveal-workspace-snapshot".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarRevealWorkspaceSnapshot,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"open-workspace-snapshot".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarOpenWorkspaceSnapshot,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"close-workspace".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarCloseWorkspace,
+            self,
+            .{},
+        );
+        _ = WorkspaceSidebar.signals.@"restore-workspace".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarRestoreWorkspace,
+            self,
+            .{},
+        );
+        self.syncWorkspaceSidebarSelection();
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to build initial workspace registry error={}", .{err});
         };
@@ -809,361 +832,52 @@ pub const Window = extern struct {
         self.toggleWorkspaceSidebar();
     }
 
-    fn workspaceListCreateWidget(
-        item: *gobject.Object,
-        ud: ?*anyopaque,
-    ) callconv(.c) *gtk.Widget {
-        const self: *Self = @ptrCast(@alignCast(ud orelse @panic("expected window")));
-        const page = gobject.ext.cast(adw.TabPage, item) orelse @panic("expected tab page");
-        const workspace_page = gobject.ext.cast(
-            WorkspacePage,
-            page.getChild(),
-        ) orelse @panic("expected workspace page");
-
-        const row = gtk.ListBoxRow.new();
-        row.setActivatable(1);
-        row.setSelectable(1);
-        row.as(gtk.Widget).addCssClass("workspace-row");
-
-        const content = gtk.Box.new(.horizontal, 12);
-        content.as(gtk.Widget).setMarginTop(8);
-        content.as(gtk.Widget).setMarginBottom(8);
-        content.as(gtk.Widget).setMarginStart(12);
-        content.as(gtk.Widget).setMarginEnd(12);
-
-        const box = gtk.Box.new(.vertical, 2);
-        box.as(gtk.Widget).setHexpand(1);
-
-        const title = gtk.Label.new(null);
-        title.setXalign(0);
-        title.as(gtk.Widget).setHexpand(1);
-        title.setLabel(workspace_page.getSidebarTitle() orelse "");
-
-        const subtitle = gtk.Label.new(null);
-        subtitle.setXalign(0);
-        subtitle.as(gtk.Widget).setHexpand(1);
-        subtitle.as(gtk.Widget).addCssClass("dim-label");
-        subtitle.setLabel(workspace_page.getSidebarSubtitle() orelse "");
-
-        const badge = gtk.Label.new(null);
-        badge.as(gtk.Widget).addCssClass("accent");
-        badge.as(gtk.Widget).setValign(.center);
-        badge.as(gtk.Widget).setVisible(0);
-
-        box.append(title.as(gtk.Widget));
-        box.append(subtitle.as(gtk.Widget));
-        content.append(box.as(gtk.Widget));
-        content.append(badge.as(gtk.Widget));
-        row.setChild(content.as(gtk.Widget));
-
-        row.as(gobject.Object).setData("workspace-badge", badge);
-        row.as(gobject.Object).setData("workspace-title-label", title);
-        row.as(gobject.Object).setData("workspace-subtitle-label", subtitle);
-
-        const gesture = gtk.GestureClick.new();
-        gesture.as(gtk.GestureSingle).setButton(3);
-        _ = gtk.GestureClick.signals.released.connect(
-            gesture,
-            *Self,
-            workspaceRowSecondaryClick,
-            self,
-            .{},
-        );
-        row.as(gtk.Widget).addController(gesture.as(gtk.EventController));
-
-        return row.as(gtk.Widget);
-    }
-
-    fn workspaceRowSecondaryClick(
-        gesture: *gtk.GestureClick,
-        _: c_int,
-        x: f64,
-        y: f64,
-        self: *Self,
-    ) callconv(.c) void {
+    fn workspaceSidebarWorkspaceSelected(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, self: *Self) callconv(.c) void {
         const priv = self.private();
-        const row_widget = gesture.as(gtk.EventController).getWidget() orelse return;
-        const row = gobject.ext.cast(gtk.ListBoxRow, row_widget) orelse return;
-        const idx = row.getIndex();
-        if (idx < 0) return;
-
-        priv.context_menu_page = priv.tab_view.getNthPage(idx);
-        var list_x: f64 = 0;
-        var list_y: f64 = 0;
-        if (row.as(gtk.Widget).translateCoordinates(
-            priv.workspace_list.as(gtk.Widget),
-            x,
-            y,
-            &list_x,
-            &list_y,
-        ) == 0) return;
-
-        const rect: gdk.Rectangle = .{
-            .f_x = @intFromFloat(list_x),
-            .f_y = @intFromFloat(list_y),
-            .f_width = 1,
-            .f_height = 1,
-        };
-        self.ensureWorkspaceContextMenuPopover();
-        if (priv.context_menu_popover.?.as(gtk.Widget).isVisible() != 0) {
-            priv.pending_context_menu_row = null;
-            priv.pending_context_menu_rect = null;
-            priv.context_menu_popover.?.setPointingTo(&rect);
-            return;
+        const page = priv.tab_view.getPage(workspace_page.as(gtk.Widget));
+        if (priv.tab_view.getSelectedPage() != page) {
+            priv.tab_view.setSelectedPage(page);
         }
-
-        self.showWorkspaceContextMenu(rect);
+        self.focusWorkspaceSelection(workspace_page);
     }
 
-    fn workspaceListSecondaryClick(
-        _: *gtk.GestureClick,
-        _: c_int,
-        x: f64,
-        y: f64,
-        self: *Self,
-    ) callconv(.c) void {
-        const priv = self.private();
-        if (priv.workspace_list.getRowAtY(@intFromFloat(y)) != null) return;
-
-        const rect: gdk.Rectangle = .{
-            .f_x = @intFromFloat(x),
-            .f_y = @intFromFloat(y),
-            .f_width = 1,
-            .f_height = 1,
-        };
-        self.ensureWorkspaceEmptyContextMenuPopover();
-        if (priv.workspace_empty_context_popover.?.as(gtk.Widget).isVisible() != 0) {
-            priv.pending_workspace_empty_restore = false;
-            priv.workspace_empty_context_popover.?.setPointingTo(&rect);
-            return;
-        }
-
-        self.showWorkspaceEmptyContextMenu(rect);
+    fn workspaceSidebarNewWorkspace(_: *WorkspaceSidebar, self: *Self) callconv(.c) void {
+        self.newWorkspace(if (self.getActiveSurface()) |surface| surface.core() else null);
     }
 
-    fn ensureWorkspaceContextMenuPopover(self: *Self) void {
-        const priv = self.private();
-        if (priv.context_menu_popover != null) return;
-        const content = gtk.Box.new(.vertical, 0);
-
-        const rename_button = gtk.Button.newWithLabel(i18n._("Change Workspace Title…"));
-        rename_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(
-            rename_button,
-            *Self,
-            workspaceRowRenameClicked,
-            self,
-            .{},
-        );
-
-        const save_button = gtk.Button.newWithLabel(i18n._("Save Workspace"));
-        save_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(
-            save_button,
-            *Self,
-            workspaceRowSaveClicked,
-            self,
-            .{},
-        );
-
-        const reveal_button = gtk.Button.newWithLabel(i18n._("Reveal Snapshot"));
-        reveal_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(
-            reveal_button,
-            *Self,
-            workspaceRowRevealClicked,
-            self,
-            .{},
-        );
-
-        const open_button = gtk.Button.newWithLabel(i18n._("Open Snapshot File…"));
-        open_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(
-            open_button,
-            *Self,
-            workspaceRowOpenSnapshotClicked,
-            self,
-            .{},
-        );
-
-        const delete_button = gtk.Button.newWithLabel(i18n._("Delete Workspace"));
-        delete_button.as(gtk.Widget).setHalign(.fill);
-        delete_button.as(gtk.Widget).addCssClass("destructive-action");
-        _ = gtk.Button.signals.clicked.connect(
-            delete_button,
-            *Self,
-            workspaceRowDeleteClicked,
-            self,
-            .{},
-        );
-
-        content.append(rename_button.as(gtk.Widget));
-        content.append(save_button.as(gtk.Widget));
-        content.append(reveal_button.as(gtk.Widget));
-        content.append(open_button.as(gtk.Widget));
-        content.append(delete_button.as(gtk.Widget));
-
-        const popover = gtk.Popover.new();
-        popover.setHasArrow(0);
-        popover.setChild(content.as(gtk.Widget));
-        popover.as(gtk.Widget).setParent(priv.workspace_list.as(gtk.Widget));
-        _ = gtk.Popover.signals.closed.connect(
-            popover,
-            *Self,
-            workspaceRowContextMenuClosed,
-            self,
-            .{},
-        );
-
-        priv.context_menu_popover = popover;
+    fn workspaceSidebarPromptWorkspaceTitle(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page.ref());
     }
 
-    fn ensureWorkspaceEmptyContextMenuPopover(self: *Self) void {
-        const priv = self.private();
-        if (priv.workspace_empty_context_popover != null) return;
-
-        const content = gtk.Box.new(.vertical, 0);
-        const restore_button = gtk.Button.newWithLabel(i18n._("Restore Workspace…"));
-        restore_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(
-            restore_button,
-            *Self,
-            workspaceEmptyRestoreClicked,
-            self,
-            .{},
-        );
-        content.append(restore_button.as(gtk.Widget));
-
-        const popover = gtk.Popover.new();
-        popover.setHasArrow(0);
-        popover.setChild(content.as(gtk.Widget));
-        popover.as(gtk.Widget).setParent(priv.workspace_list.as(gtk.Widget));
-        _ = gtk.Popover.signals.closed.connect(
-            popover,
-            *Self,
-            workspaceEmptyContextMenuClosed,
-            self,
-            .{},
-        );
-
-        priv.workspace_empty_context_popover = popover;
+    fn workspaceSidebarSaveWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page.ref());
     }
 
-    fn showWorkspaceContextMenu(self: *Self, rect: gdk.Rectangle) void {
-        const priv = self.private();
-        self.ensureWorkspaceContextMenuPopover();
-        priv.context_menu_popover.?.setPointingTo(&rect);
-        priv.context_menu_popover.?.popup();
+    fn workspaceSidebarRevealWorkspaceSnapshot(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page.ref());
     }
 
-    fn showWorkspaceEmptyContextMenu(self: *Self, rect: gdk.Rectangle) void {
-        const priv = self.private();
-        self.ensureWorkspaceEmptyContextMenuPopover();
-        priv.workspace_empty_context_popover.?.setPointingTo(&rect);
-        priv.workspace_empty_context_popover.?.popup();
+    fn workspaceSidebarOpenWorkspaceSnapshot(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page.ref());
     }
 
-    fn workspaceRowRenameClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueWorkspaceRowContextAction(button, .rename);
+    fn workspaceSidebarCloseWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page.ref());
     }
 
-    fn workspaceRowSaveClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueWorkspaceRowContextAction(button, .save);
-    }
-
-    fn workspaceRowRevealClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueWorkspaceRowContextAction(button, .reveal);
-    }
-
-    fn workspaceRowOpenSnapshotClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueWorkspaceRowContextAction(button, .open_file);
-    }
-
-    fn workspaceRowDeleteClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueWorkspaceRowContextAction(button, .close);
-    }
-
-    fn workspaceEmptyRestoreClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        const priv = self.private();
-        priv.pending_workspace_empty_restore = true;
-        if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
-            popover.popdown();
-        }
-    }
-
-    fn queueWorkspaceRowContextAction(
-        self: *Self,
-        button: *gtk.Button,
-        action: WorkspaceContextAction,
-    ) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        if (priv.pending_context_workspace_page) |old_page| old_page.unref();
-        priv.pending_context_workspace_page = workspace_page.ref();
-        priv.pending_context_workspace_action = action;
-        if (ext.getAncestor(gtk.Popover, button.as(gtk.Widget))) |popover| {
-            popover.popdown();
-        }
-    }
-
-    fn workspaceRowContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
-        _ = popover;
-        const priv = self.private();
-        if (priv.pending_context_workspace_page) |workspace_page| {
-            priv.pending_context_workspace_page = null;
-            const action = priv.pending_context_workspace_action orelse .rename;
-            priv.pending_context_workspace_action = null;
-            switch (action) {
-                .rename => _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page),
-                .save => _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page),
-                .open_file => _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page),
-                .reveal => _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page),
-                .close => _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page),
-            }
-        }
-    }
-
-    fn workspaceEmptyContextMenuClosed(popover: *gtk.Popover, self: *Self) callconv(.c) void {
-        _ = popover;
-        const priv = self.private();
-        if (!priv.pending_workspace_empty_restore) return;
-        priv.pending_workspace_empty_restore = false;
+    fn workspaceSidebarRestoreWorkspace(_: *WorkspaceSidebar, self: *Self) callconv(.c) void {
         _ = self.ref();
         _ = glib.idleAdd(idleShowRestoreWorkspaceCommands, self);
     }
 
-    fn workspaceListRowSelected(
-        _: *gtk.ListBox,
-        row_: ?*gtk.ListBoxRow,
-        self: *Self,
-    ) callconv(.c) void {
-        const row = row_ orelse return;
-        const idx = row.getIndex();
-        if (idx < 0) return;
-
-        const priv = self.private();
-        const page = priv.tab_view.getNthPage(idx);
-        if (priv.tab_view.getSelectedPage() != page) {
-            priv.tab_view.setSelectedPage(page);
-        }
-
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        self.focusWorkspaceSelection(workspace_page);
-    }
-
-    fn syncWorkspaceListSelection(self: *Self) void {
+    fn syncWorkspaceSidebarSelection(self: *Self) void {
         const priv = self.private();
         const page = priv.tab_view.getSelectedPage() orelse {
-            priv.workspace_list.unselectAll();
+            priv.workspace_sidebar.syncSelection(null);
             return;
         };
         const idx = priv.tab_view.getPagePosition(page);
-        const row = priv.workspace_list.getRowAtIndex(idx) orelse return;
-        if (priv.workspace_list.getSelectedRow() == row) return;
-        priv.workspace_list.selectRow(row);
+        priv.workspace_sidebar.syncSelection(idx);
     }
 
     /// Toggle the visible property.
@@ -2150,32 +1864,27 @@ pub const Window = extern struct {
     fn syncWorkspaceListBadges(self: *Self) void {
         const priv = self.private();
         const n = priv.tab_view.getNPages();
-        var buf: [32:0]u8 = undefined;
-
         for (0..@intCast(n)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
-            const row = priv.workspace_list.getRowAtIndex(@intCast(i)) orelse continue;
-            const badge_obj = row.as(gobject.Object).getData("workspace-badge") orelse continue;
-            const badge: *gtk.Label = @ptrCast(@alignCast(badge_obj));
             const summary = if (self.getWorkspaceRuntimeForPage(workspace_page)) |runtime|
                 runtime.workspace.attention_summary
             else
                 summarizeWorkspacePageAttention(workspace_page);
             if (!summary.needs_attention) {
-                badge.as(gtk.Widget).setVisible(0);
+                priv.workspace_sidebar.updateRowBadge(@intCast(i), null);
                 continue;
             }
 
+            var buf: [32:0]u8 = undefined;
             const text = if (summary.bell_count > 0)
                 std.fmt.bufPrintZ(&buf, "🔔 {d}", .{summary.bell_count}) catch "🔔"
             else if (summary.unread_count > 0)
                 std.fmt.bufPrintZ(&buf, "{d}", .{summary.unread_count}) catch "•"
             else
                 "•";
-            badge.setLabel(text);
-            badge.as(gtk.Widget).setVisible(1);
+            priv.workspace_sidebar.updateRowBadge(@intCast(i), text);
         }
     }
 
@@ -2188,100 +1897,83 @@ pub const Window = extern struct {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
-            const row = priv.workspace_list.getRowAtIndex(@intCast(i)) orelse continue;
-            const title_obj = row.as(gobject.Object).getData("workspace-title-label") orelse continue;
-            const subtitle_obj = row.as(gobject.Object).getData("workspace-subtitle-label") orelse continue;
-            const title_label: *gtk.Label = @ptrCast(@alignCast(title_obj));
-            const subtitle_label: *gtk.Label = @ptrCast(@alignCast(subtitle_obj));
 
             const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
-                title_label.setLabel(workspace_page.getSidebarTitle() orelse "Workspace");
-                subtitle_label.setLabel(workspace_page.getSidebarSubtitle() orelse "");
-                if (workspace_page.getTooltip()) |tooltip|
-                    row.as(gtk.Widget).setTooltipText(tooltip.ptr)
-                else
-                    row.as(gtk.Widget).setTooltipText(null);
+                priv.workspace_sidebar.updateRowDescriptor(
+                    @intCast(i),
+                    workspace_page.getSidebarTitle() orelse "Workspace",
+                    workspace_page.getSidebarSubtitle() orelse "",
+                    workspace_page.getTooltip(),
+                );
                 continue;
             };
 
-            title_label.setLabel(workspace_page.getSidebarTitle() orelse "Workspace");
+            const selected = workspace_registry.selectedSessionDescriptor(runtime);
+            var fallback_title_allocated = false;
+            const title: [:0]const u8 = workspace_page.getSidebarTitle() orelse
+                workspace_page.getTitleOverride() orelse title: {
+                    fallback_title_allocated = true;
+                    break :title alloc.dupeZ(u8, runtime.workspace.name) catch "Workspace";
+                };
+            defer if (fallback_title_allocated) alloc.free(title);
+
+            var fallback_subtitle_allocated = false;
+            const base_subtitle: ?[:0]const u8 = workspace_page.getSidebarSubtitle() orelse subtitle: {
+                const selected_desc = selected orelse break :subtitle null;
+                fallback_subtitle_allocated = true;
+                const display = allocRestoreDisplayPath(alloc, selected_desc.cwd) catch {
+                    fallback_subtitle_allocated = false;
+                    break :subtitle null;
+                };
+                defer alloc.free(display);
+                break :subtitle alloc.dupeZ(u8, display) catch {
+                    fallback_subtitle_allocated = false;
+                    break :subtitle null;
+                };
+            };
+            defer if (fallback_subtitle_allocated and base_subtitle != null) alloc.free(base_subtitle.?);
 
             var subtitle_allocated = true;
-            const subtitle = formatWorkspaceSidebarSubtitle(
+            const subtitle = WorkspaceSidebar.formatSidebarSubtitle(
                 alloc,
-                workspace_page.getSidebarSubtitle(),
+                base_subtitle,
                 workspace_registry.sidebarCounts(runtime),
             ) catch blk: {
                 subtitle_allocated = false;
-                break :blk workspace_page.getSidebarSubtitle() orelse "";
+                break :blk base_subtitle orelse "";
             };
             defer if (subtitle_allocated) alloc.free(subtitle);
-            subtitle_label.setLabel(subtitle);
 
-            const tooltip = formatWorkspaceSidebarTooltip(alloc, runtime) catch null;
+            const tooltip = WorkspaceSidebar.formatSidebarTooltip(alloc, runtime) catch null;
             defer if (tooltip) |text| alloc.free(text);
-            if (tooltip) |text|
-                row.as(gtk.Widget).setTooltipText(text.ptr)
-            else if (workspace_page.getTooltip()) |fallback|
-                row.as(gtk.Widget).setTooltipText(fallback.ptr)
-            else
-                row.as(gtk.Widget).setTooltipText(null);
+            priv.workspace_sidebar.updateRowDescriptor(
+                @intCast(i),
+                title,
+                subtitle,
+                if (tooltip) |text| text else workspace_page.getTooltip(),
+            );
         }
     }
 
-    fn formatWorkspaceSidebarSubtitle(
-        alloc: std.mem.Allocator,
-        base_subtitle: ?[:0]const u8,
-        counts: workspace_registry.SidebarCounts,
-    ) ![:0]u8 {
-        const base = if (base_subtitle) |subtitle| subtitle else "";
-        if (counts.sessions <= 1 and counts.tabs <= 1 and counts.splits <= 1) {
-            return std.fmt.allocPrintSentinel(alloc, "{s}", .{base}, 0);
+    fn summarizeWorkspacePageAttention(workspace_page: *WorkspacePage) workspace_attention.AttentionSummary {
+        var summary: workspace_attention.AttentionSummary = .{};
+        const tree = workspace_page.getSurfaceTree() orelse return summary;
+
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                const unread = surface.getUnreadPending();
+                const bell = surface.getBellRinging();
+                if (unread) summary.unread_count += 1;
+                if (bell) summary.bell_count += 1;
+                summary.needs_attention = summary.needs_attention or unread or bell;
+            }
         }
 
-        if (base.len == 0) {
-            return std.fmt.allocPrintSentinel(alloc, "{d} {s}", .{
-                counts.sessions,
-                if (counts.sessions == 1) "session" else "sessions",
-            }, 0);
-        }
-
-        return std.fmt.allocPrintSentinel(alloc, "{s} • {d} {s}", .{
-            base,
-            counts.sessions,
-            if (counts.sessions == 1) "session" else "sessions",
-        }, 0);
-    }
-
-    fn formatWorkspaceSidebarTooltip(
-        alloc: std.mem.Allocator,
-        runtime: *const workspace_registry.WorkspaceRuntime,
-    ) !?[:0]u8 {
-        const counts = workspace_registry.sidebarCounts(runtime);
-        const descriptor = workspace_registry.selectedSessionDescriptor(runtime);
-
-        if (descriptor) |selected| {
-            const session_title = selected.session_title_override orelse selected.session_title;
-            const tab_title = selected.tab_title_override orelse selected.tab_title;
-            return try std.fmt.allocPrintSentinel(alloc, "{d} {s} • {d} {s}\nSelected split: {s}\nSelected tab: {s}\nSelected session: {s}\nWorking directory: {s}", .{
-                counts.splits,
-                if (counts.splits == 1) "split" else "splits",
-                counts.sessions,
-                if (counts.sessions == 1) "session" else "sessions",
-                selected.split_title,
-                tab_title,
-                session_title,
-                selected.cwd,
-            }, 0);
-        }
-
-        if (counts.sessions == 0) return null;
-        return try std.fmt.allocPrintSentinel(alloc, "{d} {s} • {d} {s}", .{
-            counts.splits,
-            if (counts.splits == 1) "split" else "splits",
-            counts.sessions,
-            if (counts.sessions == 1) "session" else "sessions",
-        }, 0);
+        return summary;
     }
 
     /// Returns true if this window needs confirmation before quitting.
@@ -2609,24 +2301,6 @@ pub const Window = extern struct {
 
         priv.workspace_page_bindings.setSource(null);
         priv.context_menu_page = null;
-        if (priv.context_menu_popover) |popover| {
-            popover.popdown();
-            popover.as(gtk.Widget).unparent();
-            priv.context_menu_popover = null;
-        }
-        if (priv.workspace_empty_context_popover) |popover| {
-            popover.popdown();
-            popover.as(gtk.Widget).unparent();
-            priv.workspace_empty_context_popover = null;
-        }
-        priv.pending_context_menu_row = null;
-        priv.pending_context_menu_rect = null;
-        if (priv.pending_context_workspace_page) |page| {
-            page.unref();
-            priv.pending_context_workspace_page = null;
-        }
-        priv.pending_context_workspace_action = null;
-        priv.pending_workspace_empty_restore = false;
         if (priv.pending_surface_focus_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_surface_focus_source = null;
@@ -2936,7 +2610,7 @@ pub const Window = extern struct {
         // Setup our binding group. This ensures things like the title
         // are synced from the active workspace page.
         priv.workspace_page_bindings.setSource(child.as(gobject.Object));
-        self.syncWorkspaceListSelection();
+        self.syncWorkspaceSidebarSelection();
 
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
@@ -3881,6 +3555,7 @@ pub const Window = extern struct {
             gobject.ext.ensureType(DebugWarning);
             gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
+            gobject.ext.ensureType(WorkspaceSidebar);
             gobject.ext.ensureType(WorkspacePage);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
@@ -3913,12 +3588,10 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("toast_overlay", .{});
             class.bindTemplateChildPrivate("workspace_split_view", .{});
             class.bindTemplateChildPrivate("workspace_sidebar", .{});
-            class.bindTemplateChildPrivate("workspace_list", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
             class.bindTemplateCallback("new_tab", &btnNewTab);
-            class.bindTemplateCallback("new_workspace", &btnNewWorkspace);
             class.bindTemplateCallback("toggle_sidebar", &btnToggleSidebar);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
@@ -3930,7 +3603,6 @@ pub const Window = extern struct {
             class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
             class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
             class.bindTemplateCallback("notify_selected_page", &tabViewSelectedPage);
-            class.bindTemplateCallback("workspace_row_selected", &workspaceListRowSelected);
             class.bindTemplateCallback("notify_config", &propConfig);
             class.bindTemplateCallback("notify_fullscreened", &propFullscreened);
             class.bindTemplateCallback("notify_is_active", &propIsActive);
@@ -4351,7 +4023,6 @@ pub fn workspaceControlRestoreAlloc(
     const finalized = try workspace_restore.finalizeAlloc(alloc, plan, outcomes);
     defer finalized.deinit(alloc);
 
-    try runtimeRegistrySelectionFromRestore(self, runtime, finalized.selection);
     selectWorkspaceControlPage(self, workspace_page);
     self.refreshWorkspaceRegistrySafe();
 
@@ -4528,7 +4199,7 @@ fn buildWorkspaceRestoreLeafTreeAlloc(
     }
 
     if (selected_surface) |surface| {
-        _ = split_tabs.selectSurface(surface);
+        _ = split_tabs.selectSurfaceWithoutFocus(surface);
     }
 
     return SplitTabs.Tree.init(alloc, split_tabs);
@@ -4672,39 +4343,6 @@ fn bindRestoredSessionIdentityAlloc(
         @intFromPtr(surface),
         session_path,
     );
-}
-
-fn runtimeRegistrySelectionFromRestore(
-    self: *Window,
-    runtime: *workspace_registry.WorkspaceRuntime,
-    selection: workspace_restore.SelectionResolution,
-) !void {
-    if (runtime.sessions.items.len == 0) return;
-
-    const selected_route = selected_route: {
-        if (selection.session_id) |selected_session_id| {
-            if (workspace_registry.routeForSession(runtime, selected_session_id)) |route| {
-                break :selected_route route;
-            }
-        }
-        if (workspace_registry.selectedSessionRoute(runtime)) |route| {
-            break :selected_route route;
-        }
-        const first_session = runtime.sessions.items[0];
-        break :selected_route workspace_registry.SessionRoute{
-            .window_id = first_session.window_id,
-            .split_id = first_session.split_id,
-            .tab_id = first_session.tab_id,
-            .session_id = first_session.session_id,
-        };
-    };
-
-    try self.getWorkspaceRegistry().updateSelection(runtime.workspace.workspace_id, .{
-        .selected_window_id = selected_route.window_id,
-        .selected_split_id = selected_route.split_id,
-        .selected_tab_id = selected_route.tab_id,
-        .selected_session_id = selected_route.session_id,
-    });
 }
 
 fn cloneRestoreResultsAlloc(
@@ -5126,7 +4764,7 @@ fn testWorkspaceRuntime(
 test "workspace sidebar subtitle includes session counts when needed" {
     const testing = std.testing;
 
-    const subtitle = try Window.formatWorkspaceSidebarSubtitle(
+    const subtitle = try WorkspaceSidebar.formatSidebarSubtitle(
         testing.allocator,
         "~/code/ghostty",
         .{
@@ -5144,7 +4782,7 @@ test "workspace sidebar subtitle includes session counts when needed" {
 test "workspace sidebar subtitle stays plain for single-session workspaces" {
     const testing = std.testing;
 
-    const subtitle = try Window.formatWorkspaceSidebarSubtitle(
+    const subtitle = try WorkspaceSidebar.formatSidebarSubtitle(
         testing.allocator,
         "~/code/ghostty",
         .{
@@ -5165,7 +4803,7 @@ test "workspace sidebar tooltip summarizes selected runtime session" {
     var fixture = try testWorkspaceRuntime(testing.allocator);
     defer fixture.registry.deinit();
 
-    const tooltip = (try Window.formatWorkspaceSidebarTooltip(
+    const tooltip = (try WorkspaceSidebar.formatSidebarTooltip(
         testing.allocator,
         fixture.workspace,
     )).?;

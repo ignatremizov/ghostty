@@ -111,6 +111,7 @@ pub const SplitTabs = extern struct {
 
     const Private = struct {
         disposing: bool = false,
+        suppress_next_selection_focus: bool = false,
         pending_close: PendingClosePage = .{},
         pending_close_dialog: ?*CloseConfirmationDialog = null,
         context_menu_tab: ?*Tab = null,
@@ -380,6 +381,13 @@ pub const SplitTabs = extern struct {
         return true;
     }
 
+    pub fn selectSurfaceWithoutFocus(self: *Self, surface: *Surface) bool {
+        const page = self.getPageForSurface(surface) orelse return false;
+        self.private().suppress_next_selection_focus = true;
+        self.private().tab_view.setSelectedPage(page);
+        return true;
+    }
+
     pub fn promptActiveTabTitle(self: *Self) void {
         const page = self.private().tab_view.getSelectedPage() orelse return;
         const child = page.getChild();
@@ -405,7 +413,11 @@ pub const SplitTabs = extern struct {
         page.setNeedsAttention(@intFromBool(false));
         const surface = self.getPageSurface(page) orelse return;
         self.syncSplitAttention();
-        surface.grabFocus();
+        if (self.private().suppress_next_selection_focus) {
+            self.private().suppress_next_selection_focus = false;
+        } else {
+            surface.grabFocus();
+        }
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
@@ -643,7 +655,15 @@ pub const SplitTabs = extern struct {
             surface.setSplitAttention(false);
         }
         if (priv.context_menu_popover) |popover| {
-            popover.popdown();
+            _ = gobject.signalHandlersDisconnectMatched(
+                popover.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
             popover.as(gtk.Widget).unparent();
             priv.context_menu_popover = null;
         }

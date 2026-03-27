@@ -712,7 +712,7 @@ pub const Surface = extern struct {
 
         /// The current focus state of the terminal based on the
         /// focus events.
-        focused: bool = true,
+        focused: bool = false,
 
         /// Whether the GLArea widget is mapped. Some operations like grabbing
         /// focus only work if a widget is mapped.
@@ -2002,7 +2002,7 @@ pub const Surface = extern struct {
         priv.cursor_pos = .{ .x = 0, .y = 0 };
         priv.mouse_shape = .text;
         priv.mouse_hidden = false;
-        priv.focused = true;
+        priv.focused = false;
         priv.mapped = false;
         priv.size = .{ .width = 0, .height = 0 };
         priv.vadj_signal_group = null;
@@ -4040,6 +4040,10 @@ pub const Surface = extern struct {
 
         // Store it!
         priv.core_surface = surface;
+
+        surface.focusCallback(priv.focused) catch |err| {
+            log.warn("failed to apply initial focus state err={}", .{err});
+        };
 
         // Emit the signal that we initialized the surface.
         Surface.signals.init.impl.emit(

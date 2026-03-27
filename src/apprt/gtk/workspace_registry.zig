@@ -38,6 +38,11 @@ pub const WorkspaceRuntime = struct {
     pub fn resetRuntime(self: *WorkspaceRuntime) void {
         _ = self.runtime_arena.reset(.retain_capacity);
         self.workspace.layout_root_id = null;
+        self.workspace.selected_window_id = null;
+        self.workspace.selected_split_id = null;
+        self.workspace.selected_tab_id = null;
+        self.workspace.selected_session_id = null;
+        self.workspace.attention_summary = .{};
         self.workspace.split_ids = &.{};
         self.workspace.session_ids = &.{};
         self.workspace.tab_ids = &.{};
