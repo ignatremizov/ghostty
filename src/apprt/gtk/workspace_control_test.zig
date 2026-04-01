@@ -8,15 +8,56 @@ const workspace_ids = @import("workspace_ids.zig");
 const workspace_snapshot = @import("workspace_snapshot.zig");
 const workspace_storage = @import("workspace_storage.zig");
 
+const snapshot_split_children = [_][]const u8{"tab-root-1"};
+const snapshot_tab_children = [_][]const u8{"leaf-1"};
+const snapshot_argv = [_][]const u8{"sh"};
+const snapshot_splits = [_]workspace_snapshot.SplitRecord{.{
+    .split_id = workspace_ids.SplitId.init(1),
+    .window_id = workspace_ids.WindowId.init(1),
+    .ordinal = 0,
+    .root_layout_node_id = "split-root-1",
+}};
+const snapshot_tabs = [_]workspace_snapshot.TabRecord{.{
+    .tab_id = workspace_ids.TabId.init(1),
+    .ordinal = 0,
+    .title_override = "shell",
+}};
+const snapshot_layout = [_]workspace_snapshot.LayoutNodeRecord{
+    .{
+        .layout_node_id = "split-root-1",
+        .tab_id = workspace_ids.TabId.init(1),
+        .node_type = .split_root,
+        .child_ids = snapshot_split_children[0..],
+    },
+    .{
+        .layout_node_id = "tab-root-1",
+        .tab_id = workspace_ids.TabId.init(1),
+        .node_type = .tab_root,
+        .child_ids = snapshot_tab_children[0..],
+    },
+    .{
+        .layout_node_id = "leaf-1",
+        .tab_id = workspace_ids.TabId.init(1),
+        .node_type = .session_leaf,
+        .session_id = workspace_ids.SessionId.init(1),
+    },
+};
+const snapshot_sessions = [_]workspace_snapshot.SessionRecord{.{
+    .session_id = workspace_ids.SessionId.init(1),
+    .tab_id = workspace_ids.TabId.init(1),
+    .cwd = "/tmp",
+    .command = .{ .argv = snapshot_argv[0..] },
+    .title_override = "shell",
+    .focus_preferred = true,
+}};
+
 fn stringVariant(value: []const u8) *glib.Variant {
-    return glib.ext.Variant.newFrom(value);
+    const value_z = std.heap.c_allocator.dupeZ(u8, value) catch @panic("oom");
+    defer std.heap.c_allocator.free(value_z);
+    return glib.Variant.newString(value_z);
 }
 
 fn buildSnapshot() workspace_snapshot.Snapshot {
-    const split_children = [_][]const u8{"tab-root-1"};
-    const tab_children = [_][]const u8{"leaf-1"};
-    const argv = [_][]const u8{"sh"};
-
     return .{
         .snapshot_id = workspace_ids.SnapshotId.init(1),
         .saved_at = "2026-03-25T12:00:00Z",
@@ -30,45 +71,10 @@ fn buildSnapshot() workspace_snapshot.Snapshot {
             .selected_tab_id = workspace_ids.TabId.init(1),
             .selected_session_id = workspace_ids.SessionId.init(1),
         },
-        .splits = &.{.{
-            .split_id = workspace_ids.SplitId.init(1),
-            .window_id = workspace_ids.WindowId.init(1),
-            .ordinal = 0,
-            .root_layout_node_id = "split-root-1",
-        }},
-        .tabs = &.{.{
-            .tab_id = workspace_ids.TabId.init(1),
-            .ordinal = 0,
-            .title_override = "shell",
-        }},
-        .layout = &.{
-            .{
-                .layout_node_id = "split-root-1",
-                .tab_id = workspace_ids.TabId.init(1),
-                .node_type = .split_root,
-                .child_ids = split_children[0..],
-            },
-            .{
-                .layout_node_id = "tab-root-1",
-                .tab_id = workspace_ids.TabId.init(1),
-                .node_type = .tab_root,
-                .child_ids = tab_children[0..],
-            },
-            .{
-                .layout_node_id = "leaf-1",
-                .tab_id = workspace_ids.TabId.init(1),
-                .node_type = .session_leaf,
-                .session_id = workspace_ids.SessionId.init(1),
-            },
-        },
-        .sessions = &.{.{
-            .session_id = workspace_ids.SessionId.init(1),
-            .tab_id = workspace_ids.TabId.init(1),
-            .cwd = "/tmp",
-            .command = .{ .argv = argv[0..] },
-            .title_override = "shell",
-            .focus_preferred = true,
-        }},
+        .splits = snapshot_splits[0..],
+        .tabs = snapshot_tabs[0..],
+        .layout = snapshot_layout[0..],
+        .sessions = snapshot_sessions[0..],
     };
 }
 
@@ -156,7 +162,7 @@ test "ipc workspace control validates session split params before dispatch" {
     defer testing.allocator.free(invalid_direction.response_json);
 
     try testing.expectEqual(workspace_control.Method.session_split, invalid_direction.metadata.method.?);
-    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, invalid_direction.metadata.focus_behavior);
+    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, invalid_direction.metadata.focus_behavior);
     try testing.expect(std.mem.indexOf(u8, invalid_direction.response_json, "\"code\":\"invalid_params\"") != null);
 }
 
@@ -176,19 +182,21 @@ test "ipc workspace control action parameter decodes variant strings" {
     const request = try workspace_control.encodeRequestAlloc(
         testing.allocator,
         null,
-        .session_list,
-        "{\"workspace\":\"workspace:1\"}",
+        .workspace_list,
+        "{}",
     );
     defer testing.allocator.free(request);
 
     const variant = stringVariant(request);
     defer variant.unref();
 
+    const expected = try workspace_control.dispatchAlloc(testing.allocator, request);
+    defer testing.allocator.free(expected.response_json);
+
     const result = try workspace_control.dispatchActionParameterAlloc(testing.allocator, variant);
     defer testing.allocator.free(result.response_json);
 
-    try testing.expectEqual(workspace_control.Method.session_list, result.metadata.method.?);
-    try testing.expect(std.mem.indexOf(u8, result.response_json, "\"sessions\":[]") != null);
+    try testing.expectEqualStrings(expected.response_json, result.response_json);
 }
 
 test "ipc workspace control restore reports not found for unknown target" {
@@ -217,6 +225,57 @@ test "ipc workspace control save reports not ready without a window" {
     try testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_ready\"") != null);
 }
 
+test "ipc workspace control required V1 methods report contract error codes" {
+    const testing = std.testing;
+
+    const cases = [_]struct {
+        request_json: []const u8,
+        expected_method: workspace_control.Method,
+        expected_focus: workspace_control.FocusBehavior,
+        expected_code: []const u8,
+    }{
+        .{
+            .request_json = "{\"id\":\"req-v1-list\",\"method\":\"session.list\",\"params\":{\"workspace\":\"missing-workspace\"}}",
+            .expected_method = .session_list,
+            .expected_focus = .no_focus_change,
+            .expected_code = "\"code\":\"not_found\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-v1-open\",\"method\":\"workspace.open\",\"params\":{\"workspace\":\"work\"}}",
+            .expected_method = .workspace_open,
+            .expected_focus = .may_change_focus,
+            .expected_code = "\"code\":\"not_ready\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-v1-focus\",\"method\":\"session.focus\",\"params\":{\"session\":\"session:1\"}}",
+            .expected_method = .session_focus,
+            .expected_focus = .may_change_focus,
+            .expected_code = "\"code\":\"not_ready\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-v1-split\",\"method\":\"session.split\",\"params\":{\"session\":\"session:1\",\"direction\":\"right\"}}",
+            .expected_method = .session_split,
+            .expected_focus = .may_change_focus,
+            .expected_code = "\"code\":\"not_ready\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-v1-close\",\"method\":\"session.close\",\"params\":{\"session\":\"session:1\"}}",
+            .expected_method = .session_close,
+            .expected_focus = .may_change_focus,
+            .expected_code = "\"code\":\"not_ready\"",
+        },
+    };
+
+    for (cases) |case| {
+        const result = try workspace_control.dispatchAlloc(testing.allocator, case.request_json);
+        defer testing.allocator.free(result.response_json);
+
+        try testing.expectEqual(case.expected_method, result.metadata.method.?);
+        try testing.expectEqual(case.expected_focus, result.metadata.focus_behavior);
+        try testing.expect(std.mem.indexOf(u8, result.response_json, case.expected_code) != null);
+    }
+}
+
 test "ipc workspace control restore validates stored snapshots before replay" {
     const testing = std.testing;
 
@@ -242,9 +301,39 @@ test "ipc workspace control restore validates stored snapshots before replay" {
             defer std.testing.allocator.free(result.response_json);
 
             try std.testing.expectEqual(workspace_control.Method.workspace_restore, result.metadata.method.?);
-            try std.testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_supported\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_ready\"") != null);
         }
     }.run);
+}
+
+test "ipc workspace control request envelope preserves ids across error responses" {
+    const testing = std.testing;
+
+    const cases = [_]struct {
+        request_json: []const u8,
+        expected_code: []const u8,
+    }{
+        .{
+            .request_json = "{\"id\":\"req-e1\",\"method\":\"workspace.list\",\"params\":[]}",
+            .expected_code = "\"code\":\"invalid_params\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-e2\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":1}}",
+            .expected_code = "\"code\":\"invalid_params\"",
+        },
+        .{
+            .request_json = "{\"id\":\"req-e3\",\"method\":\"session.split\",\"params\":{\"session\":\"session:1\",\"direction\":\"sideways\"}}",
+            .expected_code = "\"code\":\"invalid_params\"",
+        },
+    };
+
+    for (cases) |case| {
+        const result = try workspace_control.dispatchAlloc(testing.allocator, case.request_json);
+        defer testing.allocator.free(result.response_json);
+
+        try testing.expect(std.mem.indexOf(u8, result.response_json, case.expected_code) != null);
+        try testing.expect(std.mem.indexOf(u8, result.response_json, "\"id\":\"req-e") != null);
+    }
 }
 
 test "ipc workspace control restore rejects invalid stored snapshots" {

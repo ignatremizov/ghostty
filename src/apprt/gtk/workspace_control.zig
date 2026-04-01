@@ -252,7 +252,7 @@ pub fn dispatchActionParameterAlloc(
 }
 
 pub fn initialStateVariant() *glib.Variant {
-    return glib.ext.Variant.newFrom(initial_response_json);
+    return encodeActionState(initial_response_json) catch unreachable;
 }
 
 pub fn createAction() *gio.SimpleAction {
@@ -287,7 +287,9 @@ pub fn unregisterAction(map: *gio.ActionMap) void {
 
 pub fn encodeActionState(response_json: []const u8) !*glib.Variant {
     try expectJsonObject(response_json);
-    return glib.ext.Variant.newFrom(response_json);
+    const value_z = try std.heap.c_allocator.dupeZ(u8, response_json);
+    defer std.heap.c_allocator.free(value_z);
+    return glib.Variant.newString(value_z);
 }
 
 pub fn decodeActionStateAlloc(
@@ -1002,13 +1004,15 @@ fn loadWorkspaceSnapshotForControlAlloc(
     target: []const u8,
 ) !LoadedWorkspaceSnapshot {
     var catalog = try readWorkspaceCatalogAlloc(alloc);
-    errdefer catalog.deinit(alloc);
+    defer catalog.deinit(alloc);
 
     const match = findCatalogEntryForControlTarget(catalog.entries, target);
     if (match) |entry| {
+        const catalog_entry = try entry.cloneAlloc(alloc);
+        errdefer catalog_entry.deinit(alloc);
         const snapshot_value = try readWorkspaceSnapshotAlloc(alloc, entry.path);
         return .{
-            .catalog = try entry.cloneAlloc(alloc),
+            .catalog = catalog_entry,
             .snapshot = snapshot_value,
         };
     }

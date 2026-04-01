@@ -2051,6 +2051,12 @@ pub const Surface = extern struct {
             priv.idle_focus_source = null;
         }
 
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("surface", null);
+            group.unref();
+            priv.action_group = null;
+        }
+
         // This works around a GTK double-free bug where if you bind
         // to a top-level template child, it frees twice if the widget is
         // also the root child of the template. By unsetting the child here,
