@@ -237,6 +237,7 @@ pub const WorkspacePage = extern struct {
     const Private = struct {
         /// The configuration that this surface is using.
         config: ?*Config = null,
+        action_group: ?*gio.SimpleActionGroup = null,
 
         /// The title of this workspace page. This is usually bound to the active surface.
         title: ?[:0]const u8 = null,
@@ -362,7 +363,7 @@ pub const WorkspacePage = extern struct {
             .init("prompt-tab-title", actionPromptWorkspaceTitle, null),
         };
 
-        _ = ext.actions.addAsGroup(Self, self, "workspace", &actions);
+        self.private().action_group = ext.actions.addAsGroup(Self, self, "workspace", &actions);
     }
 
     //---------------------------------------------------------------
@@ -564,6 +565,11 @@ pub const WorkspacePage = extern struct {
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
+        }
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("workspace", null);
+            group.unref();
+            priv.action_group = null;
         }
 
         gtk.Widget.disposeTemplate(

@@ -968,11 +968,30 @@ pub const Catalog = struct {
     }
 
     pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !Catalog {
-        const parsed = try std.json.parseFromSliceLeaky(Catalog, alloc, data, .{
+        const parsed = try std.json.parseFromSlice(Catalog, alloc, data, .{
             .allocate = .alloc_always,
         });
-        if (parsed.version != current_version) return error.InvalidSnapshotVersion;
-        return parsed;
+        defer parsed.deinit();
+        if (parsed.value.version != current_version) {
+            return error.InvalidSnapshotVersion;
+        }
+
+        const entries = try alloc.alloc(CatalogEntry, parsed.value.entries.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+
+        for (parsed.value.entries, 0..) |entry, i| {
+            entries[i] = try entry.cloneAlloc(alloc);
+            initialized += 1;
+        }
+
+        return .{
+            .version = parsed.value.version,
+            .entries = entries,
+        };
     }
 
     pub fn deinit(self: Catalog, alloc: std.mem.Allocator) void {

@@ -98,6 +98,7 @@ pub const Tab = extern struct {
         title: ?[:0]const u8 = null,
         tooltip: ?[:0]const u8 = null,
         title_override: ?[:0]const u8 = null,
+        action_group: ?*gio.SimpleActionGroup = null,
 
         surface_scrolled_window: *SurfaceScrolledWindow,
 
@@ -121,7 +122,7 @@ pub const Tab = extern struct {
             .init("ring-bell", actionRingBell, null),
         };
 
-        _ = ext.actions.addAsGroup(Self, self, "tab", &actions);
+        self.private().action_group = ext.actions.addAsGroup(Self, self, "tab", &actions);
     }
 
     pub fn getSurface(self: *Self) ?*Surface {
@@ -273,6 +274,12 @@ pub const Tab = extern struct {
     }
 
     fn dispose(self: *Self) callconv(.c) void {
+        const priv = self.private();
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("tab", null);
+            group.unref();
+            priv.action_group = null;
+        }
         gtk.Widget.disposeTemplate(self.as(gtk.Widget), getGObjectType());
         gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
     }

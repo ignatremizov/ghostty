@@ -175,6 +175,7 @@ pub const SplitTree = extern struct {
     const Private = struct {
         /// The tree datastructure containing all of our surface views.
         tree: ?*SplitTabs.Tree,
+        action_group: ?*gio.SimpleActionGroup = null,
 
         // Template bindings
         tree_bin: *adw.Bin,
@@ -231,7 +232,7 @@ pub const SplitTree = extern struct {
             .init("close-split", actionCloseSplit, null),
         };
 
-        _ = ext.actions.addAsGroup(Self, self, "split-tree", &actions);
+        self.private().action_group = ext.actions.addAsGroup(Self, self, "split-tree", &actions);
     }
 
     fn bindSurfaceSplitState(self: *Self, surface: *Surface) void {
@@ -549,6 +550,19 @@ pub const SplitTree = extern struct {
         }
     }
 
+    fn clearSurfaceBindings(self: *Self) void {
+        const tree = self.getTree() orelse return;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                surface.setSplitBinding(null);
+            }
+        }
+    }
+
     fn connectSurfaceHandler(self: *Self, surface: *Surface) void {
         self.disconnectSurfaceHandler(surface);
         _ = Surface.signals.@"close-request".connect(
@@ -782,9 +796,17 @@ pub const SplitTree = extern struct {
             _ = glib.Source.remove(source);
             priv.empty_leaf_cleanup_source = null;
         }
+        self.disconnectLeafHandlers();
+        self.disconnectSurfaceHandlers();
+        self.clearSurfaceBindings();
         if (priv.tree) |tree| {
             ext.boxedFree(SplitTabs.Tree, tree);
             priv.tree = null;
+        }
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("split-tree", null);
+            group.unref();
+            priv.action_group = null;
         }
 
         gtk.Widget.disposeTemplate(

@@ -1966,9 +1966,16 @@ pub const Window = extern struct {
         if (runtime.workspace.snapshot_ref == null) return;
 
         const alloc = Application.default().allocator();
-        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| {
-            log.warn("failed to autosave workspace error={}", .{err});
-            return;
+        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| switch (err) {
+            // During shutdown or structural page teardown, a saved workspace
+            // can temporarily lose its selected tab/surface before the widget
+            // graph is fully dismantled. Explicit save should still fail on
+            // this, but autosave can safely skip the transient state.
+            error.SelectionRequired => return,
+            else => {
+                log.warn("failed to autosave workspace error={}", .{err});
+                return;
+            },
         };
         result.deinit(alloc);
     }
@@ -3511,6 +3518,7 @@ pub const Window = extern struct {
     }
 
     pub fn restoreSavedWorkspace(self: *Window, target: []const u8) void {
+        self.refreshWorkspaceRegistrySafe();
         const alloc = Application.default().allocator();
         var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
             log.warn("failed to read restore workspace catalog error={}", .{err});

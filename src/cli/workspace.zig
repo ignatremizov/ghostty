@@ -558,3 +558,106 @@ test "workspace cli targetForClass maps class to ipc target" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "workspace cli encodes required V1 request envelopes" {
+    const testing = std.testing;
+
+    const cases = [_]struct {
+        method: gtk_workspace_control.Method,
+        params: []const u8,
+        expected_method: []const u8,
+        expected_params_fragment: []const u8,
+    }{
+        .{
+            .method = .workspace_list,
+            .params = "{}",
+            .expected_method = "\"method\":\"workspace.list\"",
+            .expected_params_fragment = "\"params\":{}",
+        },
+        .{
+            .method = .workspace_open,
+            .params = "{\"workspace\":\"work\",\"create\":true}",
+            .expected_method = "\"method\":\"workspace.open\"",
+            .expected_params_fragment = "\"params\":{\"workspace\":\"work\",\"create\":true}",
+        },
+        .{
+            .method = .workspace_save,
+            .params = "{\"workspace\":\"work\"}",
+            .expected_method = "\"method\":\"workspace.save\"",
+            .expected_params_fragment = "\"params\":{\"workspace\":\"work\"}",
+        },
+        .{
+            .method = .workspace_restore,
+            .params = "{\"workspace\":\"work\"}",
+            .expected_method = "\"method\":\"workspace.restore\"",
+            .expected_params_fragment = "\"params\":{\"workspace\":\"work\"}",
+        },
+        .{
+            .method = .session_list,
+            .params = "{\"workspace\":\"work\"}",
+            .expected_method = "\"method\":\"session.list\"",
+            .expected_params_fragment = "\"params\":{\"workspace\":\"work\"}",
+        },
+        .{
+            .method = .session_focus,
+            .params = "{\"session\":\"session:1\"}",
+            .expected_method = "\"method\":\"session.focus\"",
+            .expected_params_fragment = "\"params\":{\"session\":\"session:1\"}",
+        },
+        .{
+            .method = .session_split,
+            .params = "{\"session\":\"session:1\",\"direction\":\"right\",\"cwd\":\"/tmp\",\"command\":\"zsh\"}",
+            .expected_method = "\"method\":\"session.split\"",
+            .expected_params_fragment = "\"params\":{\"session\":\"session:1\",\"direction\":\"right\",\"cwd\":\"/tmp\",\"command\":\"zsh\"}",
+        },
+        .{
+            .method = .session_close,
+            .params = "{\"session\":\"session:1\"}",
+            .expected_method = "\"method\":\"session.close\"",
+            .expected_params_fragment = "\"params\":{\"session\":\"session:1\"}",
+        },
+    };
+
+    for (cases) |case| {
+        const request = try gtk_workspace_control.encodeRequestAlloc(
+            testing.allocator,
+            "cli-contract",
+            case.method,
+            case.params,
+        );
+        defer testing.allocator.free(request);
+
+        try testing.expect(std.mem.indexOf(u8, request, "\"id\":\"cli-contract\"") != null);
+        try testing.expect(std.mem.indexOf(u8, request, case.expected_method) != null);
+        try testing.expect(std.mem.indexOf(u8, request, case.expected_params_fragment) != null);
+    }
+}
+
+test "workspace cli printResponse returns exit code for success and error payloads" {
+    const testing = std.testing;
+
+    var stdout_stream: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout_stream.deinit();
+    var stderr_stream: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stderr_stream.deinit();
+
+    try testing.expectEqual(
+        @as(u8, 0),
+        try printResponse(
+            &stderr_stream.writer,
+            &stdout_stream.writer,
+            "{\"ok\":true,\"result\":{}}",
+        ),
+    );
+
+    stdout_stream.clearRetainingCapacity();
+    stderr_stream.clearRetainingCapacity();
+    try testing.expectEqual(
+        @as(u8, 1),
+        try printResponse(
+            &stderr_stream.writer,
+            &stdout_stream.writer,
+            "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"x\"}}",
+        ),
+    );
+}
