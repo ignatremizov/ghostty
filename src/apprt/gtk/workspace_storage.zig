@@ -119,6 +119,30 @@ pub const Storage = struct {
         };
     }
 
+    pub fn pruneCheckpointPath(self: Storage, checkpoint_path: []const u8) !void {
+        var catalog = self.readCatalogAlloc(self.allocator, catalog_filename) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer catalog.deinit(self.allocator);
+
+        const update = try buildCatalogWithoutCheckpointPath(self.allocator, catalog, checkpoint_path);
+        defer {
+            update.catalog.deinit(self.allocator);
+            if (update.replaced_path) |path| self.allocator.free(path);
+        }
+
+        if (update.replaced_path == null) return;
+
+        try self.writeCatalog(update.catalog, catalog_filename);
+
+        const removed_path = update.replaced_path.?;
+        self.dir.deleteFile(removed_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
     pub fn writeCatalog(self: Storage, value: snapshot.Catalog, filename: []const u8) !void {
         const data = try value.encodeAlloc(self.allocator);
         defer self.allocator.free(data);
@@ -259,6 +283,56 @@ fn buildCatalogWithoutCheckpoint(
             removed_path = try alloc.dupe(u8, entry.path);
             continue;
         }
+        entries[write_index] = try entry.cloneAlloc(alloc);
+        initialized += 1;
+        write_index += 1;
+    }
+
+    return .{
+        .catalog = .{
+            .version = catalog.version,
+            .entries = entries,
+        },
+        .replaced_path = removed_path,
+    };
+}
+
+fn buildCatalogWithoutCheckpointPath(
+    alloc: std.mem.Allocator,
+    catalog: snapshot.Catalog,
+    checkpoint_path: []const u8,
+) !CatalogUpdate {
+    var removed_index: ?usize = null;
+    for (catalog.entries, 0..) |entry, index| {
+        if (!std.mem.eql(u8, entry.path, checkpoint_path)) continue;
+        removed_index = index;
+        break;
+    }
+
+    const entry_count = if (removed_index == null)
+        catalog.entries.len
+    else
+        catalog.entries.len - 1;
+    const empty_entries = [_]snapshot.CatalogEntry{};
+    var entries: []snapshot.CatalogEntry = if (entry_count == 0)
+        empty_entries[0..]
+    else
+        try alloc.alloc(snapshot.CatalogEntry, entry_count);
+    var initialized: usize = 0;
+    var removed_path: ?[]u8 = null;
+    errdefer if (removed_path) |old_path| alloc.free(old_path);
+    errdefer {
+        for (entries[0..initialized]) |entry| entry.deinit(alloc);
+        if (entry_count > 0) alloc.free(entries);
+    }
+
+    var write_index: usize = 0;
+    for (catalog.entries, 0..) |entry, index| {
+        if (removed_index != null and index == removed_index.?) {
+            removed_path = try alloc.dupe(u8, entry.path);
+            continue;
+        }
+
         entries[write_index] = try entry.cloneAlloc(alloc);
         initialized += 1;
         write_index += 1;

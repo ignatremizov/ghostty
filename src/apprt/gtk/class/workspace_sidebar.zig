@@ -16,6 +16,7 @@ const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const WorkspaceContextAction = enum {
     rename,
     save,
+    delete_saved,
     open_file,
     reveal,
     close,
@@ -70,6 +71,12 @@ pub const WorkspaceSidebar = extern struct {
             const impl = gobject.ext.defineSignal(name, Self, &.{*WorkspacePage}, void);
         };
 
+        pub const @"delete-workspace" = struct {
+            pub const name = "delete-workspace";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(name, Self, &.{*WorkspacePage}, void);
+        };
+
         pub const @"close-workspace" = struct {
             pub const name = "close-workspace";
             pub const connect = impl.connect;
@@ -90,7 +97,10 @@ pub const WorkspaceSidebar = extern struct {
         context_workspace_page: ?*WorkspacePage = null,
         pending_context_workspace_page: ?*WorkspacePage = null,
         pending_context_workspace_action: ?WorkspaceContextAction = null,
+        pending_context_action_ctx: ?*IdleWorkspaceActionContext = null,
+        pending_context_action_source: ?c_uint = null,
         pending_workspace_empty_restore: bool = false,
+        pending_restore_source: ?c_uint = null,
 
         workspace_list: *gtk.ListBox,
 
@@ -355,6 +365,11 @@ pub const WorkspaceSidebar = extern struct {
         open_button.as(gtk.Widget).setHalign(.fill);
         _ = gtk.Button.signals.clicked.connect(open_button, *Self, workspaceRowOpenSnapshotClicked, self, .{});
 
+        const delete_button = gtk.Button.newWithLabel(i18n._("Delete Saved Workspace"));
+        delete_button.as(gtk.Widget).setHalign(.fill);
+        delete_button.as(gtk.Widget).addCssClass("destructive-action");
+        _ = gtk.Button.signals.clicked.connect(delete_button, *Self, workspaceRowDeleteClicked, self, .{});
+
         const close_button = gtk.Button.newWithLabel(i18n._("Close Workspace"));
         close_button.as(gtk.Widget).setHalign(.fill);
         close_button.as(gtk.Widget).addCssClass("destructive-action");
@@ -364,6 +379,7 @@ pub const WorkspaceSidebar = extern struct {
         content.append(save_button.as(gtk.Widget));
         content.append(reveal_button.as(gtk.Widget));
         content.append(open_button.as(gtk.Widget));
+        content.append(delete_button.as(gtk.Widget));
         content.append(close_button.as(gtk.Widget));
 
         const popover = gtk.Popover.new();
@@ -420,6 +436,9 @@ pub const WorkspaceSidebar = extern struct {
     fn workspaceRowOpenSnapshotClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
         self.queueContextAction(button, .open_file);
     }
+    fn workspaceRowDeleteClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        self.queueContextAction(button, .delete_saved);
+    }
     fn workspaceRowCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
         self.queueContextAction(button, .close);
     }
@@ -443,7 +462,9 @@ pub const WorkspaceSidebar = extern struct {
         const priv = self.private();
         if (priv.pending_context_workspace_page) |workspace_page| {
             const action = priv.pending_context_workspace_action orelse .rename;
-            _ = glib.idleAdd(idleEmitPendingWorkspaceAction, IdleWorkspaceActionContext.new(self.ref(), workspace_page, action));
+            const ctx = IdleWorkspaceActionContext.new(self.ref(), workspace_page, action);
+            priv.pending_context_action_ctx = ctx;
+            priv.pending_context_action_source = glib.idleAdd(idleEmitPendingWorkspaceAction, ctx);
             priv.pending_context_workspace_page = null;
             priv.pending_context_workspace_action = null;
         }
@@ -453,7 +474,7 @@ pub const WorkspaceSidebar = extern struct {
         const priv = self.private();
         if (!priv.pending_workspace_empty_restore) return;
         priv.pending_workspace_empty_restore = false;
-        _ = glib.idleAdd(idleEmitRestoreWorkspace, self.ref());
+        priv.pending_restore_source = glib.idleAdd(idleEmitRestoreWorkspace, self.ref());
     }
 
     fn workspaceListRowSelected(_: *gtk.ListBox, row_: ?*gtk.ListBoxRow, self: *Self) callconv(.c) void {
@@ -489,9 +510,15 @@ pub const WorkspaceSidebar = extern struct {
     fn idleEmitPendingWorkspaceAction(ud: ?*anyopaque) callconv(.c) c_int {
         const ctx: *IdleWorkspaceActionContext = @ptrCast(@alignCast(ud orelse return 0));
         defer ctx.deinit();
+        const priv = ctx.sidebar.private();
+        if (priv.pending_context_action_ctx == ctx) {
+            priv.pending_context_action_ctx = null;
+            priv.pending_context_action_source = null;
+        }
         switch (ctx.action) {
             .rename => signals.@"prompt-workspace-title".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .save => signals.@"save-workspace".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
+            .delete_saved => signals.@"delete-workspace".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .open_file => signals.@"open-workspace-snapshot".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .reveal => signals.@"reveal-workspace-snapshot".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .close => signals.@"close-workspace".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
@@ -502,6 +529,7 @@ pub const WorkspaceSidebar = extern struct {
     fn idleEmitRestoreWorkspace(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
         defer self.unref();
+        self.private().pending_restore_source = null;
         signals.@"restore-workspace".impl.emit(self, null, .{}, null);
         return 0;
     }
@@ -509,6 +537,19 @@ pub const WorkspaceSidebar = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.disposing = true;
+        if (priv.pending_context_action_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_context_action_source = null;
+        }
+        if (priv.pending_context_action_ctx) |ctx| {
+            priv.pending_context_action_ctx = null;
+            ctx.deinit();
+        }
+        if (priv.pending_restore_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_restore_source = null;
+            self.unref();
+        }
         priv.context_workspace_page = null;
         if (priv.context_menu_popover) |popover| {
             _ = gobject.signalHandlersDisconnectMatched(
@@ -584,6 +625,7 @@ pub const WorkspaceSidebar = extern struct {
             signals.@"new-workspace".impl.register(.{});
             signals.@"prompt-workspace-title".impl.register(.{});
             signals.@"save-workspace".impl.register(.{});
+            signals.@"delete-workspace".impl.register(.{});
             signals.@"reveal-workspace-snapshot".impl.register(.{});
             signals.@"open-workspace-snapshot".impl.register(.{});
             signals.@"close-workspace".impl.register(.{});
