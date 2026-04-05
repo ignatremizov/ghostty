@@ -403,6 +403,13 @@ pub const Window = extern struct {
             self,
             .{},
         );
+        _ = WorkspaceSidebar.signals.@"delete-workspace".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarDeleteWorkspace,
+            self,
+            .{},
+        );
         _ = WorkspaceSidebar.signals.@"close-workspace".connect(
             priv.workspace_sidebar,
             *Self,
@@ -862,6 +869,10 @@ pub const Window = extern struct {
 
     fn workspaceSidebarOpenWorkspaceSnapshot(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
         _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page.ref());
+    }
+
+    fn workspaceSidebarDeleteWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
+        _ = glib.idleAdd(idleDeleteWorkspaceSnapshot, workspace_page.ref());
     }
 
     fn workspaceSidebarCloseWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
@@ -2044,9 +2055,9 @@ pub const Window = extern struct {
             var fallback_title_allocated = false;
             const title: [:0]const u8 = workspace_page.getSidebarTitle() orelse
                 workspace_page.getTitleOverride() orelse title: {
-                    fallback_title_allocated = true;
-                    break :title alloc.dupeZ(u8, runtime.workspace.name) catch "Workspace";
-                };
+                fallback_title_allocated = true;
+                break :title alloc.dupeZ(u8, runtime.workspace.name) catch "Workspace";
+            };
             defer if (fallback_title_allocated) alloc.free(title);
 
             var fallback_subtitle_allocated = false;
@@ -3267,6 +3278,14 @@ pub const Window = extern struct {
         return 0;
     }
 
+    fn idleDeleteWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
+        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
+        defer workspace_page.unref();
+        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
+        window.deleteWorkspaceSnapshot(workspace_page);
+        return 0;
+    }
+
     fn idleShowRestoreWorkspaceCommands(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
         defer self.unref();
@@ -3471,6 +3490,50 @@ pub const Window = extern struct {
             self.addToast(i18n._("Failed to open workspace snapshot"));
             return;
         };
+    }
+
+    fn deleteWorkspaceSnapshot(self: *Self, workspace_page: *WorkspacePage) void {
+        self.refreshWorkspaceRegistrySafe();
+        const alloc = Application.default().allocator();
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return;
+        };
+        var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
+            log.warn("failed to read workspace catalog for delete error={}", .{err});
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return;
+        };
+        defer catalog.deinit(alloc);
+
+        const entry = findSavedWorkspaceCatalogEntryForRuntime(catalog.entries, runtime) orelse {
+            self.addToast(i18n._("This workspace has no saved snapshot to delete"));
+            return;
+        };
+
+        var dir = workspaceStorageDirCreateAlloc(alloc) catch |err| {
+            log.warn("failed to open workspace storage directory error={}", .{err});
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return;
+        };
+        defer dir.close();
+
+        const storage = workspace_storage.Storage.init(alloc, dir);
+        if (entry.workspace_key) |workspace_key| {
+            storage.pruneCheckpoint(workspace_key) catch |err| {
+                log.warn("failed to delete workspace checkpoint error={}", .{err});
+                self.addToast(i18n._("Failed to delete saved workspace"));
+                return;
+            };
+        } else storage.pruneCheckpointPath(entry.path) catch |err| {
+            log.warn("failed to delete workspace checkpoint error={}", .{err});
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return;
+        };
+
+        clearWorkspaceSnapshotRefAlloc(alloc, runtime);
+        self.refreshWorkspaceRegistrySafe();
+        self.addToast(i18n._("Saved workspace deleted"));
     }
 
     pub fn showRestoreWorkspaceCommands(self: *Window) void {
@@ -4699,6 +4762,17 @@ fn updateWorkspaceSnapshotRefAlloc(
     };
 }
 
+fn clearWorkspaceSnapshotRefAlloc(
+    alloc: std.mem.Allocator,
+    runtime: anytype,
+) void {
+    if (runtime.workspace.snapshot_ref) |*snapshot_ref| {
+        alloc.free(snapshot_ref.saved_at);
+        alloc.free(snapshot_ref.path);
+        runtime.workspace.snapshot_ref = null;
+    }
+}
+
 fn allocFreshWorkspaceKey(
     workspace_id: workspace_ids.WorkspaceId,
 ) ![]u8 {
@@ -4849,7 +4923,25 @@ fn findSavedWorkspaceCatalogEntry(
         if (std.mem.eql(u8, workspace_key, target)) return entry;
     }
 
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.workspace_name, target)) return entry;
+    }
+
     return null;
+}
+
+fn findSavedWorkspaceCatalogEntryForRuntime(
+    entries: []const workspace_snapshot.CatalogEntry,
+    runtime: *const workspace_registry.WorkspaceRuntime,
+) ?workspace_snapshot.CatalogEntry {
+    if (runtime.workspace.snapshot_ref) |snapshot_ref| {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.path, snapshot_ref.path)) return entry;
+        }
+    }
+
+    if (findSavedWorkspaceCatalogEntry(entries, runtime.workspace.slug)) |entry| return entry;
+    return findSavedWorkspaceCatalogEntry(entries, runtime.workspace.name);
 }
 
 pub fn resolveWorkspaceControlWorkspace(
