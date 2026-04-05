@@ -58,8 +58,6 @@ pub const Method = enum {
         return switch (self) {
             .workspace_open,
             .session_focus,
-            .session_split,
-            .session_close,
             => .may_change_focus,
             else => .no_focus_change,
         };
@@ -967,6 +965,10 @@ fn findCatalogEntryForControlTarget(
     for (entries) |entry| {
         const workspace_key = entry.workspace_key orelse continue;
         if (std.mem.eql(u8, workspace_key, target)) return entry;
+    }
+
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.workspace_name, target)) return entry;
     }
 
     return null;

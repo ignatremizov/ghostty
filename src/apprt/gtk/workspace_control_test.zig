@@ -162,7 +162,7 @@ test "ipc workspace control validates session split params before dispatch" {
     defer testing.allocator.free(invalid_direction.response_json);
 
     try testing.expectEqual(workspace_control.Method.session_split, invalid_direction.metadata.method.?);
-    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, invalid_direction.metadata.focus_behavior);
+    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, invalid_direction.metadata.focus_behavior);
     try testing.expect(std.mem.indexOf(u8, invalid_direction.response_json, "\"code\":\"invalid_params\"") != null);
 }
 
@@ -171,8 +171,8 @@ test "ipc workspace control marks mutating workspace actions as focus-changing" 
 
     try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.workspace_open.focusBehavior());
     try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.workspace_restore.focusBehavior());
-    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_split.focusBehavior());
-    try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_close.focusBehavior());
+    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.session_split.focusBehavior());
+    try testing.expectEqual(workspace_control.FocusBehavior.no_focus_change, workspace_control.Method.session_close.focusBehavior());
     try testing.expectEqual(workspace_control.FocusBehavior.may_change_focus, workspace_control.Method.session_focus.focusBehavior());
 }
 
@@ -255,13 +255,13 @@ test "ipc workspace control required V1 methods report contract error codes" {
         .{
             .request_json = "{\"id\":\"req-v1-split\",\"method\":\"session.split\",\"params\":{\"session\":\"session:1\",\"direction\":\"right\"}}",
             .expected_method = .session_split,
-            .expected_focus = .may_change_focus,
+            .expected_focus = .no_focus_change,
             .expected_code = "\"code\":\"not_ready\"",
         },
         .{
             .request_json = "{\"id\":\"req-v1-close\",\"method\":\"session.close\",\"params\":{\"session\":\"session:1\"}}",
             .expected_method = .session_close,
-            .expected_focus = .may_change_focus,
+            .expected_focus = .no_focus_change,
             .expected_code = "\"code\":\"not_ready\"",
         },
     };
@@ -297,6 +297,36 @@ test "ipc workspace control restore validates stored snapshots before replay" {
             const result = try workspace_control.dispatchAlloc(
                 std.testing.allocator,
                 "{\"id\":\"req-r1\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":\"workspace-key-1\"}}",
+            );
+            defer std.testing.allocator.free(result.response_json);
+
+            try std.testing.expectEqual(workspace_control.Method.workspace_restore, result.metadata.method.?);
+            try std.testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_ready\"") != null);
+        }
+    }.run);
+}
+
+test "ipc workspace control restore resolves saved snapshots by workspace name" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(state_home);
+
+    try tmp.dir.makePath("ghostty/workspaces");
+    var workspace_dir = try tmp.dir.openDir("ghostty/workspaces", .{});
+    defer workspace_dir.close();
+
+    const storage = workspace_storage.Storage.init(testing.allocator, workspace_dir);
+    const filename = try storage.writeCheckpoint(buildSnapshot());
+    defer testing.allocator.free(filename);
+
+    try withStateHome(testing.allocator, state_home, &struct {
+        fn run() !void {
+            const result = try workspace_control.dispatchAlloc(
+                std.testing.allocator,
+                "{\"id\":\"req-r1-name\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":\"Workspace 1\"}}",
             );
             defer std.testing.allocator.free(result.response_json);
 

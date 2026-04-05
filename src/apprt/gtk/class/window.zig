@@ -4053,7 +4053,7 @@ pub fn workspaceControlOpen(
     refreshWorkspaceControlRuntime(self);
 
     if (resolveWorkspaceControlWorkspace(self, target)) |resolved| {
-        selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+        selectWorkspaceControlPage(resolved.window, resolved.workspace_page, true);
         return .{
             .workspace_id = resolved.runtime.workspace.workspace_id,
             .name = resolved.runtime.workspace.name,
@@ -4071,7 +4071,7 @@ pub fn workspaceControlOpen(
     refreshWorkspaceControlRuntime(self);
 
     const resolved = resolveWorkspaceControlWorkspace(self, null) orelse return error.WorkspaceNotFound;
-    selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+    selectWorkspaceControlPage(resolved.window, resolved.workspace_page, true);
     return .{
         .workspace_id = resolved.runtime.workspace.workspace_id,
         .name = resolved.runtime.workspace.name,
@@ -4087,7 +4087,7 @@ pub fn workspaceControlFocusSession(
     refreshWorkspaceControlRuntime(self);
 
     const resolved = resolveWorkspaceControlSession(self, session_target) orelse return error.SessionNotFound;
-    selectWorkspaceControlPage(resolved.window, resolved.workspace_page);
+    selectWorkspaceControlPage(resolved.window, resolved.workspace_page, true);
     _ = resolved.leaf.selectSurface(resolved.surface);
     resolved.window.as(gtk.Window).present();
     resolved.surface.grabFocus();
@@ -4251,7 +4251,6 @@ pub fn workspaceControlRestoreAlloc(
     const finalized = try workspace_restore.finalizeAlloc(alloc, &live_plan, outcomes);
     defer finalized.deinit(alloc);
 
-    selectWorkspaceControlPage(self, workspace_page);
     self.refreshWorkspaceRegistrySafe();
     const restored_runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
     var results = try cloneRestoreResultsAlloc(alloc, finalized.results);
@@ -4944,11 +4943,14 @@ fn resolveWorkspaceControlSession(
 fn selectWorkspaceControlPage(
     window: *Window,
     workspace_page: *WorkspacePage,
+    focus_window: bool,
 ) void {
     const page = window.getTabView().getPage(workspace_page.as(gtk.Widget));
     window.getTabView().setSelectedPage(page);
-    window.focusWorkspaceSelection(workspace_page);
-    window.as(gtk.Window).present();
+    if (focus_window) {
+        window.focusWorkspaceSelection(workspace_page);
+        window.as(gtk.Window).present();
+    }
 }
 
 fn parseWorkspaceControlWorkspaceRef(value: []const u8) ?workspace_ids.WorkspaceId {

@@ -94,6 +94,10 @@ fn encodeParamsAlloc(alloc: Allocator, value: anytype) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn encodeEmptyParamsAlloc(alloc: Allocator) ![]u8 {
+    return alloc.dupe(u8, "{}");
+}
+
 fn targetForClass(class: ?[:0]const u8) apprt.ipc.Target {
     return if (class) |value| .{ .class = value } else .detect;
 }
@@ -129,7 +133,7 @@ pub fn runList(alloc: Allocator) !u8 {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    const params_json = try encodeParamsAlloc(alloc, .{});
+    const params_json = try encodeEmptyParamsAlloc(alloc);
     defer alloc.free(params_json);
 
     const result = try sendRequest(
@@ -238,7 +242,7 @@ pub fn runSave(alloc: Allocator) !u8 {
     const params_json = if (opts.workspace) |workspace| blk: {
         break :blk try encodeParamsAlloc(alloc, .{ .workspace = workspace });
     } else blk: {
-        break :blk try encodeParamsAlloc(alloc, .{});
+        break :blk try encodeEmptyParamsAlloc(alloc);
     };
     defer alloc.free(params_json);
 
@@ -557,6 +561,15 @@ test "workspace cli targetForClass maps class to ipc target" {
         .class => |value| try testing.expectEqualStrings("ghostty-dev", value),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "workspace cli encodeEmptyParamsAlloc encodes a JSON object" {
+    const testing = std.testing;
+
+    const params_json = try encodeEmptyParamsAlloc(testing.allocator);
+    defer testing.allocator.free(params_json);
+
+    try testing.expectEqualStrings("{}", params_json);
 }
 
 test "workspace cli encodes required V1 request envelopes" {

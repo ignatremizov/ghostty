@@ -27,31 +27,12 @@ pub fn workspaceControl(
     defer group.unref();
 
     const action_group = group.as(gio.ActionGroup);
-    if (action_group.hasAction(workspace_control.action_name) == 0) {
-        try stderr.print(
-            "workspace-control action is not exported by the running Ghostty instance\n",
-            .{},
-        );
-        try stderr.flush();
-        return error.IPCFailed;
-    }
 
-    const parameter = glib.ext.Variant.newFrom(request_json);
-    defer parameter.unref();
-    action_group.activateAction(workspace_control.action_name, parameter);
-
-    {
-        var err_: ?*glib.Error = null;
-        defer if (err_) |err| err.free();
-        if (dbus.dbus.flushSync(null, &err_) == 0) {
-            try stderr.print(
-                "Unable to flush workspace-control action to D-Bus: {s}\n",
-                .{if (err_) |err| err.f_message orelse "(unknown)" else "(unknown)"},
-            );
-            try stderr.flush();
-            return error.IPCFailed;
-        }
-    }
+    const request_json_z = try alloc.dupeZ(u8, request_json);
+    defer alloc.free(request_json_z);
+    const parameter = glib.Variant.newString(request_json_z);
+    dbus.addParameter(parameter);
+    try dbus.send();
 
     const ctx = glib.MainContext.default();
     for (0..50) |_| {
