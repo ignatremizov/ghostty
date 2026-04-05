@@ -46,6 +46,23 @@ See the [download page](https://ghostty.org/download) on the Ghostty website.
 
 See the [documentation](https://ghostty.org/docs) on the Ghostty website.
 
+### GTK Workspace Control CLI
+
+The GTK build also exposes workspace-management actions through the `ghostty +...`
+CLI surface. Current actions include:
+
+- `ghostty +workspace-list`
+- `ghostty +workspace-open --workspace=<name>`
+- `ghostty +workspace-save --workspace=<name>`
+- `ghostty +workspace-restore --workspace=<name>`
+- `ghostty +workspace-list-sessions --workspace=<name>`
+- `ghostty +workspace-focus-session --session=<session-id>`
+- `ghostty +workspace-split --session=<session-id> --direction=<direction>`
+- `ghostty +workspace-close-session --session=<session-id>`
+
+These commands target a running GTK Ghostty instance and return structured JSON
+success or error envelopes.
+
 ## Contributing and Developing
 
 If you have any ideas, issues, etc. regarding Ghostty, or would like to

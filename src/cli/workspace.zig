@@ -8,14 +8,34 @@ const args = @import("args.zig");
 const build_config = @import("../build_config.zig");
 const diagnostics = @import("diagnostics.zig");
 
-const gtk_workspace_control = if (build_config.app_runtime == .gtk)
-    @import("../apprt/gtk/workspace_control.zig")
-else
-    struct {};
 const gtk_workspace_ipc = if (build_config.app_runtime == .gtk)
     @import("../apprt/gtk/ipc/workspace_control.zig")
 else
     struct {};
+
+const Method = enum {
+    workspace_list,
+    workspace_open,
+    workspace_save,
+    workspace_restore,
+    session_list,
+    session_focus,
+    session_split,
+    session_close,
+
+    fn name(self: Method) []const u8 {
+        return switch (self) {
+            .workspace_list => "workspace.list",
+            .workspace_open => "workspace.open",
+            .workspace_save => "workspace.save",
+            .workspace_restore => "workspace.restore",
+            .session_list => "session.list",
+            .session_focus => "session.focus",
+            .session_split => "session.split",
+            .session_close => "session.close",
+        };
+    }
+};
 
 fn deinitOptions(self: anytype) void {
     if (self._arena) |arena| arena.deinit();
@@ -50,12 +70,40 @@ fn responseSucceeded(response_json: []const u8) bool {
     return ok == .bool and ok.bool;
 }
 
+fn encodeRequestAlloc(
+    alloc: Allocator,
+    id: ?[]const u8,
+    method: Method,
+    params_json: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, params_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidFormat;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try out.writer.writeAll("{");
+    if (id) |value| {
+        try out.writer.writeAll("\"id\":");
+        try std.json.Stringify.value(value, .{}, &out.writer);
+        try out.writer.writeAll(",");
+    }
+    try out.writer.writeAll("\"method\":");
+    try std.json.Stringify.value(method.name(), .{}, &out.writer);
+    try out.writer.writeAll(",\"params\":");
+    try out.writer.writeAll(params_json);
+    try out.writer.writeAll("}");
+
+    return out.toOwnedSlice();
+}
+
 fn sendRequest(
     alloc: Allocator,
     stderr: *std.Io.Writer,
     stdout: *std.Io.Writer,
     target: apprt.ipc.Target,
-    method: gtk_workspace_control.Method,
+    method: Method,
     params_json: []const u8,
 ) !u8 {
     if (comptime build_config.app_runtime != .gtk) {
@@ -66,7 +114,7 @@ fn sendRequest(
     const request_id = try std.fmt.allocPrint(alloc, "cli-{d}", .{std.time.milliTimestamp()});
     defer alloc.free(request_id);
 
-    const request_json = try gtk_workspace_control.encodeRequestAlloc(
+    const request_json = try encodeRequestAlloc(
         alloc,
         request_id,
         method,
@@ -576,7 +624,7 @@ test "workspace cli encodes required V1 request envelopes" {
     const testing = std.testing;
 
     const cases = [_]struct {
-        method: gtk_workspace_control.Method,
+        method: Method,
         params: []const u8,
         expected_method: []const u8,
         expected_params_fragment: []const u8,
@@ -632,7 +680,7 @@ test "workspace cli encodes required V1 request envelopes" {
     };
 
     for (cases) |case| {
-        const request = try gtk_workspace_control.encodeRequestAlloc(
+        const request = try encodeRequestAlloc(
             testing.allocator,
             "cli-contract",
             case.method,
@@ -644,6 +692,20 @@ test "workspace cli encodes required V1 request envelopes" {
         try testing.expect(std.mem.indexOf(u8, request, case.expected_method) != null);
         try testing.expect(std.mem.indexOf(u8, request, case.expected_params_fragment) != null);
     }
+}
+
+test "workspace cli encodeRequestAlloc rejects non-object params" {
+    const testing = std.testing;
+
+    try testing.expectError(
+        error.InvalidFormat,
+        encodeRequestAlloc(
+            testing.allocator,
+            "cli-contract",
+            .workspace_list,
+            "[]",
+        ),
+    );
 }
 
 test "workspace cli printResponse returns exit code for success and error payloads" {
