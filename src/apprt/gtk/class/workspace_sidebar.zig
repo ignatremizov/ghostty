@@ -355,16 +355,16 @@ pub const WorkspaceSidebar = extern struct {
         open_button.as(gtk.Widget).setHalign(.fill);
         _ = gtk.Button.signals.clicked.connect(open_button, *Self, workspaceRowOpenSnapshotClicked, self, .{});
 
-        const delete_button = gtk.Button.newWithLabel(i18n._("Delete Workspace"));
-        delete_button.as(gtk.Widget).setHalign(.fill);
-        delete_button.as(gtk.Widget).addCssClass("destructive-action");
-        _ = gtk.Button.signals.clicked.connect(delete_button, *Self, workspaceRowDeleteClicked, self, .{});
+        const close_button = gtk.Button.newWithLabel(i18n._("Close Workspace"));
+        close_button.as(gtk.Widget).setHalign(.fill);
+        close_button.as(gtk.Widget).addCssClass("destructive-action");
+        _ = gtk.Button.signals.clicked.connect(close_button, *Self, workspaceRowCloseClicked, self, .{});
 
         content.append(rename_button.as(gtk.Widget));
         content.append(save_button.as(gtk.Widget));
         content.append(reveal_button.as(gtk.Widget));
         content.append(open_button.as(gtk.Widget));
-        content.append(delete_button.as(gtk.Widget));
+        content.append(close_button.as(gtk.Widget));
 
         const popover = gtk.Popover.new();
         popover.setHasArrow(0);
@@ -420,7 +420,7 @@ pub const WorkspaceSidebar = extern struct {
     fn workspaceRowOpenSnapshotClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
         self.queueContextAction(button, .open_file);
     }
-    fn workspaceRowDeleteClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+    fn workspaceRowCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
         self.queueContextAction(button, .close);
     }
 
