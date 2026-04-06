@@ -102,7 +102,7 @@ pub const Storage = struct {
         };
         defer catalog.deinit(self.allocator);
 
-        const update = try buildCatalogWithoutCheckpoint(self.allocator, catalog, workspace_key);
+        const update = try buildCatalogWithoutMatching(self.allocator, catalog, .workspace_key, workspace_key);
         defer {
             update.catalog.deinit(self.allocator);
             if (update.replaced_path) |path| self.allocator.free(path);
@@ -126,7 +126,7 @@ pub const Storage = struct {
         };
         defer catalog.deinit(self.allocator);
 
-        const update = try buildCatalogWithoutCheckpointPath(self.allocator, catalog, checkpoint_path);
+        const update = try buildCatalogWithoutMatching(self.allocator, catalog, .path, checkpoint_path);
         defer {
             update.catalog.deinit(self.allocator);
             if (update.replaced_path) |path| self.allocator.free(path);
@@ -193,6 +193,11 @@ const CatalogUpdate = struct {
     replaced_path: ?[]u8 = null,
 };
 
+const CatalogRemovalKey = enum {
+    workspace_key,
+    path,
+};
+
 fn buildCatalogWithCheckpoint(
     alloc: std.mem.Allocator,
     catalog: snapshot.Catalog,
@@ -247,15 +252,15 @@ fn buildCatalogWithCheckpoint(
     };
 }
 
-fn buildCatalogWithoutCheckpoint(
+fn buildCatalogWithoutMatching(
     alloc: std.mem.Allocator,
     catalog: snapshot.Catalog,
-    workspace_key: []const u8,
+    removal_key: CatalogRemovalKey,
+    needle: []const u8,
 ) !CatalogUpdate {
     var removed_index: ?usize = null;
     for (catalog.entries, 0..) |entry, index| {
-        const entry_workspace_key = entry.workspace_key orelse continue;
-        if (!std.mem.eql(u8, entry_workspace_key, workspace_key)) continue;
+        if (!catalogEntryMatchesRemovalKey(entry, removal_key, needle)) continue;
         removed_index = index;
         break;
     }
@@ -297,52 +302,16 @@ fn buildCatalogWithoutCheckpoint(
     };
 }
 
-fn buildCatalogWithoutCheckpointPath(
-    alloc: std.mem.Allocator,
-    catalog: snapshot.Catalog,
-    checkpoint_path: []const u8,
-) !CatalogUpdate {
-    var removed_index: ?usize = null;
-    for (catalog.entries, 0..) |entry, index| {
-        if (!std.mem.eql(u8, entry.path, checkpoint_path)) continue;
-        removed_index = index;
-        break;
-    }
-
-    const entry_count = if (removed_index == null)
-        catalog.entries.len
-    else
-        catalog.entries.len - 1;
-    const empty_entries = [_]snapshot.CatalogEntry{};
-    var entries: []snapshot.CatalogEntry = if (entry_count == 0)
-        empty_entries[0..]
-    else
-        try alloc.alloc(snapshot.CatalogEntry, entry_count);
-    var initialized: usize = 0;
-    var removed_path: ?[]u8 = null;
-    errdefer if (removed_path) |old_path| alloc.free(old_path);
-    errdefer {
-        for (entries[0..initialized]) |entry| entry.deinit(alloc);
-        if (entry_count > 0) alloc.free(entries);
-    }
-
-    var write_index: usize = 0;
-    for (catalog.entries, 0..) |entry, index| {
-        if (removed_index != null and index == removed_index.?) {
-            removed_path = try alloc.dupe(u8, entry.path);
-            continue;
-        }
-
-        entries[write_index] = try entry.cloneAlloc(alloc);
-        initialized += 1;
-        write_index += 1;
-    }
-
-    return .{
-        .catalog = .{
-            .version = catalog.version,
-            .entries = entries,
-        },
-        .replaced_path = removed_path,
+fn catalogEntryMatchesRemovalKey(
+    entry: snapshot.CatalogEntry,
+    removal_key: CatalogRemovalKey,
+    needle: []const u8,
+) bool {
+    return switch (removal_key) {
+        .workspace_key => if (entry.workspace_key) |workspace_key|
+            std.mem.eql(u8, workspace_key, needle)
+        else
+            false,
+        .path => std.mem.eql(u8, entry.path, needle),
     };
 }

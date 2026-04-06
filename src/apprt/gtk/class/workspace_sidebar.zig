@@ -22,6 +22,12 @@ const WorkspaceContextAction = enum {
     close,
 };
 
+const WorkspaceContextActionDescriptor = struct {
+    label: [:0]const u8,
+    action: WorkspaceContextAction,
+    destructive: bool = false,
+};
+
 pub const WorkspaceSidebar = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -348,39 +354,17 @@ pub const WorkspaceSidebar = extern struct {
         const priv = self.private();
         if (priv.context_menu_popover != null) return;
         const content = gtk.Box.new(.vertical, 0);
-
-        const rename_button = gtk.Button.newWithLabel(i18n._("Change Workspace Title…"));
-        rename_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(rename_button, *Self, workspaceRowRenameClicked, self, .{});
-
-        const save_button = gtk.Button.newWithLabel(i18n._("Save Workspace"));
-        save_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(save_button, *Self, workspaceRowSaveClicked, self, .{});
-
-        const reveal_button = gtk.Button.newWithLabel(i18n._("Reveal Snapshot"));
-        reveal_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(reveal_button, *Self, workspaceRowRevealClicked, self, .{});
-
-        const open_button = gtk.Button.newWithLabel(i18n._("Open Snapshot File…"));
-        open_button.as(gtk.Widget).setHalign(.fill);
-        _ = gtk.Button.signals.clicked.connect(open_button, *Self, workspaceRowOpenSnapshotClicked, self, .{});
-
-        const delete_button = gtk.Button.newWithLabel(i18n._("Delete Saved Workspace"));
-        delete_button.as(gtk.Widget).setHalign(.fill);
-        delete_button.as(gtk.Widget).addCssClass("destructive-action");
-        _ = gtk.Button.signals.clicked.connect(delete_button, *Self, workspaceRowDeleteClicked, self, .{});
-
-        const close_button = gtk.Button.newWithLabel(i18n._("Close Workspace"));
-        close_button.as(gtk.Widget).setHalign(.fill);
-        close_button.as(gtk.Widget).addCssClass("destructive-action");
-        _ = gtk.Button.signals.clicked.connect(close_button, *Self, workspaceRowCloseClicked, self, .{});
-
-        content.append(rename_button.as(gtk.Widget));
-        content.append(save_button.as(gtk.Widget));
-        content.append(reveal_button.as(gtk.Widget));
-        content.append(open_button.as(gtk.Widget));
-        content.append(delete_button.as(gtk.Widget));
-        content.append(close_button.as(gtk.Widget));
+        const descriptors = [_]WorkspaceContextActionDescriptor{
+            .{ .label = i18n._("Change Workspace Title…"), .action = .rename },
+            .{ .label = i18n._("Save Workspace"), .action = .save },
+            .{ .label = i18n._("Reveal Snapshot"), .action = .reveal },
+            .{ .label = i18n._("Open Snapshot File…"), .action = .open_file },
+            .{ .label = i18n._("Delete Saved Workspace"), .action = .delete_saved, .destructive = true },
+            .{ .label = i18n._("Close Workspace"), .action = .close, .destructive = true },
+        };
+        inline for (descriptors) |descriptor| {
+            content.append(createContextActionButton(self, descriptor).as(gtk.Widget));
+        }
 
         const popover = gtk.Popover.new();
         popover.setHasArrow(0);
@@ -424,23 +408,25 @@ pub const WorkspaceSidebar = extern struct {
         priv.workspace_empty_context_popover.?.popup();
     }
 
-    fn workspaceRowRenameClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .rename);
+    fn createContextActionButton(
+        self: *Self,
+        descriptor: WorkspaceContextActionDescriptor,
+    ) *gtk.Button {
+        const button = gtk.Button.newWithLabel(descriptor.label);
+        button.as(gtk.Widget).setHalign(.fill);
+        if (descriptor.destructive) button.as(gtk.Widget).addCssClass("destructive-action");
+        button.as(gobject.Object).setData(
+            "workspace-context-action",
+            @ptrFromInt(@intFromEnum(descriptor.action) + 1),
+        );
+        _ = gtk.Button.signals.clicked.connect(button, *Self, workspaceRowActionClicked, self, .{});
+        return button;
     }
-    fn workspaceRowSaveClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .save);
-    }
-    fn workspaceRowRevealClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .reveal);
-    }
-    fn workspaceRowOpenSnapshotClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .open_file);
-    }
-    fn workspaceRowDeleteClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .delete_saved);
-    }
-    fn workspaceRowCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
-        self.queueContextAction(button, .close);
+
+    fn workspaceRowActionClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        const action_ptr = button.as(gobject.Object).getData("workspace-context-action") orelse return;
+        const action: WorkspaceContextAction = @enumFromInt(@intFromPtr(action_ptr) - 1);
+        self.queueContextAction(button, action);
     }
 
     fn workspaceEmptyRestoreClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
