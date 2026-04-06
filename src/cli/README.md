@@ -20,11 +20,11 @@ CLI entrypoints. The current workspace actions are:
 - `+workspace-split`
 - `+workspace-close-session`
 
-Each action defines its own `run` function doc comment and options struct in the
-matching `src/cli/workspace_*.zig` file. General `ghostty +help` output is driven
-by the `Action` enum in `src/cli/ghostty.zig`, so new actions should be added to
-that enum and documented in their action file rather than hand-maintained in
-`help.zig`.
+These actions share one implementation module in `src/cli/workspace.zig`.
+General `ghostty +help` output is driven by the `Action` enum in
+`src/cli/ghostty.zig`, and help extraction for the workspace commands now reads
+the corresponding `run*` doc comments from that shared module rather than thin
+per-command wrapper files.
 
 ## Updating documentation
 

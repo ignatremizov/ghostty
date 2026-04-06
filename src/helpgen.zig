@@ -86,21 +86,25 @@ fn genActions(alloc: std.mem.Allocator, writer: *std.Io.Writer) !void {
             const action = @field(Action, field.name);
             break :action_file action.file();
         };
+        const action_fn = comptime action_fn: {
+            const action = @field(Action, field.name);
+            break :action_fn action.helpFunction();
+        };
 
         var ast = try std.zig.Ast.parse(alloc, @embedFile(action_file), .zig);
         defer ast.deinit(alloc);
         const tokens: []std.zig.Token.Tag = ast.tokens.items(.tag);
 
         for (tokens, 0..) |token, i| {
-            // We're looking for a function named "run".
+            // We're looking for the function that carries help for this action.
             if (token != .keyword_fn) continue;
-            if (!std.mem.eql(u8, ast.tokenSlice(@intCast(i + 1)), "run")) continue;
+            if (!std.mem.eql(u8, ast.tokenSlice(@intCast(i + 1)), action_fn)) continue;
 
             // The function must be preceded by a doc comment.
             if (tokens[i - 2] != .doc_comment) {
                 std.debug.print(
-                    "doc comment must be present on run function of the {s} action!",
-                    .{field.name},
+                    "doc comment must be present on {s} in {s} for the {s} action!",
+                    .{ action_fn, action_file, field.name },
                 );
                 std.process.exit(1);
             }

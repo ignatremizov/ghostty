@@ -15,6 +15,30 @@ else
     struct {};
 
 const Method = workspace_control_protocol.Method;
+const CommandUsageError = error{CommandUsage};
+
+const Stdio = struct {
+    stdout_buf: [1024]u8 = undefined,
+    stdout_writer: std.fs.File.Writer = undefined,
+    stdout: *std.Io.Writer = undefined,
+    stderr_buf: [1024]u8 = undefined,
+    stderr_writer: std.fs.File.Writer = undefined,
+    stderr: *std.Io.Writer = undefined,
+
+    fn init() Stdio {
+        var self: Stdio = .{};
+        self.stdout_writer = std.fs.File.stdout().writer(&self.stdout_buf);
+        self.stdout = &self.stdout_writer.interface;
+        self.stderr_writer = std.fs.File.stderr().writer(&self.stderr_buf);
+        self.stderr = &self.stderr_writer.interface;
+        return self;
+    }
+
+    fn flush(self: *Stdio) !void {
+        try self.stdout.flush();
+        try self.stderr.flush();
+    }
+};
 
 fn deinitOptions(self: anytype) void {
     if (self._arena) |arena| arena.deinit();
@@ -49,15 +73,6 @@ fn responseSucceeded(response_json: []const u8) bool {
     return ok == .bool and ok.bool;
 }
 
-fn encodeRequestAlloc(
-    alloc: Allocator,
-    id: ?[]const u8,
-    method: Method,
-    params_json: []const u8,
-) ![]u8 {
-    return workspace_control_protocol.encodeRequestAlloc(alloc, id, method, params_json);
-}
-
 fn sendRequest(
     alloc: Allocator,
     stderr: *std.Io.Writer,
@@ -74,7 +89,7 @@ fn sendRequest(
     const request_id = try std.fmt.allocPrint(alloc, "cli-{d}", .{std.time.milliTimestamp()});
     defer alloc.free(request_id);
 
-    const request_json = try encodeRequestAlloc(
+    const request_json = try workspace_control_protocol.encodeRequestAlloc(
         alloc,
         request_id,
         method,
@@ -106,6 +121,45 @@ fn encodeEmptyParamsAlloc(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, "{}");
 }
 
+fn printUsageError(stderr: *std.Io.Writer, message: []const u8) !void {
+    try stderr.print("{s}\n", .{message});
+}
+
+fn runCommand(
+    alloc: Allocator,
+    comptime Options: type,
+    comptime method: Method,
+    comptime buildParams: fn (Allocator, *std.Io.Writer, Options) anyerror![]u8,
+) !u8 {
+    var iter = try args.argsIterator(alloc);
+    defer iter.deinit();
+
+    var opts: Options = .{};
+    defer opts.deinit();
+    try args.parse(Options, alloc, &opts, &iter);
+
+    var io = Stdio.init();
+    const params_json = buildParams(alloc, io.stderr, opts) catch |err| switch (err) {
+        error.CommandUsage => {
+            try io.flush();
+            return 1;
+        },
+        else => return err,
+    };
+    defer alloc.free(params_json);
+
+    const result = try sendRequest(
+        alloc,
+        io.stderr,
+        io.stdout,
+        targetForClass(opts.class),
+        method,
+        params_json,
+    );
+    try io.flush();
+    return result;
+}
+
 fn targetForClass(class: ?[:0]const u8) apprt.ipc.Target {
     return if (class) |value| .{ .class = value } else .detect;
 }
@@ -125,36 +179,10 @@ pub const ListOptions = struct {
     }
 };
 
+/// Query the running Ghostty instance for its visible and restorable
+/// workspaces and print the JSON workspace-control response.
 pub fn runList(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: ListOptions = .{};
-    defer opts.deinit();
-    try args.parse(ListOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const params_json = try encodeEmptyParamsAlloc(alloc);
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .workspace_list,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, ListOptions, .workspace_list, buildListParams);
 }
 
 pub const OpenOptions = struct {
@@ -174,45 +202,10 @@ pub const OpenOptions = struct {
     }
 };
 
+/// Open an existing workspace in the running Ghostty instance, or create it
+/// when `--create` is supplied, and print the JSON workspace-control response.
 pub fn runOpen(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: OpenOptions = .{};
-    defer opts.deinit();
-    try args.parse(OpenOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const workspace = opts.workspace orelse {
-        try stderr.print("--workspace is required\n", .{});
-        try stderr.flush();
-        return 1;
-    };
-
-    const params_json = try encodeParamsAlloc(alloc, .{
-        .workspace = workspace,
-        .create = opts.create,
-    });
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .workspace_open,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, OpenOptions, .workspace_open, buildOpenParams);
 }
 
 pub const SaveOptions = struct {
@@ -231,40 +224,10 @@ pub const SaveOptions = struct {
     }
 };
 
+/// Save the current live snapshot for a workspace in the running Ghostty
+/// instance and print the JSON workspace-control response.
 pub fn runSave(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: SaveOptions = .{};
-    defer opts.deinit();
-    try args.parse(SaveOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const params_json = if (opts.workspace) |workspace| blk: {
-        break :blk try encodeParamsAlloc(alloc, .{ .workspace = workspace });
-    } else blk: {
-        break :blk try encodeEmptyParamsAlloc(alloc);
-    };
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .workspace_save,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, SaveOptions, .workspace_save, buildSaveParams);
 }
 
 pub const RestoreOptions = struct {
@@ -283,42 +246,10 @@ pub const RestoreOptions = struct {
     }
 };
 
+/// Restore the latest saved snapshot for a workspace in the running Ghostty
+/// instance and print the JSON workspace-control response.
 pub fn runRestore(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: RestoreOptions = .{};
-    defer opts.deinit();
-    try args.parse(RestoreOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const workspace = opts.workspace orelse {
-        try stderr.print("--workspace is required\n", .{});
-        try stderr.flush();
-        return 1;
-    };
-
-    const params_json = try encodeParamsAlloc(alloc, .{ .workspace = workspace });
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .workspace_restore,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, RestoreOptions, .workspace_restore, buildRestoreParams);
 }
 
 pub const ListSessionsOptions = struct {
@@ -337,36 +268,10 @@ pub const ListSessionsOptions = struct {
     }
 };
 
+/// List sessions for a workspace, or for the currently selected workspace
+/// when `--workspace` is omitted, and print the JSON response.
 pub fn runListSessions(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: ListSessionsOptions = .{};
-    defer opts.deinit();
-    try args.parse(ListSessionsOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const params_json = try encodeParamsAlloc(alloc, .{ .workspace = opts.workspace });
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .session_list,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, ListSessionsOptions, .session_list, buildListSessionsParams);
 }
 
 pub const FocusSessionOptions = struct {
@@ -385,42 +290,10 @@ pub const FocusSessionOptions = struct {
     }
 };
 
+/// Focus a target session in the running Ghostty instance and print the JSON
+/// workspace-control response.
 pub fn runFocusSession(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: FocusSessionOptions = .{};
-    defer opts.deinit();
-    try args.parse(FocusSessionOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const session = opts.session orelse {
-        try stderr.print("--session is required\n", .{});
-        try stderr.flush();
-        return 1;
-    };
-
-    const params_json = try encodeParamsAlloc(alloc, .{ .session = session });
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .session_focus,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, FocusSessionOptions, .session_focus, buildFocusSessionParams);
 }
 
 pub const SplitDirection = enum {
@@ -449,52 +322,10 @@ pub const SplitOptions = struct {
     }
 };
 
+/// Create a Ghostty-native split from a target session and print the JSON
+/// workspace-control response.
 pub fn runSplit(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
-
-    var opts: SplitOptions = .{};
-    defer opts.deinit();
-    try args.parse(SplitOptions, alloc, &opts, &iter);
-
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const session = opts.session orelse {
-        try stderr.print("--session is required\n", .{});
-        try stderr.flush();
-        return 1;
-    };
-    const direction = opts.direction orelse {
-        try stderr.print("--direction is required\n", .{});
-        try stderr.flush();
-        return 1;
-    };
-
-    const params_json = try encodeParamsAlloc(alloc, .{
-        .session = session,
-        .direction = @tagName(direction),
-        .cwd = opts.cwd,
-        .command = opts.command,
-    });
-    defer alloc.free(params_json);
-
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .session_split,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+    return runCommand(alloc, SplitOptions, .session_split, buildSplitParams);
 }
 
 pub const CloseSessionOptions = struct {
@@ -513,42 +344,102 @@ pub const CloseSessionOptions = struct {
     }
 };
 
+/// Close a target session in the running Ghostty instance and print the JSON
+/// workspace-control response.
 pub fn runCloseSession(alloc: Allocator) !u8 {
-    var iter = try args.argsIterator(alloc);
-    defer iter.deinit();
+    return runCommand(alloc, CloseSessionOptions, .session_close, buildCloseSessionParams);
+}
 
-    var opts: CloseSessionOptions = .{};
-    defer opts.deinit();
-    try args.parse(CloseSessionOptions, alloc, &opts, &iter);
+fn buildListParams(alloc: Allocator, _: *std.Io.Writer, _: ListOptions) ![]u8 {
+    return encodeEmptyParamsAlloc(alloc);
+}
 
-    var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const stdout = &stdout_writer.interface;
-
-    var stderr_buf: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const stderr = &stderr_writer.interface;
-
-    const session = opts.session orelse {
-        try stderr.print("--session is required\n", .{});
-        try stderr.flush();
-        return 1;
+fn buildOpenParams(alloc: Allocator, stderr: *std.Io.Writer, opts: OpenOptions) ![]u8 {
+    const workspace = opts.workspace orelse {
+        try printUsageError(stderr, "--workspace is required");
+        return error.CommandUsage;
     };
+    return encodeParamsAlloc(alloc, .{ .workspace = workspace, .create = opts.create });
+}
 
-    const params_json = try encodeParamsAlloc(alloc, .{ .session = session });
-    defer alloc.free(params_json);
+fn buildSaveParams(alloc: Allocator, _: *std.Io.Writer, opts: SaveOptions) ![]u8 {
+    return if (opts.workspace) |workspace|
+        encodeParamsAlloc(alloc, .{ .workspace = workspace })
+    else
+        encodeEmptyParamsAlloc(alloc);
+}
 
-    const result = try sendRequest(
-        alloc,
-        stderr,
-        stdout,
-        targetForClass(opts.class),
-        .session_close,
-        params_json,
-    );
-    try stdout.flush();
-    try stderr.flush();
-    return result;
+fn buildRestoreParams(alloc: Allocator, stderr: *std.Io.Writer, opts: RestoreOptions) ![]u8 {
+    const workspace = opts.workspace orelse {
+        try printUsageError(stderr, "--workspace is required");
+        return error.CommandUsage;
+    };
+    return encodeParamsAlloc(alloc, .{ .workspace = workspace });
+}
+
+fn buildListSessionsParams(alloc: Allocator, _: *std.Io.Writer, opts: ListSessionsOptions) ![]u8 {
+    return encodeParamsAlloc(alloc, .{ .workspace = opts.workspace });
+}
+
+fn buildFocusSessionParams(alloc: Allocator, stderr: *std.Io.Writer, opts: FocusSessionOptions) ![]u8 {
+    const session = opts.session orelse {
+        try printUsageError(stderr, "--session is required");
+        return error.CommandUsage;
+    };
+    return encodeParamsAlloc(alloc, .{ .session = session });
+}
+
+fn buildSplitParams(alloc: Allocator, stderr: *std.Io.Writer, opts: SplitOptions) ![]u8 {
+    const session = opts.session orelse {
+        try printUsageError(stderr, "--session is required");
+        return error.CommandUsage;
+    };
+    const direction = opts.direction orelse {
+        try printUsageError(stderr, "--direction is required");
+        return error.CommandUsage;
+    };
+    return encodeParamsAlloc(alloc, .{
+        .session = session,
+        .direction = @tagName(direction),
+        .cwd = opts.cwd,
+        .command = opts.command,
+    });
+}
+
+fn buildCloseSessionParams(alloc: Allocator, stderr: *std.Io.Writer, opts: CloseSessionOptions) ![]u8 {
+    const session = opts.session orelse {
+        try printUsageError(stderr, "--session is required");
+        return error.CommandUsage;
+    };
+    return encodeParamsAlloc(alloc, .{ .session = session });
+}
+
+pub fn runAction(action: Action, alloc: Allocator) !u8 {
+    return switch (action) {
+        .@"workspace-list" => runList(alloc),
+        .@"workspace-open" => runOpen(alloc),
+        .@"workspace-save" => runSave(alloc),
+        .@"workspace-restore" => runRestore(alloc),
+        .@"workspace-list-sessions" => runListSessions(alloc),
+        .@"workspace-focus-session" => runFocusSession(alloc),
+        .@"workspace-split" => runSplit(alloc),
+        .@"workspace-close-session" => runCloseSession(alloc),
+        else => unreachable,
+    };
+}
+
+pub fn optionsForAction(comptime action: Action) type {
+    return switch (action) {
+        .@"workspace-list" => ListOptions,
+        .@"workspace-open" => OpenOptions,
+        .@"workspace-save" => SaveOptions,
+        .@"workspace-restore" => RestoreOptions,
+        .@"workspace-list-sessions" => ListSessionsOptions,
+        .@"workspace-focus-session" => FocusSessionOptions,
+        .@"workspace-split" => SplitOptions,
+        .@"workspace-close-session" => CloseSessionOptions,
+        else => unreachable,
+    };
 }
 
 test "workspace cli responseSucceeded handles ok and invalid payloads" {
@@ -640,7 +531,7 @@ test "workspace cli encodes required V1 request envelopes" {
     };
 
     for (cases) |case| {
-        const request = try encodeRequestAlloc(
+        const request = try workspace_control_protocol.encodeRequestAlloc(
             testing.allocator,
             "cli-contract",
             case.method,
@@ -659,7 +550,7 @@ test "workspace cli encodeRequestAlloc rejects non-object params" {
 
     try testing.expectError(
         error.InvalidFormat,
-        encodeRequestAlloc(
+        workspace_control_protocol.encodeRequestAlloc(
             testing.allocator,
             "cli-contract",
             .workspace_list,
