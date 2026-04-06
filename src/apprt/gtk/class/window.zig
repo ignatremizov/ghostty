@@ -3513,7 +3513,7 @@ pub const Window = extern struct {
             return;
         };
 
-        var dir = workspaceStorageDirCreateAlloc(alloc) catch |err| {
+        var dir = workspace_storage.createDefaultStorageDirAlloc(alloc) catch |err| {
             log.warn("failed to open workspace storage directory error={}", .{err});
             self.addToast(i18n._("Failed to delete saved workspace"));
             return;
@@ -4233,7 +4233,7 @@ pub fn saveWorkspaceAlloc(
     var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(alloc, snapshot_id, saved_at, runtime);
     defer snapshot_value.deinit(alloc);
 
-    var dir = try workspaceStorageDirCreateAlloc(alloc);
+    var dir = try workspace_storage.createDefaultStorageDirAlloc(alloc);
     defer dir.close();
     const storage = workspace_storage.Storage.init(alloc, dir);
     const path = try storage.writeCheckpoint(snapshot_value);
@@ -4730,20 +4730,6 @@ fn cloneRestoreResultsAlloc(
             .reason = try alloc.dupe(u8, fallback.reason),
         } else null,
     };
-}
-
-fn workspaceStorageDirCreateAlloc(
-    alloc: std.mem.Allocator,
-) !std.fs.Dir {
-    const storage_path = try internal_os.xdg.state(alloc, .{
-        .subdir = "ghostty/workspaces",
-    });
-    defer alloc.free(storage_path);
-    std.fs.makeDirAbsolute(storage_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    return try std.fs.openDirAbsolute(storage_path, .{});
 }
 
 fn updateWorkspaceSnapshotRefAlloc(

@@ -675,38 +675,10 @@ fn workspaceControlWindowsAlloc(
     return windows.toOwnedSlice(alloc);
 }
 
-fn workspaceStorageDirAlloc(
-    alloc: std.mem.Allocator,
-) !?std.fs.Dir {
-    const storage_path = try internal_os.xdg.state(alloc, .{
-        .subdir = "ghostty/workspaces",
-    });
-    defer alloc.free(storage_path);
-
-    return std.fs.openDirAbsolute(storage_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-}
-
-fn workspaceStorageDirCreateAlloc(
-    alloc: std.mem.Allocator,
-) !std.fs.Dir {
-    const storage_path = try internal_os.xdg.state(alloc, .{
-        .subdir = "ghostty/workspaces",
-    });
-    defer alloc.free(storage_path);
-    std.fs.makeDirAbsolute(storage_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    return try std.fs.openDirAbsolute(storage_path, .{});
-}
-
 fn readWorkspaceCatalogAlloc(
     alloc: std.mem.Allocator,
 ) !workspace_snapshot.Catalog {
-    var dir = try workspaceStorageDirAlloc(alloc) orelse return .{};
+    var dir = try workspace_storage.openDefaultStorageDirAlloc(alloc) orelse return .{};
     defer dir.close();
     const storage = workspace_storage.Storage.init(alloc, dir);
     return storage.readCatalogAlloc(alloc, workspace_storage.Storage.catalog_filename) catch |err| switch (err) {
@@ -719,7 +691,7 @@ fn readWorkspaceSnapshotAlloc(
     alloc: std.mem.Allocator,
     filename: []const u8,
 ) !workspace_snapshot.Snapshot {
-    var dir = try workspaceStorageDirAlloc(alloc) orelse return error.FileNotFound;
+    var dir = try workspace_storage.openDefaultStorageDirAlloc(alloc) orelse return error.FileNotFound;
     defer dir.close();
     const storage = workspace_storage.Storage.init(alloc, dir);
     return storage.readSnapshotAlloc(alloc, filename);
@@ -1158,24 +1130,6 @@ fn encodeWorkspaceRestoreResultAlloc(
     defer out.deinit();
     try std.json.Stringify.value(result, .{}, &out.writer);
     return out.toOwnedSlice();
-}
-
-fn updateWorkspaceSnapshotRefAlloc(
-    alloc: std.mem.Allocator,
-    runtime: anytype,
-    snapshot_id: workspace_ids.SnapshotId,
-    saved_at: []const u8,
-    path: []const u8,
-) void {
-    if (runtime.workspace.snapshot_ref) |snapshot_ref| {
-        alloc.free(snapshot_ref.saved_at);
-        alloc.free(snapshot_ref.path);
-    }
-    runtime.workspace.snapshot_ref = .{
-        .snapshot_id = snapshot_id,
-        .saved_at = alloc.dupe(u8, saved_at) catch return,
-        .path = alloc.dupe(u8, path) catch return,
-    };
 }
 
 fn parseEnvelopeIdAlloc(alloc: std.mem.Allocator, json: []const u8) !?[]u8 {

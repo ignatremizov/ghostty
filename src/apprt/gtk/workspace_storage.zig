@@ -175,6 +175,21 @@ pub fn openDefaultStorageDirAlloc(
     };
 }
 
+pub fn createDefaultStorageDirAlloc(
+    alloc: std.mem.Allocator,
+) !std.fs.Dir {
+    const storage_path = try internal_os.xdg.state(alloc, .{
+        .subdir = "ghostty/workspaces",
+    });
+    defer alloc.free(storage_path);
+
+    std.fs.makeDirAbsolute(storage_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return try std.fs.openDirAbsolute(storage_path, .{});
+}
+
 pub fn readDefaultCatalogAlloc(
     alloc: std.mem.Allocator,
 ) !snapshot.Catalog {
