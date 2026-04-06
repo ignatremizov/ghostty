@@ -23,7 +23,7 @@ const WorkspaceContextAction = enum {
 };
 
 const WorkspaceContextActionDescriptor = struct {
-    label: [:0]const u8,
+    label: [*:0]const u8,
     action: WorkspaceContextAction,
     destructive: bool = false,
 };

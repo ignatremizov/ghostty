@@ -23,14 +23,7 @@ const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const toggle_quick_terminal = @import("toggle_quick_terminal.zig");
 const global = @import("../global.zig");
-const workspace_list = @import("workspace_list.zig");
-const workspace_open = @import("workspace_open.zig");
-const workspace_save = @import("workspace_save.zig");
-const workspace_restore = @import("workspace_restore.zig");
-const workspace_list_sessions = @import("workspace_list_sessions.zig");
-const workspace_focus_session = @import("workspace_focus_session.zig");
-const workspace_split = @import("workspace_split.zig");
-const workspace_close_session = @import("workspace_close_session.zig");
+const workspace = @import("workspace.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -198,14 +191,15 @@ pub const Action = enum {
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
             .@"toggle-quick-terminal" => try toggle_quick_terminal.run(alloc),
-            .@"workspace-list" => try workspace_list.run(alloc),
-            .@"workspace-open" => try workspace_open.run(alloc),
-            .@"workspace-save" => try workspace_save.run(alloc),
-            .@"workspace-restore" => try workspace_restore.run(alloc),
-            .@"workspace-list-sessions" => try workspace_list_sessions.run(alloc),
-            .@"workspace-focus-session" => try workspace_focus_session.run(alloc),
-            .@"workspace-split" => try workspace_split.run(alloc),
-            .@"workspace-close-session" => try workspace_close_session.run(alloc),
+            .@"workspace-list",
+            .@"workspace-open",
+            .@"workspace-save",
+            .@"workspace-restore",
+            .@"workspace-list-sessions",
+            .@"workspace-focus-session",
+            .@"workspace-split",
+            .@"workspace-close-session",
+            => try workspace.runAction(self, alloc),
         };
     }
 
@@ -213,6 +207,19 @@ pub const Action = enum {
     /// path from the root src/ directory.
     pub fn file(comptime self: Action) []const u8 {
         comptime {
+            switch (self) {
+                .@"workspace-list",
+                .@"workspace-open",
+                .@"workspace-save",
+                .@"workspace-restore",
+                .@"workspace-list-sessions",
+                .@"workspace-focus-session",
+                .@"workspace-split",
+                .@"workspace-close-session",
+                => return "cli/workspace.zig",
+                else => {},
+            }
+
             @setEvalBranchQuota(10_000);
             const filename = filename: {
                 const tag = @tagName(self);
@@ -223,6 +230,20 @@ pub const Action = enum {
 
             return "cli/" ++ filename ++ ".zig";
         }
+    }
+
+    pub fn helpFunction(comptime self: Action) []const u8 {
+        return switch (self) {
+            .@"workspace-list" => "runList",
+            .@"workspace-open" => "runOpen",
+            .@"workspace-save" => "runSave",
+            .@"workspace-restore" => "runRestore",
+            .@"workspace-list-sessions" => "runListSessions",
+            .@"workspace-focus-session" => "runFocusSession",
+            .@"workspace-split" => "runSplit",
+            .@"workspace-close-session" => "runCloseSession",
+            else => "run",
+        };
     }
 
     /// Returns the options of action. Supports generating shell completions
@@ -249,14 +270,15 @@ pub const Action = enum {
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
                 .@"toggle-quick-terminal" => toggle_quick_terminal.Options,
-                .@"workspace-list" => workspace_list.Options,
-                .@"workspace-open" => workspace_open.Options,
-                .@"workspace-save" => workspace_save.Options,
-                .@"workspace-restore" => workspace_restore.Options,
-                .@"workspace-list-sessions" => workspace_list_sessions.Options,
-                .@"workspace-focus-session" => workspace_focus_session.Options,
-                .@"workspace-split" => workspace_split.Options,
-                .@"workspace-close-session" => workspace_close_session.Options,
+                .@"workspace-list",
+                .@"workspace-open",
+                .@"workspace-save",
+                .@"workspace-restore",
+                .@"workspace-list-sessions",
+                .@"workspace-focus-session",
+                .@"workspace-split",
+                .@"workspace-close-session",
+                => workspace.optionsForAction(self),
             };
         }
     }
