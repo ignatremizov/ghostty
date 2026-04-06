@@ -4,6 +4,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
+const workspace_control_protocol = @import("../apprt/workspace_control_protocol.zig");
 const args = @import("args.zig");
 const build_config = @import("../build_config.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -13,29 +14,7 @@ const gtk_workspace_ipc = if (build_config.app_runtime == .gtk)
 else
     struct {};
 
-const Method = enum {
-    workspace_list,
-    workspace_open,
-    workspace_save,
-    workspace_restore,
-    session_list,
-    session_focus,
-    session_split,
-    session_close,
-
-    fn name(self: Method) []const u8 {
-        return switch (self) {
-            .workspace_list => "workspace.list",
-            .workspace_open => "workspace.open",
-            .workspace_save => "workspace.save",
-            .workspace_restore => "workspace.restore",
-            .session_list => "session.list",
-            .session_focus => "session.focus",
-            .session_split => "session.split",
-            .session_close => "session.close",
-        };
-    }
-};
+const Method = workspace_control_protocol.Method;
 
 fn deinitOptions(self: anytype) void {
     if (self._arena) |arena| arena.deinit();
@@ -76,26 +55,7 @@ fn encodeRequestAlloc(
     method: Method,
     params_json: []const u8,
 ) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, params_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidFormat;
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{");
-    if (id) |value| {
-        try out.writer.writeAll("\"id\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
-        try out.writer.writeAll(",");
-    }
-    try out.writer.writeAll("\"method\":");
-    try std.json.Stringify.value(method.name(), .{}, &out.writer);
-    try out.writer.writeAll(",\"params\":");
-    try out.writer.writeAll(params_json);
-    try out.writer.writeAll("}");
-
-    return out.toOwnedSlice();
+    return workspace_control_protocol.encodeRequestAlloc(alloc, id, method, params_json);
 }
 
 fn sendRequest(

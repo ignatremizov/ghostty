@@ -295,6 +295,15 @@ pub const Window = extern struct {
         pub var offset: c_int = 0;
     };
 
+    const WorkspacePageIdleAction = enum {
+        prompt_title,
+        save,
+        reveal_snapshot,
+        open_snapshot,
+        delete_snapshot,
+        close,
+    };
+
     pub fn new(
         app: *Application,
         overrides: struct {
@@ -856,27 +865,27 @@ pub const Window = extern struct {
     }
 
     fn workspaceSidebarPromptWorkspaceTitle(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .prompt_title);
     }
 
     fn workspaceSidebarSaveWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .save);
     }
 
     fn workspaceSidebarRevealWorkspaceSnapshot(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .reveal_snapshot);
     }
 
     fn workspaceSidebarOpenWorkspaceSnapshot(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .open_snapshot);
     }
 
     fn workspaceSidebarDeleteWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idleDeleteWorkspaceSnapshot, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .delete_snapshot);
     }
 
     fn workspaceSidebarCloseWorkspace(_: *WorkspaceSidebar, workspace_page: *WorkspacePage, _: *Self) callconv(.c) void {
-        _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page.ref());
+        queueWorkspacePageIdleAction(workspace_page, .close);
     }
 
     fn workspaceSidebarRestoreWorkspace(_: *WorkspaceSidebar, self: *Self) callconv(.c) void {
@@ -3239,51 +3248,65 @@ pub const Window = extern struct {
         self.performBindingAction(.new_tab);
     }
 
-    fn idlePromptWorkspaceTitle(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        workspace_page.promptWorkspaceTitle();
+    fn idleWorkspacePageAction(ud: ?*anyopaque) callconv(.c) c_int {
+        const ctx: *WorkspacePageIdleContext = @ptrCast(@alignCast(ud orelse return 0));
+        defer ctx.deinit();
+
+        switch (ctx.action) {
+            .prompt_title => {
+                ctx.workspace_page.promptWorkspaceTitle();
+            },
+            .save => {
+                const window = ext.getAncestor(Self, ctx.workspace_page.as(gtk.Widget)) orelse return 0;
+                window.saveWorkspacePage(ctx.workspace_page);
+            },
+            .reveal_snapshot => {
+                const window = ext.getAncestor(Self, ctx.workspace_page.as(gtk.Widget)) orelse return 0;
+                window.revealWorkspaceSnapshot(ctx.workspace_page);
+            },
+            .open_snapshot => {
+                const window = ext.getAncestor(Self, ctx.workspace_page.as(gtk.Widget)) orelse return 0;
+                window.openWorkspaceSnapshot(ctx.workspace_page);
+            },
+            .delete_snapshot => {
+                const window = ext.getAncestor(Self, ctx.workspace_page.as(gtk.Widget)) orelse return 0;
+                window.deleteWorkspaceSnapshot(ctx.workspace_page);
+            },
+            .close => {
+                const window = ext.getAncestor(Self, ctx.workspace_page.as(gtk.Widget)) orelse return 0;
+                window.closeWorkspacePage(ctx.workspace_page);
+            },
+        }
         return 0;
     }
 
-    fn idleSaveWorkspacePage(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
-        window.saveWorkspacePage(workspace_page);
-        return 0;
+    const WorkspacePageIdleContext = struct {
+        workspace_page: *WorkspacePage,
+        action: WorkspacePageIdleAction,
+
+        fn new(workspace_page: *WorkspacePage, action: WorkspacePageIdleAction) *WorkspacePageIdleContext {
+            const ctx = std.heap.c_allocator.create(WorkspacePageIdleContext) catch @panic("oom");
+            ctx.* = .{
+                .workspace_page = workspace_page.ref(),
+                .action = action,
+            };
+            return ctx;
+        }
+
+        fn deinit(self: *WorkspacePageIdleContext) void {
+            self.workspace_page.unref();
+            std.heap.c_allocator.destroy(self);
+        }
+    };
+
+    fn queueWorkspacePageIdleAction(workspace_page: *WorkspacePage, action: WorkspacePageIdleAction) void {
+        _ = glib.idleAdd(idleWorkspacePageAction, WorkspacePageIdleContext.new(workspace_page, action));
     }
 
-    fn idleCloseWorkspacePage(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
-        window.closeWorkspacePage(workspace_page);
-        return 0;
-    }
-
-    fn idleRevealWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
-        window.revealWorkspaceSnapshot(workspace_page);
-        return 0;
-    }
-
-    fn idleOpenWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
-        window.openWorkspaceSnapshot(workspace_page);
-        return 0;
-    }
-
-    fn idleDeleteWorkspaceSnapshot(ud: ?*anyopaque) callconv(.c) c_int {
-        const workspace_page: *WorkspacePage = @ptrCast(@alignCast(ud orelse return 0));
-        defer workspace_page.unref();
-        const window = ext.getAncestor(Self, workspace_page.as(gtk.Widget)) orelse return 0;
-        window.deleteWorkspaceSnapshot(workspace_page);
-        return 0;
+    fn getContextMenuWorkspacePage(self: *Self) ?*WorkspacePage {
+        const priv = self.private();
+        const page = priv.context_menu_page orelse return null;
+        return gobject.ext.cast(WorkspacePage, page.getChild());
     }
 
     fn idleShowRestoreWorkspaceCommands(ud: ?*anyopaque) callconv(.c) c_int {
@@ -3294,48 +3317,28 @@ pub const Window = extern struct {
     }
 
     fn promptContextWorkspaceTitle(self: *Self) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
+        const workspace_page = self.getContextMenuWorkspacePage() orelse return;
+        queueWorkspacePageIdleAction(workspace_page, .prompt_title);
     }
 
     fn saveContextWorkspace(self: *Self) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idleSaveWorkspacePage, workspace_page);
+        const workspace_page = self.getContextMenuWorkspacePage() orelse return;
+        queueWorkspacePageIdleAction(workspace_page, .save);
     }
 
     fn closeContextWorkspace(self: *Self) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idleCloseWorkspacePage, workspace_page);
+        const workspace_page = self.getContextMenuWorkspacePage() orelse return;
+        queueWorkspacePageIdleAction(workspace_page, .close);
     }
 
     fn revealContextWorkspaceSnapshot(self: *Self) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idleRevealWorkspaceSnapshot, workspace_page);
+        const workspace_page = self.getContextMenuWorkspacePage() orelse return;
+        queueWorkspacePageIdleAction(workspace_page, .reveal_snapshot);
     }
 
     fn openContextWorkspaceSnapshot(self: *Self) void {
-        const priv = self.private();
-        const page = priv.context_menu_page orelse return;
-        const child = page.getChild();
-        const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idleOpenWorkspaceSnapshot, workspace_page);
+        const workspace_page = self.getContextMenuWorkspacePage() orelse return;
+        queueWorkspacePageIdleAction(workspace_page, .open_snapshot);
     }
 
     fn getOrCreateCommandPalette(self: *Window) *CommandPalette {
@@ -3410,8 +3413,7 @@ pub const Window = extern struct {
         self: *Window,
     ) callconv(.c) void {
         const workspace_page = self.getSelectedWorkspacePage() orelse return;
-        _ = workspace_page.ref();
-        _ = glib.idleAdd(idlePromptWorkspaceTitle, workspace_page);
+        queueWorkspacePageIdleAction(workspace_page, .prompt_title);
     }
 
     fn actionPromptSurfaceTitle(

@@ -6,6 +6,7 @@ const gtk = @import("gtk");
 const internal_os = @import("../../os/main.zig");
 const Application = @import("class/application.zig").Application;
 const gtk_window = @import("class/window.zig");
+const workspace_control_protocol = @import("../workspace_control_protocol.zig");
 const workspace_ids = @import("workspace_ids.zig");
 const workspace_restore = @import("workspace_restore.zig");
 const workspace_snapshot = @import("workspace_snapshot.zig");
@@ -18,51 +19,8 @@ pub const initial_response_json =
     \\{"ok":false,"error":{"code":"not_ready","message":"workspace-control has not handled a request yet"}}
 ;
 
-pub const FocusBehavior = enum {
-    no_focus_change,
-    may_change_focus,
-};
-
-pub const Method = enum {
-    workspace_list,
-    workspace_open,
-    workspace_save,
-    workspace_restore,
-    session_list,
-    session_focus,
-    session_split,
-    session_close,
-
-    pub fn parse(value: []const u8) ?Method {
-        inline for (std.meta.fields(Method)) |field| {
-            const method: Method = @enumFromInt(field.value);
-            if (std.mem.eql(u8, value, method.name())) return method;
-        }
-        return null;
-    }
-
-    pub fn name(self: Method) []const u8 {
-        return switch (self) {
-            .workspace_list => "workspace.list",
-            .workspace_open => "workspace.open",
-            .workspace_save => "workspace.save",
-            .workspace_restore => "workspace.restore",
-            .session_list => "session.list",
-            .session_focus => "session.focus",
-            .session_split => "session.split",
-            .session_close => "session.close",
-        };
-    }
-
-    pub fn focusBehavior(self: Method) FocusBehavior {
-        return switch (self) {
-            .workspace_open,
-            .session_focus,
-            => .may_change_focus,
-            else => .no_focus_change,
-        };
-    }
-};
+pub const FocusBehavior = workspace_control_protocol.FocusBehavior;
+pub const Method = workspace_control_protocol.Method;
 
 pub const DispatchMetadata = struct {
     method: ?Method = null,
@@ -73,6 +31,38 @@ pub const DispatchResult = struct {
     metadata: DispatchMetadata = .{},
     response_json: []u8,
 };
+
+fn dispatchMetadata(method: Method) DispatchMetadata {
+    return .{
+        .method = method,
+        .focus_behavior = method.focusBehavior(),
+    };
+}
+
+fn successResult(
+    alloc: std.mem.Allocator,
+    id: ?[]const u8,
+    method: Method,
+    result_json: []const u8,
+) !DispatchResult {
+    return .{
+        .metadata = dispatchMetadata(method),
+        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
+    };
+}
+
+fn errorResult(
+    alloc: std.mem.Allocator,
+    id: ?[]const u8,
+    method: Method,
+    code: []const u8,
+    message: []const u8,
+) !DispatchResult {
+    return .{
+        .metadata = dispatchMetadata(method),
+        .response_json = try encodeErrorResponseAlloc(alloc, id, code, message),
+    };
+}
 
 const LoadedWorkspaceSnapshot = struct {
     catalog: workspace_snapshot.CatalogEntry,
@@ -90,24 +80,7 @@ pub fn encodeRequestAlloc(
     method: Method,
     params_json: []const u8,
 ) ![]u8 {
-    try expectJsonObject(params_json);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{");
-    if (id) |value| {
-        try out.writer.writeAll("\"id\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
-        try out.writer.writeAll(",");
-    }
-    try out.writer.writeAll("\"method\":");
-    try std.json.Stringify.value(method.name(), .{}, &out.writer);
-    try out.writer.writeAll(",\"params\":");
-    try out.writer.writeAll(params_json);
-    try out.writer.writeAll("}");
-
-    return out.toOwnedSlice();
+    return workspace_control_protocol.encodeRequestAlloc(alloc, id, method, params_json);
 }
 
 pub fn dispatchAlloc(
@@ -396,10 +369,7 @@ fn dispatchWorkspaceList(alloc: std.mem.Allocator, id: ?[]const u8, method: Meth
 
     const result_json = try encodeWorkspaceListResultAlloc(alloc, workspaces.items);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchSessionList(
@@ -425,15 +395,7 @@ fn dispatchSessionList(
             break :sessions result;
         }
 
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "workspace target could not be resolved",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_found", "workspace target could not be resolved");
     };
     defer {
         for (sessions) |session| session.deinit(alloc);
@@ -442,10 +404,7 @@ fn dispatchSessionList(
 
     const result_json = try encodeSessionListResultAlloc(alloc, sessions);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchWorkspaceOpen(
@@ -462,15 +421,7 @@ fn dispatchWorkspaceOpen(
     const preferred = preferredWorkspaceControlWindow();
 
     if (preferred == null) {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_ready",
-                "no Ghostty window is available for workspace control",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace control");
     }
 
     const result = result: {
@@ -482,15 +433,7 @@ fn dispatchWorkspaceOpen(
         }
 
         if (!create) {
-            return .{
-                .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-                .response_json = try encodeErrorResponseAlloc(
-                    alloc,
-                    id,
-                    "not_found",
-                    "workspace target could not be resolved",
-                ),
-            };
+            return errorResult(alloc, id, method, "not_found", "workspace target could not be resolved");
         }
 
         break :result gtk_window.workspaceControlOpen(preferred.?, workspace, true) catch |err| switch (err) {
@@ -501,10 +444,7 @@ fn dispatchWorkspaceOpen(
 
     const result_json = try encodeWorkspaceOpenResultAlloc(alloc, result);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchWorkspaceSave(
@@ -517,15 +457,7 @@ fn dispatchWorkspaceSave(
     const windows = try workspaceControlWindowsAlloc(alloc);
     defer alloc.free(windows);
     if (windows.len == 0) {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_ready",
-                "no Ghostty window is available for workspace control",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace control");
     }
 
     const resolved = result: {
@@ -535,27 +467,11 @@ fn dispatchWorkspaceSave(
             }
         }
 
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "workspace target could not be resolved",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_found", "workspace target could not be resolved");
     };
 
     const saved = gtk_window.saveWorkspaceAlloc(resolved.window, alloc, resolved.workspace_page) catch |err| switch (err) {
-        error.WorkspaceNotFound => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "workspace target could not be resolved",
-            ),
-        },
+        error.WorkspaceNotFound => return errorResult(alloc, id, method, "not_found", "workspace target could not be resolved"),
         else => return err,
     };
     defer saved.deinit(alloc);
@@ -567,10 +483,7 @@ fn dispatchWorkspaceSave(
         .path = saved.path,
     });
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchWorkspaceRestore(
@@ -582,98 +495,26 @@ fn dispatchWorkspaceRestore(
     const workspace = try requireStringParam(params, "workspace");
 
     var loaded = loadWorkspaceSnapshotForControlAlloc(alloc, workspace) catch |err| switch (err) {
-        error.WorkspaceNotFound => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "workspace target could not be resolved",
-            ),
-        },
-        error.NotRestorable => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_restorable",
-                "workspace target has no saved snapshot to restore",
-            ),
-        },
-        error.FileNotFound => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_restorable",
-                "workspace snapshot could not be found on disk",
-            ),
-        },
-        else => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "restore_invalid",
-                "workspace snapshot is invalid or could not be loaded",
-            ),
-        },
+        error.WorkspaceNotFound => return errorResult(alloc, id, method, "not_found", "workspace target could not be resolved"),
+        error.NotRestorable => return errorResult(alloc, id, method, "not_restorable", "workspace target has no saved snapshot to restore"),
+        error.FileNotFound => return errorResult(alloc, id, method, "not_restorable", "workspace snapshot could not be found on disk"),
+        else => return errorResult(alloc, id, method, "restore_invalid", "workspace snapshot is invalid or could not be loaded"),
     };
     defer loaded.deinit(alloc);
 
     var plan = workspace_restore.planAlloc(alloc, loaded.snapshot) catch {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "restore_invalid",
-                "workspace snapshot is invalid or cannot be planned for restore",
-            ),
-        };
+        return errorResult(alloc, id, method, "restore_invalid", "workspace snapshot is invalid or cannot be planned for restore");
     };
     defer plan.deinit(alloc);
 
-    const window = preferredWorkspaceControlWindow() orelse return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeErrorResponseAlloc(
-            alloc,
-            id,
-            "not_ready",
-            "no Ghostty window is available for workspace restore",
-        ),
-    };
+    const window = preferredWorkspaceControlWindow() orelse return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace restore");
 
     const results = gtk_window.workspaceControlRestoreAlloc(window, alloc, loaded.snapshot, &plan) catch |err| switch (err) {
-        error.TabMultiSessionUnsupported => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_supported",
-                "workspace restore does not yet support multiple sessions inside a single split-local tab",
-            ),
-        },
-        error.WorkspaceSessionEnvUnsupported => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_supported",
-                "workspace restore does not yet support per-session environment overrides",
-            ),
-        },
+        error.TabMultiSessionUnsupported => return errorResult(alloc, id, method, "not_supported", "workspace restore does not yet support multiple sessions inside a single split-local tab"),
+        error.WorkspaceSessionEnvUnsupported => return errorResult(alloc, id, method, "not_supported", "workspace restore does not yet support per-session environment overrides"),
         error.WorkspaceLayoutMissing,
         error.WorkspaceLayoutInvalid,
-        => return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "restore_invalid",
-                "workspace snapshot is missing a valid top-level layout root",
-            ),
-        },
+        => return errorResult(alloc, id, method, "restore_invalid", "workspace snapshot is missing a valid top-level layout root"),
         else => return err,
     };
     defer {
@@ -688,10 +529,7 @@ fn dispatchWorkspaceRestore(
 
     const result_json = try encodeWorkspaceRestoreResultAlloc(alloc, results);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchSessionFocus(
@@ -704,15 +542,7 @@ fn dispatchSessionFocus(
     const windows = try workspaceControlWindowsAlloc(alloc);
     defer alloc.free(windows);
     if (windows.len == 0) {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_ready",
-                "no Ghostty window is available for workspace control",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace control");
     }
 
     const result = result: {
@@ -723,23 +553,12 @@ fn dispatchSessionFocus(
             };
         }
 
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "session target could not be resolved",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_found", "session target could not be resolved");
     };
 
     const result_json = try encodeSessionFocusResultAlloc(alloc, result);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchSessionSplit(
@@ -757,15 +576,7 @@ fn dispatchSessionSplit(
     const windows = try workspaceControlWindowsAlloc(alloc);
     defer alloc.free(windows);
     if (windows.len == 0) {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_ready",
-                "no Ghostty window is available for workspace control",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace control");
     }
 
     const result = result: {
@@ -781,23 +592,12 @@ fn dispatchSessionSplit(
             };
         }
 
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "session target could not be resolved",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_found", "session target could not be resolved");
     };
 
     const result_json = try encodeSessionSplitResultAlloc(alloc, result);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn dispatchSessionClose(
@@ -810,15 +610,7 @@ fn dispatchSessionClose(
     const windows = try workspaceControlWindowsAlloc(alloc);
     defer alloc.free(windows);
     if (windows.len == 0) {
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_ready",
-                "no Ghostty window is available for workspace control",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace control");
     }
 
     const result = result: {
@@ -829,23 +621,12 @@ fn dispatchSessionClose(
             };
         }
 
-        return .{
-            .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-            .response_json = try encodeErrorResponseAlloc(
-                alloc,
-                id,
-                "not_found",
-                "session target could not be resolved",
-            ),
-        };
+        return errorResult(alloc, id, method, "not_found", "session target could not be resolved");
     };
 
     const result_json = try encodeSessionCloseResultAlloc(alloc, result);
     defer alloc.free(result_json);
-    return .{
-        .metadata = .{ .method = method, .focus_behavior = method.focusBehavior() },
-        .response_json = try encodeSuccessResponseAlloc(alloc, id, result_json),
-    };
+    return successResult(alloc, id, method, result_json);
 }
 
 fn preferredWorkspaceControlWindow() ?*gtk_window.Window {
