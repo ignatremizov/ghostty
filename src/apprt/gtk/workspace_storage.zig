@@ -39,17 +39,7 @@ pub const Storage = struct {
         const final_name = try self.checkpointFilenameAlloc(workspace_key);
         errdefer self.allocator.free(final_name);
 
-        const temp_name = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{final_name});
-        defer self.allocator.free(temp_name);
-
-        {
-            const file = try self.dir.createFile(temp_name, .{ .truncate = true, .read = true });
-            defer file.close();
-            try file.writeAll(data);
-            try file.sync();
-        }
-
-        try self.dir.rename(temp_name, final_name);
+        try self.writeAtomicFileAlloc(final_name, data);
         return final_name;
     }
 
@@ -147,6 +137,10 @@ pub const Storage = struct {
         const data = try value.encodeAlloc(self.allocator);
         defer self.allocator.free(data);
 
+        try self.writeAtomicFileAlloc(filename, data);
+    }
+
+    fn writeAtomicFileAlloc(self: Storage, filename: []const u8, data: []const u8) !void {
         const temp_name = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{filename});
         defer self.allocator.free(temp_name);
 

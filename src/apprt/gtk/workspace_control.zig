@@ -920,98 +920,145 @@ fn parseWorkspaceControlWorkspaceRef(value: []const u8) ?workspace_ids.Workspace
     };
 }
 
-fn writeWorkspaceControlShortRef(
-    writer: anytype,
-    prefix: []const u8,
-    raw: u64,
-) !void {
-    try writer.print("{s}:{d}", .{ prefix, raw });
+fn encodeJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: anytype,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
-fn writeWorkspaceControlCanonicalId(
-    writer: anytype,
-    value: anytype,
-) !void {
-    var buf: [32]u8 = undefined;
-    try writer.writeAll(try value.format(&buf));
+fn allocWorkspaceControlShortRef(
+    alloc: std.mem.Allocator,
+    prefix: []const u8,
+    raw: u64,
+) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}:{d}", .{ prefix, raw });
 }
+
+fn allocWorkspaceControlCanonicalId(
+    alloc: std.mem.Allocator,
+    value: anytype,
+) ![]u8 {
+    var buf: [32]u8 = undefined;
+    return alloc.dupe(u8, try value.format(&buf));
+}
+
+fn allocOptionalWorkspaceControlCanonicalId(
+    alloc: std.mem.Allocator,
+    value: anytype,
+) !?[]u8 {
+    if (value) |id| return try allocWorkspaceControlCanonicalId(alloc, id);
+    return null;
+}
+
+const WorkspaceListEntryJson = struct {
+    id: []const u8,
+    workspace_id: []const u8,
+    name: []const u8,
+    window_id: ?[]const u8,
+    selected_session_id: ?[]const u8,
+    session_count: usize,
+    unread_count: usize,
+    has_attention: bool,
+    selected: bool,
+    restorable: bool,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        workspace: gtk_window.WorkspaceControlWorkspace,
+    ) !WorkspaceListEntryJson {
+        return .{
+            .id = try allocWorkspaceControlShortRef(alloc, "workspace", workspace.workspace_id.raw()),
+            .workspace_id = try allocWorkspaceControlCanonicalId(alloc, workspace.workspace_id),
+            .name = workspace.name,
+            .window_id = try allocOptionalWorkspaceControlCanonicalId(alloc, workspace.selected_window_id),
+            .selected_session_id = try allocOptionalWorkspaceControlCanonicalId(alloc, workspace.selected_session_id),
+            .session_count = workspace.session_count,
+            .unread_count = workspace.unread_count,
+            .has_attention = workspace.has_attention,
+            .selected = workspace.selected,
+            .restorable = workspace.restorable,
+        };
+    }
+
+    fn deinit(self: WorkspaceListEntryJson, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.workspace_id);
+        if (self.window_id) |window_id| alloc.free(window_id);
+        if (self.selected_session_id) |session_id| alloc.free(session_id);
+    }
+};
+
+const WorkspaceListResultJson = struct {
+    workspaces: []const WorkspaceListEntryJson,
+};
 
 fn encodeWorkspaceListResultAlloc(
     alloc: std.mem.Allocator,
     workspaces: []const gtk_window.WorkspaceControlWorkspace,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"workspaces\":[");
-    for (workspaces, 0..) |workspace, index| {
-        if (index != 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"id\":\"");
-        try writeWorkspaceControlShortRef(&out.writer, "workspace", workspace.workspace_id.raw());
-        try out.writer.writeAll("\",\"workspace_id\":\"");
-        try writeWorkspaceControlCanonicalId(&out.writer, workspace.workspace_id);
-        try out.writer.writeAll("\",\"name\":");
-        try std.json.Stringify.value(workspace.name, .{}, &out.writer);
-        try out.writer.writeAll(",\"window_id\":");
-        if (workspace.selected_window_id) |window_id| {
-            try out.writer.writeByte('"');
-            try writeWorkspaceControlCanonicalId(&out.writer, window_id);
-            try out.writer.writeByte('"');
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.writeAll(",\"selected_session_id\":");
-        if (workspace.selected_session_id) |session_id| {
-            try out.writer.writeByte('"');
-            try writeWorkspaceControlCanonicalId(&out.writer, session_id);
-            try out.writer.writeByte('"');
-        } else {
-            try out.writer.writeAll("null");
-        }
-        try out.writer.print(",\"session_count\":{d},\"unread_count\":{d},\"has_attention\":{},\"selected\":{},\"restorable\":{}", .{
-            workspace.session_count,
-            workspace.unread_count,
-            workspace.has_attention,
-            workspace.selected,
-            workspace.restorable,
-        });
-        try out.writer.writeAll("}");
+    const entries = try alloc.alloc(WorkspaceListEntryJson, workspaces.len);
+    errdefer alloc.free(entries);
+    var initialized: usize = 0;
+    defer {
+        for (entries[0..initialized]) |entry| entry.deinit(alloc);
+        alloc.free(entries);
     }
-    try out.writer.writeAll("]}");
-    return out.toOwnedSlice();
+
+    for (workspaces, 0..) |workspace, index| {
+        entries[index] = try WorkspaceListEntryJson.init(alloc, workspace);
+        initialized += 1;
+    }
+
+    return encodeJsonAlloc(alloc, WorkspaceListResultJson{
+        .workspaces = entries,
+    });
 }
+
+const WorkspaceOpenWorkspaceJson = struct {
+    id: []const u8,
+    workspace_id: []const u8,
+    name: []const u8,
+    window_id: ?[]const u8,
+    selected_session_id: ?[]const u8,
+
+    fn init(
+        alloc: std.mem.Allocator,
+        result: gtk_window.WorkspaceControlOpenResult,
+    ) !WorkspaceOpenWorkspaceJson {
+        return .{
+            .id = try allocWorkspaceControlShortRef(alloc, "workspace", result.workspace_id.raw()),
+            .workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id),
+            .name = result.name,
+            .window_id = try allocOptionalWorkspaceControlCanonicalId(alloc, result.selected_window_id),
+            .selected_session_id = try allocOptionalWorkspaceControlCanonicalId(alloc, result.selected_session_id),
+        };
+    }
+
+    fn deinit(self: WorkspaceOpenWorkspaceJson, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.workspace_id);
+        if (self.window_id) |window_id| alloc.free(window_id);
+        if (self.selected_session_id) |session_id| alloc.free(session_id);
+    }
+};
+
+const WorkspaceOpenResultJson = struct {
+    workspace: WorkspaceOpenWorkspaceJson,
+};
 
 fn encodeWorkspaceOpenResultAlloc(
     alloc: std.mem.Allocator,
     result: gtk_window.WorkspaceControlOpenResult,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    try out.writer.writeAll("{\"workspace\":{\"id\":\"");
-    try writeWorkspaceControlShortRef(&out.writer, "workspace", result.workspace_id.raw());
-    try out.writer.writeAll("\",\"workspace_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.workspace_id);
-    try out.writer.writeAll("\",\"name\":");
-    try std.json.Stringify.value(result.name, .{}, &out.writer);
-    try out.writer.writeAll(",\"window_id\":");
-    if (result.selected_window_id) |window_id| {
-        try out.writer.writeByte('"');
-        try writeWorkspaceControlCanonicalId(&out.writer, window_id);
-        try out.writer.writeByte('"');
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"selected_session_id\":");
-    if (result.selected_session_id) |session_id| {
-        try out.writer.writeByte('"');
-        try writeWorkspaceControlCanonicalId(&out.writer, session_id);
-        try out.writer.writeByte('"');
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll("}}");
-    return out.toOwnedSlice();
+    const workspace = try WorkspaceOpenWorkspaceJson.init(alloc, result);
+    defer workspace.deinit(alloc);
+    return encodeJsonAlloc(alloc, WorkspaceOpenResultJson{
+        .workspace = workspace,
+    });
 }
 
 const WorkspaceSaveResult = struct {
@@ -1025,111 +1072,176 @@ fn encodeWorkspaceSaveResultAlloc(
     alloc: std.mem.Allocator,
     result: WorkspaceSaveResult,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    const Json = struct {
+        const WorkspaceJson = struct {
+            id: []const u8,
+            workspace_id: []const u8,
+            snapshot_id: []const u8,
+            saved_at: []const u8,
+            path: []const u8,
 
-    try out.writer.writeAll("{\"workspace\":{\"id\":\"");
-    try writeWorkspaceControlShortRef(&out.writer, "workspace", result.workspace_id.raw());
-    try out.writer.writeAll("\",\"workspace_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.workspace_id);
-    try out.writer.writeAll("\",\"snapshot_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.snapshot_id);
-    try out.writer.writeAll("\",\"saved_at\":");
-    try std.json.Stringify.value(result.saved_at, .{}, &out.writer);
-    try out.writer.writeAll(",\"path\":");
-    try std.json.Stringify.value(result.path, .{}, &out.writer);
-    try out.writer.writeAll("}}");
-    return out.toOwnedSlice();
+            fn deinit(self: @This(), alloc_inner: std.mem.Allocator) void {
+                alloc_inner.free(self.id);
+                alloc_inner.free(self.workspace_id);
+                alloc_inner.free(self.snapshot_id);
+            }
+        };
+
+        workspace: WorkspaceJson,
+    };
+
+    const workspace = Json.WorkspaceJson{
+        .id = try allocWorkspaceControlShortRef(alloc, "workspace", result.workspace_id.raw()),
+        .workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id),
+        .snapshot_id = try allocWorkspaceControlCanonicalId(alloc, result.snapshot_id),
+        .saved_at = result.saved_at,
+        .path = result.path,
+    };
+    defer workspace.deinit(alloc);
+
+    return encodeJsonAlloc(alloc, Json{
+        .workspace = workspace,
+    });
 }
 
 fn encodeSessionListResultAlloc(
     alloc: std.mem.Allocator,
     sessions: []const gtk_window.WorkspaceControlSession,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    const SessionListEntryJson = struct {
+        id: []const u8,
+        session_id: []const u8,
+        workspace_id: []const u8,
+        tab_id: []const u8,
+        title: []const u8,
+        cwd: []const u8,
+        focused: bool,
+        unread: bool,
+        has_attention: bool,
 
-    try out.writer.writeAll("{\"sessions\":[");
-    for (sessions, 0..) |session, index| {
-        if (index != 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"id\":\"");
-        try writeWorkspaceControlShortRef(&out.writer, "session", session.session_id.raw());
-        try out.writer.writeAll("\",\"session_id\":\"");
-        try writeWorkspaceControlCanonicalId(&out.writer, session.session_id);
-        try out.writer.writeAll("\",\"workspace_id\":\"");
-        try writeWorkspaceControlCanonicalId(&out.writer, session.workspace_id);
-        try out.writer.writeAll("\",\"tab_id\":\"");
-        try writeWorkspaceControlCanonicalId(&out.writer, session.tab_id);
-        try out.writer.writeAll("\",\"title\":");
-        try std.json.Stringify.value(session.title, .{}, &out.writer);
-        try out.writer.writeAll(",\"cwd\":");
-        try std.json.Stringify.value(session.cwd, .{}, &out.writer);
-        try out.writer.print(",\"focused\":{},\"unread\":{},\"has_attention\":{}", .{
-            session.focused,
-            session.unread,
-            session.has_attention,
-        });
-        try out.writer.writeAll("}");
+        fn init(
+            alloc_inner: std.mem.Allocator,
+            session: gtk_window.WorkspaceControlSession,
+        ) !@This() {
+            return .{
+                .id = try allocWorkspaceControlShortRef(alloc_inner, "session", session.session_id.raw()),
+                .session_id = try allocWorkspaceControlCanonicalId(alloc_inner, session.session_id),
+                .workspace_id = try allocWorkspaceControlCanonicalId(alloc_inner, session.workspace_id),
+                .tab_id = try allocWorkspaceControlCanonicalId(alloc_inner, session.tab_id),
+                .title = session.title,
+                .cwd = session.cwd,
+                .focused = session.focused,
+                .unread = session.unread,
+                .has_attention = session.has_attention,
+            };
+        }
+
+        fn deinit(self: @This(), alloc_inner: std.mem.Allocator) void {
+            alloc_inner.free(self.id);
+            alloc_inner.free(self.session_id);
+            alloc_inner.free(self.workspace_id);
+            alloc_inner.free(self.tab_id);
+        }
+    };
+    const SessionListResultJson = struct {
+        sessions: []const SessionListEntryJson,
+    };
+
+    const entries = try alloc.alloc(SessionListEntryJson, sessions.len);
+    errdefer alloc.free(entries);
+    var initialized: usize = 0;
+    defer {
+        for (entries[0..initialized]) |entry| entry.deinit(alloc);
+        alloc.free(entries);
     }
-    try out.writer.writeAll("]}");
-    return out.toOwnedSlice();
+
+    for (sessions, 0..) |session, index| {
+        entries[index] = try SessionListEntryJson.init(alloc, session);
+        initialized += 1;
+    }
+
+    return encodeJsonAlloc(alloc, SessionListResultJson{
+        .sessions = entries,
+    });
 }
 
 fn encodeSessionFocusResultAlloc(
     alloc: std.mem.Allocator,
     result: gtk_window.WorkspaceControlFocusResult,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    const Json = struct {
+        focused_session_id: []const u8,
+        tab_id: []const u8,
+        window_id: []const u8,
 
-    try out.writer.writeAll("{\"focused_session_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.focused_session_id);
-    try out.writer.writeAll("\",\"tab_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.tab_id);
-    try out.writer.writeAll("\",\"window_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.window_id);
-    try out.writer.writeAll("\"}");
-    return out.toOwnedSlice();
+        fn deinit(self: @This(), alloc_inner: std.mem.Allocator) void {
+            alloc_inner.free(self.focused_session_id);
+            alloc_inner.free(self.tab_id);
+            alloc_inner.free(self.window_id);
+        }
+    };
+
+    const json = Json{
+        .focused_session_id = try allocWorkspaceControlCanonicalId(alloc, result.focused_session_id),
+        .tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id),
+        .window_id = try allocWorkspaceControlCanonicalId(alloc, result.window_id),
+    };
+    defer json.deinit(alloc);
+
+    return encodeJsonAlloc(alloc, json);
 }
 
 fn encodeSessionSplitResultAlloc(
     alloc: std.mem.Allocator,
     result: gtk_window.WorkspaceControlSplitResult,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    const Json = struct {
+        session_id: []const u8,
+        workspace_id: []const u8,
+        tab_id: []const u8,
 
-    try out.writer.writeAll("{\"session_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.session_id);
-    try out.writer.writeAll("\",\"workspace_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.workspace_id);
-    try out.writer.writeAll("\",\"tab_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.tab_id);
-    try out.writer.writeAll("\"}");
-    return out.toOwnedSlice();
+        fn deinit(self: @This(), alloc_inner: std.mem.Allocator) void {
+            alloc_inner.free(self.session_id);
+            alloc_inner.free(self.workspace_id);
+            alloc_inner.free(self.tab_id);
+        }
+    };
+
+    const json = Json{
+        .session_id = try allocWorkspaceControlCanonicalId(alloc, result.session_id),
+        .workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id),
+        .tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id),
+    };
+    defer json.deinit(alloc);
+
+    return encodeJsonAlloc(alloc, json);
 }
 
 fn encodeSessionCloseResultAlloc(
     alloc: std.mem.Allocator,
     result: gtk_window.WorkspaceControlCloseResult,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
+    const Json = struct {
+        closed_session_id: []const u8,
 
-    try out.writer.writeAll("{\"closed_session_id\":\"");
-    try writeWorkspaceControlCanonicalId(&out.writer, result.closed_session_id);
-    try out.writer.writeAll("\"}");
-    return out.toOwnedSlice();
+        fn deinit(self: @This(), alloc_inner: std.mem.Allocator) void {
+            alloc_inner.free(self.closed_session_id);
+        }
+    };
+
+    const json = Json{
+        .closed_session_id = try allocWorkspaceControlCanonicalId(alloc, result.closed_session_id),
+    };
+    defer json.deinit(alloc);
+
+    return encodeJsonAlloc(alloc, json);
 }
 
 fn encodeWorkspaceRestoreResultAlloc(
     alloc: std.mem.Allocator,
     result: @import("workspace_model.zig").RestoreResults,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(result, .{}, &out.writer);
-    return out.toOwnedSlice();
+    return encodeJsonAlloc(alloc, result);
 }
 
 fn parseEnvelopeIdAlloc(alloc: std.mem.Allocator, json: []const u8) !?[]u8 {
