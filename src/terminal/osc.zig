@@ -305,15 +305,23 @@ pub const Parser = struct {
         id_len: usize = 0,
         title_len: usize = 0,
         body_len: usize = 0,
+        title_seen: bool = false,
+        body_seen: bool = false,
+        title_base64: bool = false,
+        body_base64: bool = false,
         id: [64]u8 = undefined,
-        title: [MAX_BUF]u8 = undefined,
-        body: [MAX_BUF]u8 = undefined,
+        title: [MAX_BUF + 1]u8 = undefined,
+        body: [MAX_BUF + 1]u8 = undefined,
 
         pub fn reset(self: *KittyNotificationPending) void {
             self.active = false;
             self.id_len = 0;
             self.title_len = 0;
             self.body_len = 0;
+            self.title_seen = false;
+            self.body_seen = false;
+            self.title_base64 = false;
+            self.body_base64 = false;
         }
 
         pub fn idSlice(self: *const KittyNotificationPending) []const u8 {
@@ -740,7 +748,7 @@ pub const Parser = struct {
             },
 
             .@"9" => switch (c) {
-                ';' => self.writeToFixed(),
+                ';' => self.captureTrailing(.fixed),
                 '9' => self.state = .@"99",
                 else => self.state = .invalid,
             },
@@ -778,9 +786,13 @@ pub const Parser = struct {
             .@"22",
             .@"777",
             .@"8",
-            .@"99",
             => switch (c) {
                 ';' => self.captureTrailing(.fixed),
+                else => self.state = .invalid,
+            },
+
+            .@"99" => switch (c) {
+                ';' => self.captureTrailing(.allocating),
                 else => self.state = .invalid,
             },
         }
