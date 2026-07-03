@@ -298,3 +298,92 @@ test "restore selection fallback stays inside the selected window when a split i
     try testing.expectEqual(model.SelectionFallbackReason.selected_split_missing, finalized.selection.fallback_reason.?);
     try testing.expectEqualStrings("selected_split_missing", finalized.results.selection_fallback.?.reason);
 }
+
+test "restore selection fallback chooses the first surviving window when the selected window is missing" {
+    const testing = std.testing;
+
+    var value = buildSplitAwareSnapshot();
+    value.workspace.selected_window_id = ids.WindowId.init(99);
+
+    const plan = try restore.planAlloc(testing.allocator, value);
+    defer plan.deinit(testing.allocator);
+
+    const finalized = try restore.finalizeAlloc(testing.allocator, &plan, &.{
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(41),
+            .window_id = ids.WindowId.init(9),
+            .split_id = ids.SplitId.init(19),
+            .tab_id = ids.TabId.init(5),
+        } },
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(42),
+            .window_id = ids.WindowId.init(9),
+            .split_id = ids.SplitId.init(19),
+            .tab_id = ids.TabId.init(5),
+        } },
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(43),
+            .window_id = ids.WindowId.init(9),
+            .split_id = ids.SplitId.init(19),
+            .tab_id = ids.TabId.init(7),
+        } },
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(44),
+            .window_id = ids.WindowId.init(10),
+            .split_id = ids.SplitId.init(20),
+            .tab_id = ids.TabId.init(8),
+        } },
+    });
+    defer finalized.deinit(testing.allocator);
+
+    try testing.expectEqual(ids.WindowId.init(9), finalized.selection.window_id.?);
+    try testing.expectEqual(ids.SplitId.init(19), finalized.selection.split_id.?);
+    try testing.expectEqual(ids.TabId.init(5), finalized.selection.tab_id.?);
+    try testing.expectEqual(ids.SessionId.init(41), finalized.selection.session_id.?);
+    try testing.expectEqual(model.SelectionFallbackReason.selected_window_missing, finalized.selection.fallback_reason.?);
+    try testing.expectEqualStrings("selected_window_missing", finalized.results.selection_fallback.?.reason);
+}
+
+test "restore selection fallback keeps scope and reports selected tab missing" {
+    const testing = std.testing;
+
+    var value = buildSplitAwareSnapshot();
+    value.workspace.selected_tab_id = ids.TabId.init(7);
+    value.workspace.selected_session_id = ids.SessionId.init(43);
+
+    const plan = try restore.planAlloc(testing.allocator, value);
+    defer plan.deinit(testing.allocator);
+
+    const finalized = try restore.finalizeAlloc(testing.allocator, &plan, &.{
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(41),
+            .window_id = ids.WindowId.init(9),
+            .split_id = ids.SplitId.init(19),
+            .tab_id = ids.TabId.init(5),
+        } },
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(42),
+            .window_id = ids.WindowId.init(9),
+            .split_id = ids.SplitId.init(19),
+            .tab_id = ids.TabId.init(5),
+        } },
+        .{ .failed = .{
+            .session_id = ids.SessionId.init(43),
+            .code = .command_missing,
+        } },
+        .{ .restored = .{
+            .session_id = ids.SessionId.init(44),
+            .window_id = ids.WindowId.init(10),
+            .split_id = ids.SplitId.init(20),
+            .tab_id = ids.TabId.init(8),
+        } },
+    });
+    defer finalized.deinit(testing.allocator);
+
+    try testing.expectEqual(ids.WindowId.init(9), finalized.selection.window_id.?);
+    try testing.expectEqual(ids.SplitId.init(19), finalized.selection.split_id.?);
+    try testing.expectEqual(ids.TabId.init(5), finalized.selection.tab_id.?);
+    try testing.expectEqual(ids.SessionId.init(41), finalized.selection.session_id.?);
+    try testing.expectEqual(model.SelectionFallbackReason.selected_tab_missing, finalized.selection.fallback_reason.?);
+    try testing.expectEqualStrings("selected_tab_missing", finalized.results.selection_fallback.?.reason);
+}

@@ -350,6 +350,14 @@ pub const WorkspacePage = extern struct {
         return self.private().sidebar_title;
     }
 
+    pub fn setSidebarTitle(self: *Self, title: ?[:0]const u8) void {
+        const priv = self.private();
+        if (priv.sidebar_title) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.sidebar_title = null;
+        if (title) |v| priv.sidebar_title = glib.ext.dupeZ(u8, v);
+        self.as(gobject.Object).notifyByPspec(properties.@"sidebar-title".impl.param_spec);
+    }
+
     pub fn getSidebarSubtitle(self: *Self) ?[:0]const u8 {
         return self.private().sidebar_subtitle;
     }

@@ -649,6 +649,10 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // Stop the runloop first so teardown can't get stuck waiting for a
+        // later state transition after window destruction has already begun.
+        self.private().running = false;
+
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -667,13 +671,12 @@ pub const Application = extern struct {
                 // tries to free on its own. I think this is probably a bug in
                 // the fcitx ime widget but still, we don't want a double free!
                 if (gobject.ext.isA(window, Window)) {
+                    const ghostty_window = gobject.ext.cast(Window, window).?;
+                    ghostty_window.autosaveAllWorkspacesOnShutdown();
                     window.destroy();
                 }
             }
         }.callback, null);
-
-        // Trigger our runloop exit.
-        self.private().running = false;
     }
 
     /// apprt API to perform an action.

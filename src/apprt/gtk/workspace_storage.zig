@@ -16,17 +16,27 @@ pub const Storage = struct {
         };
     }
 
-    pub fn snapshotFilenameAlloc(self: Storage, snapshot_id: ids.SnapshotId) ![]u8 {
-        var buf: [48]u8 = undefined;
-        const id_text = try snapshot_id.format(&buf);
-        return std.fmt.allocPrint(self.allocator, "{s}.json", .{id_text});
+    pub fn checkpointFilenameAlloc(self: Storage, workspace_key: []const u8) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        for (workspace_key) |c| {
+            switch (c) {
+                'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => try buf.append(self.allocator, c),
+                else => try buf.append(self.allocator, '_'),
+            }
+        }
+
+        if (buf.items.len == 0) return error.InvalidWorkspaceKey;
+        return std.fmt.allocPrint(self.allocator, "{s}.json", .{buf.items});
     }
 
     pub fn writeSnapshot(self: Storage, value: snapshot.Snapshot) ![]u8 {
         const data = try value.encodeAlloc(self.allocator);
         defer self.allocator.free(data);
 
-        const final_name = try self.snapshotFilenameAlloc(value.snapshot_id);
+        const workspace_key = value.workspace.workspace_key orelse return error.MissingWorkspaceKey;
+        const final_name = try self.checkpointFilenameAlloc(workspace_key);
         errdefer self.allocator.free(final_name);
 
         const temp_name = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{final_name});
@@ -53,21 +63,6 @@ pub const Storage = struct {
         const data = try self.dir.readFileAlloc(alloc, filename, std.math.maxInt(usize));
         defer alloc.free(data);
         return try snapshot.Catalog.decodeAlloc(alloc, data);
-    }
-
-    pub fn readWorkspaceKeyAlloc(
-        self: Storage,
-        alloc: std.mem.Allocator,
-        filename: []const u8,
-    ) ![]u8 {
-        const value = try self.readSnapshotAlloc(alloc, filename);
-        defer value.deinit(alloc);
-
-        if (value.workspace.workspace_key) |workspace_key| {
-            return try alloc.dupe(u8, workspace_key);
-        }
-
-        return try std.fmt.allocPrint(alloc, "legacy:{s}", .{filename});
     }
 
     pub fn writeCheckpoint(self: Storage, value: snapshot.Snapshot) ![]u8 {

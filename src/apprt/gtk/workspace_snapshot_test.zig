@@ -126,6 +126,7 @@ test "workspace snapshot encodes schema-shaped json" {
     try testing.expect(std.mem.indexOf(u8, encoded, "\"node_type\": \"tab-root\"") != null);
     try testing.expect(std.mem.indexOf(u8, encoded, "\"command\": [") != null);
     try testing.expect(std.mem.indexOf(u8, encoded, "\"env_overrides\": [") != null);
+    try testing.expect(std.mem.indexOf(u8, encoded, "\"scrollback\"") == null);
 }
 
 test "workspace snapshot round trips through storage" {
@@ -167,7 +168,7 @@ test "workspace catalog round trips through storage" {
             .workspace_key = "workspace-key-1",
             .workspace_name = "Developer Workspace",
             .saved_at = "2026-03-22T12:00:00Z",
-            .path = "snapshot-1.json",
+            .path = "workspace-key-1.json",
         }},
     };
 
@@ -180,7 +181,7 @@ test "workspace catalog round trips through storage" {
     try testing.expectEqual(@as(usize, 1), loaded.entries.len);
     try testing.expectEqual(ids.WorkspaceId.init(1), loaded.entries[0].workspace_id);
     try testing.expectEqualStrings("workspace-key-1", loaded.entries[0].workspace_key.?);
-    try testing.expectEqualStrings("snapshot-1.json", loaded.entries[0].path);
+    try testing.expectEqualStrings("workspace-key-1.json", loaded.entries[0].path);
 }
 
 test "workspace checkpoint updates latest catalog entry and prunes replaced snapshot" {
@@ -195,14 +196,14 @@ test "workspace checkpoint updates latest catalog entry and prunes replaced snap
     first_snapshot.saved_at = "2026-03-22T12:00:00Z";
     const first_filename = try storage.writeCheckpoint(first_snapshot);
     defer testing.allocator.free(first_filename);
-    try testing.expectEqualStrings("snapshot-1.json", first_filename);
+    try testing.expectEqualStrings("workspace-key-1.json", first_filename);
 
     var second_snapshot = buildSnapshot();
     second_snapshot.snapshot_id = ids.SnapshotId.init(2);
     second_snapshot.saved_at = "2026-03-22T12:30:00Z";
     const second_filename = try storage.writeCheckpoint(second_snapshot);
     defer testing.allocator.free(second_filename);
-    try testing.expectEqualStrings("snapshot-2.json", second_filename);
+    try testing.expectEqualStrings("workspace-key-1.json", second_filename);
 
     const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
     defer loaded.deinit(testing.allocator);
@@ -211,11 +212,10 @@ test "workspace checkpoint updates latest catalog entry and prunes replaced snap
     try testing.expectEqual(ids.SnapshotId.init(2), loaded.entries[0].snapshot_id);
     try testing.expectEqual(ids.WorkspaceId.init(1), loaded.entries[0].workspace_id);
     try testing.expectEqualStrings("workspace-key-1", loaded.entries[0].workspace_key.?);
-    try testing.expectEqualStrings("snapshot-2.json", loaded.entries[0].path);
+    try testing.expectEqualStrings("workspace-key-1.json", loaded.entries[0].path);
     try testing.expectEqualStrings("2026-03-22T12:30:00Z", loaded.entries[0].saved_at);
 
-    try testing.expectError(error.FileNotFound, tmp.dir.access("snapshot-1.json", .{}));
-    try tmp.dir.access("snapshot-2.json", .{});
+    try tmp.dir.access("workspace-key-1.json", .{});
 }
 
 test "workspace snapshot validates workspace-level split topology" {
@@ -324,6 +324,208 @@ test "workspace snapshot validates workspace-level split topology" {
     };
 
     try value.validate();
+}
+
+test "workspace snapshot rejects selected tab outside the selected split" {
+    const testing = std.testing;
+
+    var value = buildSnapshot();
+    value.workspace.selected_split_id = ids.SplitId.init(999);
+
+    try testing.expectError(error.SelectedSplitNotFound, value.validate());
+
+    value.workspace.selected_split_id = ids.SplitId.init(1);
+    value.workspace.selected_tab_id = ids.TabId.init(1);
+    value.tabs = &.{
+        .{
+            .tab_id = ids.TabId.init(1),
+            .ordinal = 0,
+            .title_override = "Main",
+        },
+        .{
+            .tab_id = ids.TabId.init(2),
+            .ordinal = 1,
+            .title_override = "Other",
+        },
+    };
+    value.splits = &.{
+        .{
+            .split_id = ids.SplitId.init(1),
+            .window_id = ids.WindowId.init(1),
+            .ordinal = 0,
+            .root_layout_node_id = "split-1-root",
+        },
+        .{
+            .split_id = ids.SplitId.init(2),
+            .window_id = ids.WindowId.init(1),
+            .ordinal = 1,
+            .root_layout_node_id = "split-2-root",
+        },
+    };
+    value.layout = &.{
+        .{
+            .layout_node_id = "workspace-root",
+            .node_type = .split,
+            .split_direction = .right,
+            .child_ids = &.{ "split-1-root", "split-2-root" },
+        },
+        .{
+            .layout_node_id = "split-1-root",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .split_root,
+            .child_ids = &.{"tab-1-root"},
+        },
+        .{
+            .layout_node_id = "tab-1-root",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .tab_root,
+            .child_ids = &.{"leaf-1"},
+        },
+        .{
+            .layout_node_id = "leaf-1",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .session_leaf,
+            .session_id = ids.SessionId.init(1),
+        },
+        .{
+            .layout_node_id = "split-2-root",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .split_root,
+            .child_ids = &.{"tab-2-root"},
+        },
+        .{
+            .layout_node_id = "tab-2-root",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .tab_root,
+            .child_ids = &.{"leaf-2"},
+        },
+        .{
+            .layout_node_id = "leaf-2",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .session_leaf,
+            .session_id = ids.SessionId.init(2),
+        },
+    };
+    value.sessions = &.{
+        .{
+            .session_id = ids.SessionId.init(1),
+            .tab_id = ids.TabId.init(1),
+            .cwd = "/home/ignat/code/ghostty",
+            .command = .{ .shell = "zsh" },
+        },
+        .{
+            .session_id = ids.SessionId.init(2),
+            .tab_id = ids.TabId.init(2),
+            .cwd = "/home/ignat/code/specs",
+            .command = .{ .shell = "nvim" },
+        },
+    };
+    value.workspace.layout_root_node_id = "workspace-root";
+    value.workspace.selected_split_id = ids.SplitId.init(1);
+    value.workspace.selected_tab_id = ids.TabId.init(2);
+
+    try testing.expectError(error.SelectedTabOutsideSplit, value.validate());
+}
+
+test "workspace snapshot rejects selected session outside the selected tab" {
+    const testing = std.testing;
+
+    var value = buildSnapshot();
+    value.workspace.selected_tab_id = ids.TabId.init(999);
+    value.workspace.selected_session_id = ids.SessionId.init(1);
+
+    try testing.expectError(error.SelectedTabNotFound, value.validate());
+
+    value.tabs = &.{
+        .{
+            .tab_id = ids.TabId.init(1),
+            .ordinal = 0,
+            .title_override = "Main",
+        },
+        .{
+            .tab_id = ids.TabId.init(2),
+            .ordinal = 1,
+            .title_override = "Other",
+        },
+    };
+    value.splits = &.{
+        .{
+            .split_id = ids.SplitId.init(1),
+            .window_id = ids.WindowId.init(1),
+            .ordinal = 0,
+            .root_layout_node_id = "split-1-root",
+        },
+        .{
+            .split_id = ids.SplitId.init(2),
+            .window_id = ids.WindowId.init(1),
+            .ordinal = 1,
+            .root_layout_node_id = "split-2-root",
+        },
+    };
+    value.layout = &.{
+        .{
+            .layout_node_id = "workspace-root",
+            .node_type = .split,
+            .split_direction = .right,
+            .child_ids = &.{ "split-1-root", "split-2-root" },
+        },
+        .{
+            .layout_node_id = "split-1-root",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .split_root,
+            .child_ids = &.{"tab-1-root"},
+        },
+        .{
+            .layout_node_id = "tab-1-root",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .tab_root,
+            .child_ids = &.{"leaf-1"},
+        },
+        .{
+            .layout_node_id = "leaf-1",
+            .tab_id = ids.TabId.init(1),
+            .node_type = .session_leaf,
+            .session_id = ids.SessionId.init(1),
+        },
+        .{
+            .layout_node_id = "split-2-root",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .split_root,
+            .child_ids = &.{"tab-2-root"},
+        },
+        .{
+            .layout_node_id = "tab-2-root",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .tab_root,
+            .child_ids = &.{"leaf-2"},
+        },
+        .{
+            .layout_node_id = "leaf-2",
+            .tab_id = ids.TabId.init(2),
+            .node_type = .session_leaf,
+            .session_id = ids.SessionId.init(2),
+        },
+    };
+    value.sessions = &.{
+        .{
+            .session_id = ids.SessionId.init(1),
+            .tab_id = ids.TabId.init(1),
+            .cwd = "/home/ignat/code/ghostty",
+            .command = .{ .shell = "zsh" },
+        },
+        .{
+            .session_id = ids.SessionId.init(2),
+            .tab_id = ids.TabId.init(2),
+            .cwd = "/home/ignat/code/specs",
+            .command = .{ .shell = "nvim" },
+        },
+    };
+    value.workspace.layout_root_node_id = "workspace-root";
+    value.workspace.selected_split_id = ids.SplitId.init(1);
+    value.workspace.selected_tab_id = ids.TabId.init(1);
+    value.workspace.selected_session_id = ids.SessionId.init(2);
+
+    try testing.expectError(error.SelectedSessionOutsideTab, value.validate());
 }
 
 test "workspace snapshot serializes runtime workspace layout roots" {

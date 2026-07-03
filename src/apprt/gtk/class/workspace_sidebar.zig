@@ -511,19 +511,47 @@ pub const WorkspaceSidebar = extern struct {
         priv.disposing = true;
         priv.context_workspace_page = null;
         if (priv.context_menu_popover) |popover| {
+            _ = gobject.signalHandlersDisconnectMatched(
+                popover.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
             popover.popdown();
-            popover.as(gtk.Widget).unparent();
+            popover.setChild(null);
+            if (popover.as(gtk.Widget).getParent() != null) {
+                popover.as(gtk.Widget).unparent();
+            }
             priv.context_menu_popover = null;
         }
         if (priv.workspace_empty_context_popover) |popover| {
+            _ = gobject.signalHandlersDisconnectMatched(
+                popover.as(gobject.Object),
+                .{ .data = true },
+                0,
+                0,
+                null,
+                null,
+                self,
+            );
             popover.popdown();
-            popover.as(gtk.Widget).unparent();
+            popover.setChild(null);
+            if (popover.as(gtk.Widget).getParent() != null) {
+                popover.as(gtk.Widget).unparent();
+            }
             priv.workspace_empty_context_popover = null;
         }
         if (priv.pending_context_workspace_page) |workspace_page| {
             workspace_page.unref();
             priv.pending_context_workspace_page = null;
         }
+        gtk.Widget.disposeTemplate(
+            self.as(gtk.Widget),
+            getGObjectType(),
+        );
         gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
     }
 

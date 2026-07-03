@@ -278,11 +278,19 @@ pub const CommandPalette = extern struct {
         };
         defer catalog.deinit(alloc);
 
-        for (catalog.entries) |entry| {
-            const target = if (entry.workspace_key) |workspace_key|
-                workspace_key
-            else
-                entry.workspace_name;
+        var seen = std.StringHashMap(void).init(alloc);
+        defer seen.deinit();
+
+        var index = catalog.entries.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = catalog.entries[index];
+            const target = entry.workspace_key orelse continue;
+            const gop = seen.getOrPut(target) catch |err| {
+                log.warn("failed to track restore command keys: {}", .{err});
+                return;
+            };
+            if (gop.found_existing) continue;
 
             const title = formatWorkspaceRestoreCommandTitle(
                 alloc,

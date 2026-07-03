@@ -963,11 +963,8 @@ fn findCatalogEntryForControlTarget(
     } else |_| {}
 
     for (entries) |entry| {
-        if (entry.workspace_key != null and std.mem.eql(u8, entry.workspace_key.?, target)) return entry;
-    }
-
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.workspace_name, target)) return entry;
+        const workspace_key = entry.workspace_key orelse continue;
+        if (std.mem.eql(u8, workspace_key, target)) return entry;
     }
 
     return null;
