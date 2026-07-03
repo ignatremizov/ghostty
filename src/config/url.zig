@@ -57,7 +57,7 @@ const dotted_path_lookahead =
 ;
 
 const unquoted_path_space_segments =
-    \\(?: (?!&&)(?!\|\|)(?![|;])(?=[\w\-.~:\/?#@!$&*+;=%]*\/)[\w\-.~:\/?#@!$&*+;=%]+)*
+    \\(?: (?!&&)(?!\|\|)(?![|;])(?!\w+:\/\/)(?![/.~])(?!(?:\.{1,2}\/))(?=[\w\-.~:\/?#@!$&*+;=%]*(?:\/|,))[\w\-.~:\/?#@!$&*+;=%]+)*
 ;
 
 // Branch 1: URLs with explicit schemes (http, mailto, ftp, etc.).
@@ -68,6 +68,13 @@ const scheme_url_branch =
 
 const rooted_or_relative_path_prefix =
     \\(?:\.\.\/|\.\/|(?<!\w)~\/|(?:[\w][\w\-.]*\/)*(?<!\w)\$[A-Za-z_]\w*\/|\.[\w][\w\-.]*\/|(?<![\w~\/])\/(?!\/))
+;
+
+// Branch 2: Git diff paths in lines such as
+// "diff --git a/src/file.zig b/src/file.zig". These are intentionally
+// space-delimited even though both sides look like valid relative paths.
+const git_diff_path_branch =
+    \\(?<=diff --git )a\/[\w\-.~:\/?#@!$&*+;=%]+
 ;
 
 // Branch 2: Absolute paths and dot-relative paths (/, ./, ../).
@@ -113,6 +120,8 @@ const bare_relative_path_branch =
 
 pub const regex =
     scheme_url_branch ++
+    "|" ++
+    git_diff_path_branch ++
     "|" ++
     quoted_rooted_or_relative_path_branch ++
     "|" ++
