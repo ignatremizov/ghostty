@@ -7,12 +7,120 @@ const apprt = @import("../../../apprt.zig");
 const DBus = @import("DBus.zig");
 const workspace_control = @import("../workspace_control.zig");
 
+const stderr_buffer_size = 4096;
+const response_timeout = 5 * std.time.ns_per_s;
+const poll_interval = 10 * std.time.ns_per_ms;
+const timeout_message = "Timed out waiting for workspace-control response from Ghostty\n";
+
+const ResponseWaitError = error{
+    ResponseTimeout,
+};
+
+fn freeResponses(alloc: Allocator, responses: [][]u8) void {
+    for (responses) |response_json| alloc.free(response_json);
+    alloc.free(responses);
+}
+
+fn actionStateResponsesAlloc(
+    alloc: Allocator,
+    action_group: *gio.ActionGroup,
+) Allocator.Error![][]u8 {
+    const state = action_group.getActionState(workspace_control.action_name) orelse {
+        return try alloc.alloc([]u8, 0);
+    };
+    defer state.unref();
+
+    return workspace_control.decodeActionStateResponsesAlloc(alloc, state) catch {
+        return try alloc.alloc([]u8, 0);
+    };
+}
+
+fn responseQueueChanged(previous: []const []const u8, current: []const []const u8) bool {
+    if (previous.len != current.len) return true;
+    for (previous, current) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs, rhs)) return true;
+    }
+    return false;
+}
+fn freshResponseStartIndex(previous: []const []const u8, current: []const []const u8) usize {
+    const max_overlap = @min(previous.len, current.len);
+    var overlap = max_overlap;
+    while (overlap > 0) : (overlap -= 1) {
+        const previous_tail = previous[previous.len - overlap ..];
+        const current_head = current[0..overlap];
+        var matches = true;
+        for (previous_tail, current_head) |lhs, rhs| {
+            if (!std.mem.eql(u8, lhs, rhs)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return overlap;
+    }
+    return 0;
+}
+
+fn waitForMatchingResponse(
+    alloc: Allocator,
+    ctx: *glib.MainContext,
+    action_group: *gio.ActionGroup,
+    initial_responses: []const []const u8,
+    request_json: []const u8,
+) (Allocator.Error || ResponseWaitError)![]u8 {
+    const request_id = workspace_control.envelopeIdAlloc(alloc, request_json) catch null;
+    defer if (request_id) |id| alloc.free(id);
+
+    const start = std.time.nanoTimestamp();
+    while (std.time.nanoTimestamp() - start < response_timeout) {
+        while (glib.MainContext.pending(ctx) != 0) {
+            _ = glib.MainContext.iteration(ctx, 0);
+        }
+
+        const state = action_group.getActionState(workspace_control.action_name) orelse {
+            std.Thread.sleep(poll_interval);
+            continue;
+        };
+        defer state.unref();
+
+        const responses = workspace_control.decodeActionStateResponsesAlloc(alloc, state) catch {
+            std.Thread.sleep(poll_interval);
+            continue;
+        };
+        defer freeResponses(alloc, responses);
+
+        if (request_id == null) {
+            if (responses.len > 0 and responseQueueChanged(initial_responses, responses)) {
+                return try alloc.dupe(u8, responses[responses.len - 1]);
+            }
+            std.Thread.sleep(poll_interval);
+            continue;
+        }
+
+        const fresh_start = freshResponseStartIndex(initial_responses, responses);
+        const fresh_responses = responses[fresh_start..];
+
+        for (fresh_responses) |response_json| {
+            const matches = workspace_control.requestIdMatchesResponse(
+                alloc,
+                request_json,
+                response_json,
+            ) catch continue;
+            if (!matches) continue;
+            return try alloc.dupe(u8, response_json);
+        }
+
+        std.Thread.sleep(poll_interval);
+    }
+
+    return error.ResponseTimeout;
+}
+
 pub fn workspaceControl(
     alloc: Allocator,
     target: apprt.ipc.Target,
     request_json: []const u8,
 ) (Allocator.Error || std.Io.Writer.Error || apprt.ipc.Errors)![]u8 {
-    var buf: [256]u8 = undefined;
+    var buf: [stderr_buffer_size]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&buf);
     const stderr = &stderr_writer.interface;
 
@@ -28,6 +136,9 @@ pub fn workspaceControl(
 
     const action_group = group.as(gio.ActionGroup);
 
+    const initial_responses = try actionStateResponsesAlloc(alloc, action_group);
+    defer freeResponses(alloc, initial_responses);
+
     const request_json_z = try alloc.dupeZ(u8, request_json);
     defer alloc.free(request_json_z);
     const parameter = glib.Variant.newString(request_json_z);
@@ -35,42 +146,44 @@ pub fn workspaceControl(
     try dbus.send();
 
     const ctx = glib.MainContext.default();
-    for (0..50) |_| {
-        while (glib.MainContext.pending(ctx) != 0) {
-            _ = glib.MainContext.iteration(ctx, 0);
-        }
+    return waitForMatchingResponse(alloc, ctx, action_group, initial_responses, request_json) catch |err| switch (err) {
+        error.ResponseTimeout => {
+            try stderr.writeAll(timeout_message);
+            try stderr.flush();
+            return error.IPCFailed;
+        },
+        else => |other| return other,
+    };
+}
 
-        const state = action_group.getActionState(workspace_control.action_name) orelse {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            continue;
-        };
-        defer state.unref();
+test "workspace control response queue changed detects fresh id-less replies" {
+    const testing = std.testing;
 
-        const response_json = workspace_control.decodeActionStateAlloc(alloc, state) catch {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            continue;
-        };
-        errdefer alloc.free(response_json);
+    const previous = [_][]const u8{workspace_control.initial_response_json};
+    const same = [_][]const u8{workspace_control.initial_response_json};
+    const grown = [_][]const u8{
+        workspace_control.initial_response_json,
+        "{\"ok\":true}",
+    };
+    const replaced = [_][]const u8{"{\"ok\":true}"};
 
-        const matches = workspace_control.requestIdMatchesResponse(
-            alloc,
-            request_json,
-            response_json,
-        ) catch {
-            alloc.free(response_json);
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            continue;
-        };
-        if (matches) return response_json;
+    try testing.expect(!responseQueueChanged(&previous, &same));
+    try testing.expect(responseQueueChanged(&previous, &grown));
+    try testing.expect(responseQueueChanged(&previous, &replaced));
+}
 
-        alloc.free(response_json);
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
+test "workspace control repeated ids ignore stale queued responses" {
+    const testing = std.testing;
 
-    try stderr.print(
-        "Timed out waiting for workspace-control response from Ghostty\n",
-        .{},
-    );
-    try stderr.flush();
-    return error.IPCFailed;
+    const previous = [_][]const u8{
+        "{\"id\":\"same\",\"ok\":false}",
+    };
+    const current = [_][]const u8{
+        "{\"id\":\"same\",\"ok\":false}",
+        "{\"id\":\"same\",\"ok\":true}",
+    };
+    const fresh = if (current.len > previous.len) current[previous.len..] else &.{};
+
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+    try testing.expect(std.mem.indexOf(u8, fresh[0], "\"ok\":true") != null);
 }

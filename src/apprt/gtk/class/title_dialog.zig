@@ -78,6 +78,9 @@ pub const TitleDialog = extern struct {
         /// The initial value of the entry field.
         initial_value: ?[:0]const u8 = null,
 
+        /// Deferred focus/select timer after present().
+        focus_timeout_id: ?c_uint = null,
+
         // Template bindings
         target: Target,
         entry: *gtk.Entry,
@@ -127,11 +130,17 @@ pub const TitleDialog = extern struct {
         );
 
         _ = self.ref();
-        _ = glib.timeoutAdd(1, grabInitialFocus, self);
+        const focus_timeout_id = glib.timeoutAdd(1, grabInitialFocus, self);
+        if (focus_timeout_id == 0) {
+            self.unref();
+        } else {
+            priv.focus_timeout_id = focus_timeout_id;
+        }
     }
 
     fn grabInitialFocus(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().focus_timeout_id = null;
         defer self.unref();
 
         const entry = self.private().entry;
@@ -162,6 +171,13 @@ pub const TitleDialog = extern struct {
     }
 
     fn dispose(self: *Self) callconv(.c) void {
+        const priv = self.private();
+        if (priv.focus_timeout_id) |source| {
+            _ = glib.Source.remove(source);
+            priv.focus_timeout_id = null;
+            self.unref();
+        }
+
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
             getGObjectType(),

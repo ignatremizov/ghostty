@@ -147,12 +147,14 @@ pub const Snapshot = struct {
     restore_results: ?model.RestoreResults = null,
 
     pub fn validate(self: Snapshot) !void {
-        if (self.version < 1) return error.InvalidSnapshotVersion;
-        try self.workspace.validate();
-
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const alloc = arena.allocator();
+        try self.validateWithAllocator(arena.allocator());
+    }
+
+    pub fn validateWithAllocator(self: Snapshot, alloc: std.mem.Allocator) !void {
+        if (self.version < 1) return error.InvalidSnapshotVersion;
+        try self.workspace.validate();
 
         var split_map = std.AutoHashMap(ids.SplitId, usize).init(alloc);
         var tab_map = std.AutoHashMap(ids.TabId, usize).init(alloc);
@@ -290,12 +292,6 @@ pub const Snapshot = struct {
 
         if (self.workspace.selected_split_id) |selected_split_id| {
             if (!split_map.contains(selected_split_id)) return error.SelectedSplitNotFound;
-            if (self.workspace.selected_window_id) |selected_window_id| {
-                const split = self.splits[split_map.get(selected_split_id).?];
-                if (split.window_id != null and split.window_id.? != selected_window_id) {
-                    return error.SelectedSplitOutsideWindow;
-                }
-            }
         }
         if (self.workspace.selected_tab_id) |selected_tab_id| {
             if (!tab_map.contains(selected_tab_id)) return error.SelectedTabNotFound;
@@ -378,12 +374,15 @@ pub fn fromRuntimeAlloc(
     }
 
     for (runtime.splits.items) |value| {
+        var root_layout_node_id: ?[]u8 = try alloc.dupe(u8, value.layout_root_id);
+        errdefer if (root_layout_node_id) |id| alloc.free(id);
         try splits.append(alloc, .{
             .split_id = value.split_id,
             .window_id = value.window_id,
             .ordinal = value.ordinal,
-            .root_layout_node_id = try alloc.dupe(u8, value.layout_root_id),
+            .root_layout_node_id = root_layout_node_id.?,
         });
+        root_layout_node_id = null;
     }
 
     var tabs: std.ArrayList(TabRecord) = .empty;
@@ -393,14 +392,17 @@ pub fn fromRuntimeAlloc(
     }
 
     for (runtime.tabs.items) |value| {
+        var title_override: ?[]u8 = if (value.title_override) |override|
+            try alloc.dupe(u8, override)
+        else
+            null;
+        errdefer if (title_override) |override| alloc.free(override);
         try tabs.append(alloc, .{
             .tab_id = value.tab_id,
             .ordinal = value.ordinal,
-            .title_override = if (value.title_override) |title_override|
-                try alloc.dupe(u8, title_override)
-            else
-                null,
+            .title_override = title_override,
         });
+        title_override = null;
     }
 
     var layout: std.ArrayList(LayoutNodeRecord) = .empty;
@@ -410,20 +412,29 @@ pub fn fromRuntimeAlloc(
     }
 
     for (runtime.layout.items) |value| {
+        var layout_node_id: ?[]u8 = try alloc.dupe(u8, value.layout_node_id);
+        errdefer if (layout_node_id) |id| alloc.free(id);
+        var child_ids: ?[]const []const u8 = if (value.child_ids.len > 0)
+            try cloneStringSliceAlloc(alloc, value.child_ids)
+        else
+            null;
+        errdefer if (child_ids) |child_id_slice| {
+            for (child_id_slice) |child_id| alloc.free(child_id);
+            alloc.free(child_id_slice);
+        };
         try layout.append(alloc, .{
-            .layout_node_id = try alloc.dupe(u8, value.layout_node_id),
+            .layout_node_id = layout_node_id.?,
             .tab_id = value.tab_id,
             .node_type = model.SnapshotNodeType.fromRuntime(value.node_type) orelse unreachable,
             .split_direction = value.split_direction,
             .ratio = value.ratio,
-            .child_ids = if (value.child_ids.len > 0)
-                try cloneStringSliceAlloc(alloc, value.child_ids)
-            else
-                null,
+            .child_ids = child_ids,
             .session_id = value.session_id,
             .is_zoomed = value.is_zoomed,
             .is_selected = value.is_selected,
         });
+        layout_node_id = null;
+        child_ids = null;
     }
 
     var sessions: std.ArrayList(SessionRecord) = .empty;
@@ -433,41 +444,99 @@ pub fn fromRuntimeAlloc(
     }
 
     for (runtime.sessions.items) |value| {
+        var cwd: ?[]u8 = try alloc.dupe(u8, value.cwd);
+        errdefer if (cwd) |value_cwd| alloc.free(value_cwd);
+        var command: ?model.Command = try cloneCommandAlloc(alloc, value.command);
+        errdefer switch (command.?) {
+            .argv => |argv| {
+                for (argv) |arg| alloc.free(arg);
+                alloc.free(argv);
+            },
+            .shell => |shell| alloc.free(shell),
+        };
+        var env_overrides: ?[]const model.EnvOverride = try cloneEnvOverridesAlloc(alloc, value.env_overrides);
+        errdefer if (env_overrides) |overrides| {
+            for (overrides) |item| {
+                alloc.free(item.key);
+                alloc.free(item.value);
+            }
+            alloc.free(overrides);
+        };
+        var title_override: ?[]u8 = if (value.title_override) |override|
+            try alloc.dupe(u8, override)
+        else
+            null;
+        errdefer if (title_override) |override| alloc.free(override);
         try sessions.append(alloc, .{
             .session_id = value.session_id,
             .tab_id = value.tab_id,
-            .cwd = try alloc.dupe(u8, value.cwd),
-            .command = try cloneCommandAlloc(alloc, value.command),
-            .env_overrides = try cloneEnvOverridesAlloc(alloc, value.env_overrides),
-            .title_override = if (value.title_override) |title_override|
-                try alloc.dupe(u8, title_override)
-            else
-                null,
+            .cwd = cwd.?,
+            .command = command.?,
+            .env_overrides = env_overrides.?,
+            .title_override = title_override,
             .focus_preferred = runtime.workspace.selected_session_id != null and
                 runtime.workspace.selected_session_id.? == value.session_id,
         });
+        cwd = null;
+        command = null;
+        env_overrides = null;
+        title_override = null;
+    }
+
+    const owned_saved_at = try alloc.dupe(u8, saved_at);
+    errdefer alloc.free(owned_saved_at);
+    const owned_workspace_key = try alloc.dupe(u8, runtime.workspace.slug);
+    errdefer alloc.free(owned_workspace_key);
+    const owned_name = try alloc.dupe(u8, runtime.workspace.name);
+    errdefer alloc.free(owned_name);
+    const owned_layout_root_node_id = if (runtime.workspace.layout_root_id) |layout_root_node_id|
+        try alloc.dupe(u8, layout_root_node_id)
+    else
+        null;
+    errdefer if (owned_layout_root_node_id) |layout_root_node_id| alloc.free(layout_root_node_id);
+
+    const owned_splits = try splits.toOwnedSlice(alloc);
+    splits = .empty;
+    errdefer {
+        for (owned_splits) |split| split.deinit(alloc);
+        alloc.free(owned_splits);
+    }
+    const owned_tabs = try tabs.toOwnedSlice(alloc);
+    tabs = .empty;
+    errdefer {
+        for (owned_tabs) |tab| tab.deinit(alloc);
+        alloc.free(owned_tabs);
+    }
+    const owned_layout = try layout.toOwnedSlice(alloc);
+    layout = .empty;
+    errdefer {
+        for (owned_layout) |entry| entry.deinit(alloc);
+        alloc.free(owned_layout);
+    }
+    const owned_sessions = try sessions.toOwnedSlice(alloc);
+    sessions = .empty;
+    errdefer {
+        for (owned_sessions) |session| session.deinit(alloc);
+        alloc.free(owned_sessions);
     }
 
     return .{
         .snapshot_id = snapshot_id,
-        .saved_at = try alloc.dupe(u8, saved_at),
+        .saved_at = owned_saved_at,
         .workspace = .{
             .workspace_id = runtime.workspace.workspace_id,
-            .workspace_key = try alloc.dupe(u8, runtime.workspace.slug),
-            .name = try alloc.dupe(u8, runtime.workspace.name),
-            .layout_root_node_id = if (runtime.workspace.layout_root_id) |layout_root_node_id|
-                try alloc.dupe(u8, layout_root_node_id)
-            else
-                null,
+            .workspace_key = owned_workspace_key,
+            .name = owned_name,
+            .layout_root_node_id = owned_layout_root_node_id,
             .selected_window_id = runtime.workspace.selected_window_id,
             .selected_split_id = runtime.workspace.selected_split_id,
             .selected_tab_id = runtime.workspace.selected_tab_id,
             .selected_session_id = runtime.workspace.selected_session_id,
         },
-        .splits = try splits.toOwnedSlice(alloc),
-        .tabs = try tabs.toOwnedSlice(alloc),
-        .layout = try layout.toOwnedSlice(alloc),
-        .sessions = try sessions.toOwnedSlice(alloc),
+        .splits = owned_splits,
+        .tabs = owned_tabs,
+        .layout = owned_layout,
+        .sessions = owned_sessions,
         .restore_results = null,
     };
 }
@@ -604,16 +673,24 @@ pub const CatalogEntry = struct {
     path: []const u8,
 
     pub fn cloneAlloc(self: CatalogEntry, alloc: std.mem.Allocator) !CatalogEntry {
+        const workspace_key = if (self.workspace_key) |workspace_key|
+            try alloc.dupe(u8, workspace_key)
+        else
+            null;
+        errdefer if (workspace_key) |key| alloc.free(key);
+        const workspace_name = try alloc.dupe(u8, self.workspace_name);
+        errdefer alloc.free(workspace_name);
+        const saved_at = try alloc.dupe(u8, self.saved_at);
+        errdefer alloc.free(saved_at);
+        const path = try alloc.dupe(u8, self.path);
+        errdefer alloc.free(path);
         return .{
             .snapshot_id = self.snapshot_id,
             .workspace_id = self.workspace_id,
-            .workspace_key = if (self.workspace_key) |workspace_key|
-                try alloc.dupe(u8, workspace_key)
-            else
-                null,
-            .workspace_name = try alloc.dupe(u8, self.workspace_name),
-            .saved_at = try alloc.dupe(u8, self.saved_at),
-            .path = try alloc.dupe(u8, self.path),
+            .workspace_key = workspace_key,
+            .workspace_name = workspace_name,
+            .saved_at = saved_at,
+            .path = path,
         };
     }
 
@@ -630,16 +707,24 @@ pub fn catalogEntryAlloc(
     value: Snapshot,
     path: []const u8,
 ) !CatalogEntry {
+    const workspace_key = if (value.workspace.workspace_key) |workspace_key|
+        try alloc.dupe(u8, workspace_key)
+    else
+        null;
+    errdefer if (workspace_key) |key| alloc.free(key);
+    const workspace_name = try alloc.dupe(u8, value.workspace.name);
+    errdefer alloc.free(workspace_name);
+    const saved_at = try alloc.dupe(u8, value.saved_at);
+    errdefer alloc.free(saved_at);
+    const path_copy = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_copy);
     return .{
         .snapshot_id = value.snapshot_id,
         .workspace_id = value.workspace.workspace_id,
-        .workspace_key = if (value.workspace.workspace_key) |workspace_key|
-            try alloc.dupe(u8, workspace_key)
-        else
-            null,
-        .workspace_name = try alloc.dupe(u8, value.workspace.name),
-        .saved_at = try alloc.dupe(u8, value.saved_at),
-        .path = try alloc.dupe(u8, path),
+        .workspace_key = workspace_key,
+        .workspace_name = workspace_name,
+        .saved_at = saved_at,
+        .path = path_copy,
     };
 }
 

@@ -9,6 +9,7 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
+const datastruct = @import("../../../datastruct/main.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -26,6 +27,7 @@ pub const SplitTree = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        focus_new_surface: bool = true,
 
         pub const none: @This() = .{};
     };
@@ -258,7 +260,7 @@ pub const SplitTree = extern struct {
         parent_: ?*Surface,
         overrides: NewSplitOverrides,
     ) Allocator.Error!void {
-        try self.newSplitAtSurface(
+        _ = try self.newSplitAtSurface(
             direction,
             self.getActiveSurface(),
             parent_,
@@ -273,8 +275,10 @@ pub const SplitTree = extern struct {
         anchor: ?*Surface,
         parent_: ?*Surface,
         overrides: NewSplitOverrides,
-    ) Allocator.Error!void {
+    ) Allocator.Error!*Surface {
         const alloc = Application.default().allocator();
+        const previous_last_focused = self.private().last_focused.get();
+        defer if (previous_last_focused) |v| v.unref();
 
         // Create our new surface.
         const surface: *Surface = .new(.{
@@ -303,17 +307,19 @@ pub const SplitTree = extern struct {
         var single_tree = try SplitTabs.Tree.init(alloc, split_tabs);
         defer single_tree.deinit();
 
-        // We want to move our focus to the new surface no matter what.
-        // But we need to be careful to restore state if we fail.
-        const old_last_focused = self.private().last_focused.get();
-        defer if (old_last_focused) |v| v.unref(); // unref strong ref from get
-        self.private().last_focused.set(surface);
-        errdefer self.private().last_focused.set(old_last_focused);
+        // Interactive splits move focus to the new surface, but some control
+        // paths need to preserve the currently selected surface.
+        const next_last_focused = if (overrides.focus_new_surface)
+            surface
+        else
+            previous_last_focused;
+        self.private().last_focused.set(next_last_focused);
+        errdefer self.private().last_focused.set(previous_last_focused);
 
         // If we have no tree yet, then this becomes our tree and we're done.
         const old_tree = self.getTree() orelse {
             self.setTree(&single_tree);
-            return;
+            return surface;
         };
 
         const handle = if (anchor) |surface_anchor|
@@ -337,6 +343,7 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+        return surface;
     }
 
     pub fn addExistingSurface(
@@ -995,6 +1002,20 @@ pub const SplitTree = extern struct {
         }
     }
 
+    fn nextFocusHandleAfterRemove(
+        comptime Tree: type,
+        tree: *const Tree,
+        alloc: Allocator,
+        handle: Tree.Node.Handle,
+    ) ?Tree.Node.Handle {
+        const next_handle: Tree.Node.Handle =
+            (tree.goto(alloc, handle, .previous) catch null) orelse
+            (tree.goto(alloc, handle, .next) catch null) orelse
+            return null;
+        if (next_handle == handle) return null;
+        return next_handle;
+    }
+
     fn removeHandle(
         self: *Self,
         handle: SplitTabs.Tree.Node.Handle,
@@ -1006,11 +1027,12 @@ pub const SplitTree = extern struct {
         const old_tree = self.getTree() orelse return;
         const next_focus: ?*Surface = next_focus: {
             const alloc = Application.default().allocator();
-            const next_handle: SplitTabs.Tree.Node.Handle =
-                (old_tree.goto(alloc, handle, .previous) catch null) orelse
-                (old_tree.goto(alloc, handle, .next) catch null) orelse
-                break :next_focus null;
-            if (next_handle == handle) break :next_focus null;
+            const next_handle = nextFocusHandleAfterRemove(
+                SplitTabs.Tree,
+                old_tree,
+                alloc,
+                handle,
+            ) orelse break :next_focus null;
 
             // Note: we don't need to ref this or anything because its
             // guaranteed to remain in the new tree since its not part
@@ -1030,7 +1052,8 @@ pub const SplitTree = extern struct {
         self.setTree(&new_tree);
 
         // Grab focus. We have to set this on the "last focused" because our
-        // focus will be set when the tree is redrawn.
+        // focus will be set when the tree is redrawn. When removing the last
+        // pane, this intentionally remains null because the tree is empty.
         if (next_focus) |v| priv.last_focused.set(v);
     }
 
@@ -1371,6 +1394,42 @@ pub const SplitTree = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+const TestTree = datastruct.SplitTree(TestView);
+
+const TestView = struct {
+    const Self = @This();
+
+    label: []const u8,
+
+    pub fn ref(self: *Self, alloc: Allocator) Allocator.Error!*Self {
+        const ptr = try alloc.create(Self);
+        ptr.* = self.*;
+        return ptr;
+    }
+
+    pub fn unref(self: *Self, alloc: Allocator) void {
+        alloc.destroy(self);
+    }
+
+    pub fn splitTreeLabel(self: *const Self) []const u8 {
+        return self.label;
+    }
+};
+
+test "SplitTree.nextFocusHandleAfterRemove returns null when removing the last pane" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var view: TestView = .{ .label = "A" };
+    var tree: TestTree = try TestTree.init(alloc, &view);
+    defer tree.deinit();
+
+    try testing.expectEqual(
+        @as(?TestTree.Node.Handle, null),
+        SplitTree.nextFocusHandleAfterRemove(TestTree, &tree, alloc, .root),
+    );
+}
 
 /// This is an internal-only widget that represents a split in the
 /// split tree. This is a wrapper around gtk.Paned that allows us to handle

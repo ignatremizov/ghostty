@@ -569,6 +569,7 @@ pub const Window = extern struct {
             title: ?[:0]const u8 = null,
             initial_surface: bool = true,
             position_override: ?c_int = null,
+            select_page: bool = true,
 
             pub const none: @This() = .{};
         },
@@ -616,7 +617,7 @@ pub const Window = extern struct {
 
         // Add the page and select it
         const page = tab_view.insert(workspace_page.as(gtk.Widget), position);
-        tab_view.setSelectedPage(page);
+        if (overrides.select_page) tab_view.setSelectedPage(page);
 
         // Create some property bindings
         _ = workspace_page.as(gobject.Object).bindProperty(
@@ -708,10 +709,12 @@ pub const Window = extern struct {
     fn newEmptyWorkspacePage(
         self: *Self,
         position: c_int,
+        select_page: bool,
     ) *adw.TabPage {
         return self.newWorkspacePage(null, .tab, .{
             .initial_surface = false,
             .position_override = position,
+            .select_page = select_page,
         });
     }
 
@@ -787,7 +790,7 @@ pub const Window = extern struct {
         }
 
         const destination_page = if (create_destination)
-            self.newEmptyWorkspacePage(destination_pos)
+            self.newEmptyWorkspacePage(destination_pos, true)
         else
             tab_view.getNthPage(destination_pos);
         const destination_workspace_page = gobject.ext.cast(
@@ -3672,22 +3675,26 @@ pub const Window = extern struct {
                 return;
             };
             defer alloc.free(fresh_key);
-
-            restored_workspace_page.setSidebarTitle(fork_name_z);
-            alloc.free(restored_runtime.workspace.name);
-            restored_runtime.workspace.name = alloc.dupe(u8, fork_name) catch {
+            const next_name = alloc.dupe(u8, fork_name) catch {
                 log.warn("failed to persist restore fork workspace name", .{});
                 self.as(gtk.Window).present();
                 self.addToast(i18n._("Workspace restored"));
                 return;
             };
-            alloc.free(restored_runtime.workspace.slug);
-            restored_runtime.workspace.slug = alloc.dupe(u8, fresh_key) catch {
+            errdefer alloc.free(next_name);
+            const next_slug = alloc.dupe(u8, fresh_key) catch {
                 log.warn("failed to persist restore fork workspace key", .{});
                 self.as(gtk.Window).present();
                 self.addToast(i18n._("Workspace restored"));
                 return;
             };
+            errdefer alloc.free(next_slug);
+
+            restored_workspace_page.setSidebarTitle(fork_name_z);
+            alloc.free(restored_runtime.workspace.name);
+            restored_runtime.workspace.name = next_name;
+            alloc.free(restored_runtime.workspace.slug);
+            restored_runtime.workspace.slug = next_slug;
             if (restored_runtime.workspace.snapshot_ref) |*snapshot_ref| {
                 alloc.free(snapshot_ref.saved_at);
                 alloc.free(snapshot_ref.path);
@@ -4184,19 +4191,21 @@ pub fn workspaceControlSplitSession(
         null;
     defer if (command) |*value| deinitWorkspaceControlCommand(alloc, value);
 
-    try split_tree.newSplitAtSurface(
+    const new_surface = try split_tree.newSplitAtSurface(
         workspaceControlSplitDirection(request.direction),
         resolved.surface,
         resolved.surface,
         .{
             .command = command,
             .working_directory = cwd,
+            .focus_new_surface = false,
         },
     );
     refreshWorkspaceControlRuntime(resolved.window);
 
     const runtime = resolved.window.getWorkspaceRuntimeForPage(resolved.workspace_page) orelse return error.WorkspaceNotFound;
-    const route = workspace_registry.selectedSessionRoute(runtime) orelse return error.SessionNotFound;
+    const session_id = self.private().session_identity_index.sessionForAttachment(@intFromPtr(new_surface)) orelse return error.SessionNotFound;
+    const route = workspace_registry.routeForSession(runtime, session_id) orelse return error.SessionNotFound;
     return .{
         .session_id = route.session_id,
         .workspace_id = runtime.workspace.workspace_id,
@@ -4260,7 +4269,8 @@ pub fn workspaceControlRestoreAlloc(
     try validateWorkspaceRestoreReplaySupported(value, &live_plan);
 
     const tab_view = self.getTabView();
-    const page = self.newEmptyWorkspacePage(tab_view.getNPages());
+    const previously_selected_page = tab_view.getSelectedPage();
+    const page = self.newEmptyWorkspacePage(tab_view.getNPages(), false);
     errdefer tab_view.closePage(page);
 
     const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse return error.WorkspaceNotFound;
@@ -4293,6 +4303,7 @@ pub fn workspaceControlRestoreAlloc(
     var built_tree = try buildWorkspaceRestoreTreeAlloc(self, alloc, value, &live_plan);
     defer built_tree.deinit();
     workspace_page.getSplitTree().setTree(&built_tree);
+    if (previously_selected_page) |selected_page| tab_view.setSelectedPage(selected_page);
 
     self.refreshWorkspaceRegistrySafe();
     const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
@@ -4704,31 +4715,48 @@ fn cloneRestoreResultsAlloc(
 ) !workspace_model.RestoreResults {
     var failed_sessions = try alloc.alloc(workspace_model.RestoreFailure, value.failed_sessions.len);
     errdefer alloc.free(failed_sessions);
+    var initialized_failed_sessions: usize = 0;
     for (value.failed_sessions, 0..) |failure, index| {
+        var code: ?[]u8 = try alloc.dupe(u8, failure.code);
+        errdefer if (code) |value_code| alloc.free(value_code);
+        var message: ?[]u8 = try alloc.dupe(u8, failure.message);
+        errdefer if (message) |value_message| alloc.free(value_message);
         failed_sessions[index] = .{
             .session_id = failure.session_id,
-            .code = try alloc.dupe(u8, failure.code),
-            .message = try alloc.dupe(u8, failure.message),
+            .code = code.?,
+            .message = message.?,
         };
+        code = null;
+        message = null;
+        initialized_failed_sessions = index + 1;
     }
     errdefer {
-        for (failed_sessions) |failure| {
+        for (failed_sessions[0..initialized_failed_sessions]) |failure| {
             alloc.free(failure.code);
             alloc.free(failure.message);
         }
         alloc.free(failed_sessions);
     }
 
-    return .{
-        .restored_workspace_id = value.restored_workspace_id,
-        .restored_session_ids = try alloc.dupe(workspace_ids.SessionId, value.restored_session_ids),
-        .failed_sessions = failed_sessions,
-        .selection_fallback = if (value.selection_fallback) |fallback| .{
+    const restored_session_ids = try alloc.dupe(workspace_ids.SessionId, value.restored_session_ids);
+    errdefer alloc.free(restored_session_ids);
+    const selection_fallback = if (value.selection_fallback) |fallback| fallback: {
+        const reason = try alloc.dupe(u8, fallback.reason);
+        errdefer alloc.free(reason);
+        break :fallback workspace_model.SelectionFallback{
             .window_id = fallback.window_id,
             .tab_id = fallback.tab_id,
             .session_id = fallback.session_id,
-            .reason = try alloc.dupe(u8, fallback.reason),
-        } else null,
+            .reason = reason,
+        };
+    } else null;
+    errdefer if (selection_fallback) |fallback| alloc.free(fallback.reason);
+
+    return .{
+        .restored_workspace_id = value.restored_workspace_id,
+        .restored_session_ids = restored_session_ids,
+        .failed_sessions = failed_sessions,
+        .selection_fallback = selection_fallback,
     };
 }
 
@@ -4739,15 +4767,22 @@ fn updateWorkspaceSnapshotRefAlloc(
     saved_at: []const u8,
     path: []const u8,
 ) void {
+    const next_saved_at = alloc.dupe(u8, saved_at) catch return;
+    errdefer alloc.free(next_saved_at);
+    const next_path = alloc.dupe(u8, path) catch return;
+    errdefer alloc.free(next_path);
+
+    const next_snapshot_ref: workspace_model.WorkspaceSnapshotRef = .{
+        .snapshot_id = snapshot_id,
+        .saved_at = next_saved_at,
+        .path = next_path,
+    };
+
     if (runtime.workspace.snapshot_ref) |*snapshot_ref| {
         alloc.free(snapshot_ref.saved_at);
         alloc.free(snapshot_ref.path);
     }
-    runtime.workspace.snapshot_ref = .{
-        .snapshot_id = snapshot_id,
-        .saved_at = alloc.dupe(u8, saved_at) catch return,
-        .path = alloc.dupe(u8, path) catch return,
-    };
+    runtime.workspace.snapshot_ref = next_snapshot_ref;
 }
 
 fn clearWorkspaceSnapshotRefAlloc(
@@ -4959,6 +4994,14 @@ pub fn resolveWorkspaceControlWorkspace(
 
         if (target_id) |workspace_id| {
             if (runtime.workspace.workspace_id != workspace_id) continue;
+            return .{
+                .window = window,
+                .workspace_page = workspace_page,
+                .runtime = runtime,
+            };
+        }
+
+        if (std.mem.eql(u8, runtime.workspace.slug, target.?)) {
             return .{
                 .window = window,
                 .workspace_page = workspace_page,
@@ -5198,6 +5241,9 @@ fn testWorkspaceRuntime(
         .focus_state = .focused,
         .activity_state = .bell_pending,
     });
+    workspace.workspace.split_ids = try workspace.runtimeAllocator().dupe(workspace_ids.SplitId, &.{workspace_ids.SplitId.init(11)});
+    workspace.workspace.tab_ids = try workspace.runtimeAllocator().dupe(workspace_ids.TabId, &.{workspace_ids.TabId.init(21)});
+    workspace.workspace.session_ids = try workspace.runtimeAllocator().dupe(workspace_ids.SessionId, &.{workspace_ids.SessionId.init(31)});
     workspace.workspace.selected_window_id = workspace_ids.WindowId.init(1);
     workspace.workspace.selected_split_id = workspace_ids.SplitId.init(11);
     workspace.workspace.selected_tab_id = workspace_ids.TabId.init(21);
@@ -5262,4 +5308,45 @@ test "workspace sidebar tooltip summarizes selected runtime session" {
     try testing.expect(std.mem.indexOf(u8, tooltip, "Selected tab: logs") != null);
     try testing.expect(std.mem.indexOf(u8, tooltip, "Selected session: cargo test") != null);
     try testing.expect(std.mem.indexOf(u8, tooltip, "Working directory: /home/ignat/code/ghostty") != null);
+}
+
+test "saved workspace catalog lookup for runtime matches checkpoint path first" {
+    const testing = std.testing;
+
+    var fixture = try testWorkspaceRuntime(testing.allocator);
+    defer fixture.registry.deinit();
+
+    fixture.workspace.workspace.snapshot_ref = .{
+        .snapshot_id = workspace_ids.SnapshotId.init(7),
+        .saved_at = try testing.allocator.dupe(u8, "2026-04-06T10:00:00Z"),
+        .path = try testing.allocator.dupe(u8, "work-restored.json"),
+    };
+
+    const entries = [_]workspace_snapshot.CatalogEntry{
+        .{
+            .snapshot_id = workspace_ids.SnapshotId.init(8),
+            .workspace_id = fixture.workspace.workspace.workspace_id,
+            .workspace_key = try testing.allocator.dupe(u8, "ghostty"),
+            .workspace_name = try testing.allocator.dupe(u8, "ghostty"),
+            .saved_at = try testing.allocator.dupe(u8, "2026-04-06T09:00:00Z"),
+            .path = try testing.allocator.dupe(u8, "ghostty.json"),
+        },
+        .{
+            .snapshot_id = workspace_ids.SnapshotId.init(7),
+            .workspace_id = fixture.workspace.workspace.workspace_id,
+            .workspace_key = try testing.allocator.dupe(u8, "work"),
+            .workspace_name = try testing.allocator.dupe(u8, "work"),
+            .saved_at = try testing.allocator.dupe(u8, "2026-04-06T10:00:00Z"),
+            .path = try testing.allocator.dupe(u8, "work-restored.json"),
+        },
+    };
+    defer for (entries) |entry| entry.deinit(testing.allocator);
+
+    const matched = findSavedWorkspaceCatalogEntryForRuntime(
+        entries[0..],
+        fixture.workspace,
+    ).?;
+
+    try testing.expectEqualStrings("work-restored.json", matched.path);
+    try testing.expectEqualStrings("work", matched.workspace_name);
 }

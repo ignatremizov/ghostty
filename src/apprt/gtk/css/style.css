@@ -163,6 +163,11 @@ label.resize-overlay {
 
 .window .split-tabs.needs-attention {
   outline-color: rgba(58, 148, 74, 0.65);
+  outline-color: color-mix(
+    in srgb,
+    var(--accent-color),
+    transparent 35%
+  );
   outline-width: 3px;
   outline-style: solid;
   outline-offset: -3px;

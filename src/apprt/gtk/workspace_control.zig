@@ -18,6 +18,7 @@ pub const action_name = "workspace-control";
 pub const initial_response_json =
     \\{"ok":false,"error":{"code":"not_ready","message":"workspace-control has not handled a request yet"}}
 ;
+const action_state_queue_limit = 32;
 
 pub const FocusBehavior = workspace_control_protocol.FocusBehavior;
 pub const Method = workspace_control_protocol.Method;
@@ -223,7 +224,8 @@ pub fn dispatchActionParameterAlloc(
 }
 
 pub fn initialStateVariant() *glib.Variant {
-    return encodeActionState(initial_response_json) catch unreachable;
+    const responses = [_][]const u8{initial_response_json};
+    return encodeActionStateQueue(&responses) catch unreachable;
 }
 
 pub fn createAction() *gio.SimpleAction {
@@ -256,17 +258,43 @@ pub fn unregisterAction(map: *gio.ActionMap) void {
     map.removeAction(action_name);
 }
 
-pub fn encodeActionState(response_json: []const u8) !*glib.Variant {
-    try expectJsonObject(response_json);
-    const value_z = try std.heap.c_allocator.dupeZ(u8, response_json);
+fn encodeActionStateQueue(responses: []const []const u8) !*glib.Variant {
+    const value_z = try encodeActionStateQueueAlloc(std.heap.c_allocator, responses);
     defer std.heap.c_allocator.free(value_z);
     return glib.Variant.newString(value_z);
 }
 
-pub fn decodeActionStateAlloc(
+fn encodeActionStateQueueAlloc(
+    alloc: std.mem.Allocator,
+    responses: []const []const u8,
+) ![:0]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    try out.writer.writeAll("{\"responses\":[");
+    for (responses, 0..) |response_json, index| {
+        try expectJsonObject(response_json);
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.writeAll(response_json);
+    }
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSliceSentinel(0);
+}
+
+fn encodeJsonValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+pub fn decodeActionStateResponsesAlloc(
     alloc: std.mem.Allocator,
     state: ?*glib.Variant,
-) ![]u8 {
+) ![][]u8 {
     const variant = state orelse return error.InvalidActionState;
     const string_type = glib.VariantType.new("s");
     defer string_type.free();
@@ -274,9 +302,48 @@ pub fn decodeActionStateAlloc(
 
     var len: usize = undefined;
     const value = variant.getString(&len);
-    const response_json = value[0..len];
-    try expectJsonObject(response_json);
-    return alloc.dupe(u8, response_json);
+    const state_json = value[0..len];
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, state_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidActionState;
+
+    if (parsed.value.object.get("responses")) |responses| {
+        if (responses != .array) return error.InvalidActionState;
+
+        const items = try alloc.alloc([]u8, responses.array.items.len);
+        errdefer alloc.free(items);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| alloc.free(item);
+        }
+
+        for (responses.array.items, 0..) |response_value, index| {
+            if (response_value != .object) return error.InvalidActionState;
+            items[index] = try encodeJsonValueAlloc(alloc, response_value);
+            initialized += 1;
+        }
+        return items;
+    }
+
+    try expectJsonObject(state_json);
+    const items = try alloc.alloc([]u8, 1);
+    errdefer alloc.free(items);
+    items[0] = try alloc.dupe(u8, state_json);
+    return items;
+}
+
+pub fn decodeActionStateAlloc(
+    alloc: std.mem.Allocator,
+    state: ?*glib.Variant,
+) ![]u8 {
+    const responses = try decodeActionStateResponsesAlloc(alloc, state);
+    defer {
+        for (responses) |response| alloc.free(response);
+        alloc.free(responses);
+    }
+    if (responses.len == 0) return error.InvalidActionState;
+    return alloc.dupe(u8, responses[responses.len - 1]);
 }
 
 pub fn updateActionStateAlloc(
@@ -287,7 +354,27 @@ pub fn updateActionStateAlloc(
     const result = try dispatchActionParameterAlloc(alloc, parameter);
     errdefer alloc.free(result.response_json);
 
-    action.setState(try encodeActionState(result.response_json));
+    const existing_state = action.as(gio.Action).getState();
+    defer if (existing_state) |state| state.unref();
+
+    const existing_responses = try decodeActionStateResponsesAlloc(alloc, existing_state);
+    defer {
+        for (existing_responses) |response| alloc.free(response);
+        alloc.free(existing_responses);
+    }
+
+    const preserved_count: usize = @min(existing_responses.len, action_state_queue_limit - 1);
+    const start_index = existing_responses.len - preserved_count;
+    const next_len = preserved_count + 1;
+    const queue = try alloc.alloc([]const u8, next_len);
+    defer alloc.free(queue);
+
+    for (0..preserved_count) |index| {
+        queue[index] = existing_responses[start_index + index];
+    }
+    queue[next_len - 1] = result.response_json;
+
+    action.setState(try encodeActionStateQueue(queue));
     return result;
 }
 
@@ -301,9 +388,13 @@ pub fn requestIdMatchesResponse(
     const response_id = try parseEnvelopeIdAlloc(alloc, response_json);
     defer if (response_id) |id| alloc.free(id);
 
-    if (request_id == null) return true;
+    if (request_id == null) return false;
     if (response_id == null) return false;
     return std.mem.eql(u8, request_id.?, response_id.?);
+}
+
+pub fn envelopeIdAlloc(alloc: std.mem.Allocator, json: []const u8) !?[]u8 {
+    return parseEnvelopeIdAlloc(alloc, json);
 }
 
 pub fn encodeSuccessResponseAlloc(
@@ -731,24 +822,11 @@ fn workspaceExistsForControlTarget(
     alloc: std.mem.Allocator,
     target: []const u8,
 ) !bool {
-    const target_id = parseWorkspaceControlWorkspaceRef(target);
     const windows = try workspaceControlWindowsAlloc(alloc);
     defer alloc.free(windows);
 
     for (windows) |window| {
-        const workspaces = try gtk_window.workspaceControlListAlloc(window, alloc);
-        defer {
-            for (workspaces) |workspace| workspace.deinit(alloc);
-            alloc.free(workspaces);
-        }
-
-        for (workspaces) |workspace| {
-            if (target_id) |workspace_id| {
-                if (workspace.workspace_id == workspace_id) return true;
-                continue;
-            }
-            if (std.mem.eql(u8, workspace.name, target)) return true;
-        }
+        if (gtk_window.resolveWorkspaceControlWorkspace(window, target) != null) return true;
     }
 
     return false;
@@ -1001,7 +1079,6 @@ fn encodeWorkspaceListResultAlloc(
     workspaces: []const gtk_window.WorkspaceControlWorkspace,
 ) ![]u8 {
     const entries = try alloc.alloc(WorkspaceListEntryJson, workspaces.len);
-    errdefer alloc.free(entries);
     var initialized: usize = 0;
     defer {
         for (entries[0..initialized]) |entry| entry.deinit(alloc);
@@ -1090,10 +1167,16 @@ fn encodeWorkspaceSaveResultAlloc(
         workspace: WorkspaceJson,
     };
 
+    const workspace_id_short = try allocWorkspaceControlShortRef(alloc, "workspace", result.workspace_id.raw());
+    errdefer alloc.free(workspace_id_short);
+    const workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id);
+    errdefer alloc.free(workspace_id);
+    const snapshot_id = try allocWorkspaceControlCanonicalId(alloc, result.snapshot_id);
+    errdefer alloc.free(snapshot_id);
     const workspace = Json.WorkspaceJson{
-        .id = try allocWorkspaceControlShortRef(alloc, "workspace", result.workspace_id.raw()),
-        .workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id),
-        .snapshot_id = try allocWorkspaceControlCanonicalId(alloc, result.snapshot_id),
+        .id = workspace_id_short,
+        .workspace_id = workspace_id,
+        .snapshot_id = snapshot_id,
         .saved_at = result.saved_at,
         .path = result.path,
     };
@@ -1148,7 +1231,6 @@ fn encodeSessionListResultAlloc(
     };
 
     const entries = try alloc.alloc(SessionListEntryJson, sessions.len);
-    errdefer alloc.free(entries);
     var initialized: usize = 0;
     defer {
         for (entries[0..initialized]) |entry| entry.deinit(alloc);
@@ -1181,10 +1263,16 @@ fn encodeSessionFocusResultAlloc(
         }
     };
 
+    const focused_session_id = try allocWorkspaceControlCanonicalId(alloc, result.focused_session_id);
+    errdefer alloc.free(focused_session_id);
+    const tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id);
+    errdefer alloc.free(tab_id);
+    const window_id = try allocWorkspaceControlCanonicalId(alloc, result.window_id);
+    errdefer alloc.free(window_id);
     const json = Json{
-        .focused_session_id = try allocWorkspaceControlCanonicalId(alloc, result.focused_session_id),
-        .tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id),
-        .window_id = try allocWorkspaceControlCanonicalId(alloc, result.window_id),
+        .focused_session_id = focused_session_id,
+        .tab_id = tab_id,
+        .window_id = window_id,
     };
     defer json.deinit(alloc);
 
@@ -1207,10 +1295,16 @@ fn encodeSessionSplitResultAlloc(
         }
     };
 
+    const session_id = try allocWorkspaceControlCanonicalId(alloc, result.session_id);
+    errdefer alloc.free(session_id);
+    const workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id);
+    errdefer alloc.free(workspace_id);
+    const tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id);
+    errdefer alloc.free(tab_id);
     const json = Json{
-        .session_id = try allocWorkspaceControlCanonicalId(alloc, result.session_id),
-        .workspace_id = try allocWorkspaceControlCanonicalId(alloc, result.workspace_id),
-        .tab_id = try allocWorkspaceControlCanonicalId(alloc, result.tab_id),
+        .session_id = session_id,
+        .workspace_id = workspace_id,
+        .tab_id = tab_id,
     };
     defer json.deinit(alloc);
 

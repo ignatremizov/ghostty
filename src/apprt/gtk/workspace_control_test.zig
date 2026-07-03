@@ -326,12 +326,29 @@ test "ipc workspace control restore resolves saved snapshots by workspace name" 
         fn run() !void {
             const result = try workspace_control.dispatchAlloc(
                 std.testing.allocator,
-                "{\"id\":\"req-r1-name\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":\"Workspace 1\"}}",
+                "{\"id\":\"req-r1-name\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":\"Developer Workspace\"}}",
             );
             defer std.testing.allocator.free(result.response_json);
 
             try std.testing.expectEqual(workspace_control.Method.workspace_restore, result.metadata.method.?);
             try std.testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_ready\"") != null);
+        }
+    }.run);
+}
+
+test "ipc workspace control restore reports not_found for absent workspace keys without snapshots" {
+    const testing = std.testing;
+
+    try withStateHome(testing.allocator, "/tmp", &struct {
+        fn run() !void {
+            const result = try workspace_control.dispatchAlloc(
+                std.testing.allocator,
+                "{\"id\":\"req-r1-key\",\"method\":\"workspace.restore\",\"params\":{\"workspace\":\"workspace-key-1\"}}",
+            );
+            defer std.testing.allocator.free(result.response_json);
+
+            try std.testing.expectEqual(workspace_control.Method.workspace_restore, result.metadata.method.?);
+            try std.testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"not_found\"") != null);
         }
     }.run);
 }
@@ -471,4 +488,81 @@ test "ipc workspace control updates action state with caller-visible JSON" {
 
     try testing.expectEqual(workspace_control.Method.workspace_list, result.metadata.method.?);
     try testing.expectEqualStrings(result.response_json, decoded);
+}
+
+test "ipc workspace control action state retains prior responses in queue" {
+    const testing = std.testing;
+
+    const action = workspace_control.createAction();
+    defer action.unref();
+
+    const request_a =
+        "{\"id\":\"req-a\",\"method\":\"workspace.list\",\"params\":{}}";
+    const request_b =
+        "{\"id\":\"req-b\",\"method\":\"workspace.list\",\"params\":{}}";
+
+    const parameter_a = stringVariant(request_a);
+    defer parameter_a.unref();
+    const parameter_b = stringVariant(request_b);
+    defer parameter_b.unref();
+
+    const result_a = try workspace_control.updateActionStateAlloc(
+        testing.allocator,
+        action,
+        parameter_a,
+    );
+    defer testing.allocator.free(result_a.response_json);
+
+    const result_b = try workspace_control.updateActionStateAlloc(
+        testing.allocator,
+        action,
+        parameter_b,
+    );
+    defer testing.allocator.free(result_b.response_json);
+
+    const state = action.as(gio.Action).getState().?;
+    defer state.unref();
+
+    const responses = try workspace_control.decodeActionStateResponsesAlloc(
+        testing.allocator,
+        state,
+    );
+    defer {
+        for (responses) |response| testing.allocator.free(response);
+        testing.allocator.free(responses);
+    }
+
+    try testing.expect(responses.len >= 2);
+    try testing.expect(std.mem.indexOf(u8, responses[responses.len - 2], "\"id\":\"req-a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, responses[responses.len - 1], "\"id\":\"req-b\"") != null);
+}
+
+test "ipc workspace control id-less request does not match stale queued responses" {
+    const testing = std.testing;
+
+    try testing.expect(!(try workspace_control.requestIdMatchesResponse(
+        testing.allocator,
+        "{\"method\":\"workspace.list\",\"params\":{}}",
+        workspace_control.initial_response_json,
+    )));
+}
+
+test "workspace storage creates nested default state path on first run" {
+    const testing = std.testing;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(state_home);
+
+    try withStateHome(testing.allocator, state_home, &struct {
+        fn run() !void {
+            var dir = try workspace_storage.createDefaultStorageDirAlloc(std.testing.allocator);
+            defer dir.close();
+
+            const file = try dir.createFile(workspace_storage.Storage.catalog_filename, .{ .truncate = true });
+            file.close();
+        }
+    }.run);
 }
