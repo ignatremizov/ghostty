@@ -1039,21 +1039,6 @@ pub const Application = extern struct {
             \\  );
             \\}
             \\
-            \\/*
-            \\ * Splits
-            \\ */
-            \\
-            \\.window .split-tabs.needs-attention {
-            \\  outline-color: color-mix(
-            \\    in srgb,
-            \\    var(--accent-color),
-            \\    transparent 35%
-            \\  );
-            \\  outline-width: 3px;
-            \\  outline-style: solid;
-            \\  outline-offset: -3px;
-            \\}
-            \\
             \\.window .split paned > separator {
             \\  background-color: color-mix(
             \\    in srgb,
@@ -2000,14 +1985,10 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const split_tabs = ext.getAncestor(
-                    SplitTabs,
-                    surface.as(gtk.Widget),
-                ) orelse {
-                    log.warn("surface is not in split-local tabs, ignoring close_tab", .{});
-                    return false;
-                };
-                return split_tabs.closeSurface(surface, value);
+                return surface.as(gtk.Widget).activateActionVariant(
+                    "workspace.close",
+                    glib.Variant.newString(@tagName(value)),
+                ) != 0;
             },
         }
     }

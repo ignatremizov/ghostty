@@ -208,6 +208,8 @@ test "workspace catalog round trips through storage" {
     defer tmp.cleanup();
 
     const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const expected_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(expected_filename);
     const catalog: snapshot.Catalog = .{
         .entries = &.{.{
             .snapshot_id = ids.SnapshotId.init(1),
@@ -215,7 +217,7 @@ test "workspace catalog round trips through storage" {
             .workspace_key = "workspace-key-1",
             .workspace_name = "Developer Workspace",
             .saved_at = "2026-03-22T12:00:00Z",
-            .path = "workspace-key-1.json",
+            .path = expected_filename,
         }},
     };
 
@@ -228,7 +230,7 @@ test "workspace catalog round trips through storage" {
     try testing.expectEqual(@as(usize, 1), loaded.entries.len);
     try testing.expectEqual(ids.WorkspaceId.init(1), loaded.entries[0].workspace_id);
     try testing.expectEqualStrings("workspace-key-1", loaded.entries[0].workspace_key.?);
-    try testing.expectEqualStrings("workspace-key-1.json", loaded.entries[0].path);
+    try testing.expectEqualStrings(expected_filename, loaded.entries[0].path);
 }
 
 test "workspace catalog rejects future versions" {
@@ -251,19 +253,21 @@ test "workspace checkpoint updates latest catalog entry and prunes replaced snap
     defer tmp.cleanup();
 
     const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const expected_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(expected_filename);
 
     var first_snapshot = buildSnapshot();
     first_snapshot.saved_at = "2026-03-22T12:00:00Z";
     const first_filename = try storage.writeCheckpoint(first_snapshot);
     defer testing.allocator.free(first_filename);
-    try testing.expectEqualStrings("workspace-key-1.json", first_filename);
+    try testing.expectEqualStrings(expected_filename, first_filename);
 
     var second_snapshot = buildSnapshot();
     second_snapshot.snapshot_id = ids.SnapshotId.init(2);
     second_snapshot.saved_at = "2026-03-22T12:30:00Z";
     const second_filename = try storage.writeCheckpoint(second_snapshot);
     defer testing.allocator.free(second_filename);
-    try testing.expectEqualStrings("workspace-key-1.json", second_filename);
+    try testing.expectEqualStrings(expected_filename, second_filename);
 
     const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
     defer loaded.deinit(testing.allocator);
@@ -272,10 +276,25 @@ test "workspace checkpoint updates latest catalog entry and prunes replaced snap
     try testing.expectEqual(ids.SnapshotId.init(2), loaded.entries[0].snapshot_id);
     try testing.expectEqual(ids.WorkspaceId.init(1), loaded.entries[0].workspace_id);
     try testing.expectEqualStrings("workspace-key-1", loaded.entries[0].workspace_key.?);
-    try testing.expectEqualStrings("workspace-key-1.json", loaded.entries[0].path);
+    try testing.expectEqualStrings(expected_filename, loaded.entries[0].path);
     try testing.expectEqualStrings("2026-03-22T12:30:00Z", loaded.entries[0].saved_at);
 
-    try tmp.dir.access("workspace-key-1.json", .{});
+    try tmp.dir.access(expected_filename, .{});
+}
+
+test "workspace checkpoint filenames include a hash to avoid sanitized collisions" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const slash = try storage.checkpointFilenameAlloc("a/b");
+    defer testing.allocator.free(slash);
+    const underscore = try storage.checkpointFilenameAlloc("a_b");
+    defer testing.allocator.free(underscore);
+
+    try testing.expect(!std.mem.eql(u8, slash, underscore));
 }
 
 test "workspace snapshot validates workspace-level split topology" {

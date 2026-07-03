@@ -28,6 +28,11 @@ per-command wrapper files.
 
 ## Updating documentation
 
-Each cli action is defined in it's own file. Documentation for each action is defined
-in the doc comment associated with the `run` function. For example the `run` function
-in `list_keybinds.zig` contains the help text for `ghostty +list-keybinds`.
+Most CLI actions are defined in their own file, but related actions may share one
+module, such as `src/cli/workspace.zig`.
+
+Documentation for each action is defined in the doc comment associated with the
+function returned by `Action.helpFunction()`. For standalone actions that is
+usually `run`; for shared modules it can be a specific `run*` entrypoint. For
+example, the `run` function in `list_keybinds.zig` contains the help text for
+`ghostty +list-keybinds`.

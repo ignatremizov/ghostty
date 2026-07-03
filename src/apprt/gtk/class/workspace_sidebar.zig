@@ -11,7 +11,10 @@ const Common = @import("../class.zig").Common;
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const workspace_registry = @import("../workspace_registry.zig");
+const Application = @import("application.zig").Application;
 const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
+
+const log = std.log.scoped(.gtk_workspace_sidebar);
 
 const WorkspaceContextAction = enum {
     rename,
@@ -219,8 +222,8 @@ pub const WorkspaceSidebar = extern struct {
             runtime.workspace.session_ids.len,
             if (runtime.workspace.session_ids.len == 1) "session" else "sessions",
             selected.split_title,
-            selected.tab_title,
-            selected.session_title,
+            selected.tab_title_override orelse selected.tab_title,
+            selected.session_title_override orelse selected.session_title,
             selected.cwd,
         }, 0);
     }
@@ -448,11 +451,23 @@ pub const WorkspaceSidebar = extern struct {
         const priv = self.private();
         if (priv.pending_context_workspace_page) |workspace_page| {
             const action = priv.pending_context_workspace_action orelse .rename;
-            const ctx = IdleWorkspaceActionContext.new(self.ref(), workspace_page, action);
-            priv.pending_context_action_ctx = ctx;
-            priv.pending_context_action_source = glib.idleAdd(idleEmitPendingWorkspaceAction, ctx);
             priv.pending_context_workspace_page = null;
             priv.pending_context_workspace_action = null;
+
+            const ctx = IdleWorkspaceActionContext.new(self, workspace_page, action) catch |err| {
+                workspace_page.unref();
+                log.err("failed to allocate pending workspace action context err={}", .{err});
+                return;
+            };
+            priv.pending_context_action_ctx = ctx;
+            const source = glib.idleAdd(idleEmitPendingWorkspaceAction, ctx);
+            if (source == 0) {
+                priv.pending_context_action_ctx = null;
+                ctx.deinit();
+                log.err("failed to schedule pending workspace action", .{});
+                return;
+            }
+            priv.pending_context_action_source = source;
         }
     }
 
@@ -460,7 +475,14 @@ pub const WorkspaceSidebar = extern struct {
         const priv = self.private();
         if (!priv.pending_workspace_empty_restore) return;
         priv.pending_workspace_empty_restore = false;
-        priv.pending_restore_source = glib.idleAdd(idleEmitRestoreWorkspace, self.ref());
+        const sidebar = self.ref();
+        const source = glib.idleAdd(idleEmitRestoreWorkspace, sidebar);
+        if (source == 0) {
+            sidebar.unref();
+            log.err("failed to schedule workspace restore action", .{});
+            return;
+        }
+        priv.pending_restore_source = source;
     }
 
     fn workspaceListRowSelected(_: *gtk.ListBox, row_: ?*gtk.ListBoxRow, self: *Self) callconv(.c) void {
@@ -475,23 +497,40 @@ pub const WorkspaceSidebar = extern struct {
     }
 
     const IdleWorkspaceActionContext = struct {
+        alloc: std.mem.Allocator,
         sidebar: *Self,
         workspace_page: *WorkspacePage,
         action: WorkspaceContextAction,
 
-        fn new(sidebar: *Self, workspace_page: *WorkspacePage, action: WorkspaceContextAction) *IdleWorkspaceActionContext {
-            const alloc = std.heap.c_allocator;
-            const ctx = alloc.create(IdleWorkspaceActionContext) catch @panic("oom");
-            ctx.* = .{ .sidebar = sidebar, .workspace_page = workspace_page, .action = action };
+        fn new(
+            sidebar: *Self,
+            workspace_page: *WorkspacePage,
+            action: WorkspaceContextAction,
+        ) std.mem.Allocator.Error!*IdleWorkspaceActionContext {
+            const alloc = workspaceActionAllocator();
+            const ctx = try alloc.create(IdleWorkspaceActionContext);
+            ctx.* = .{
+                .alloc = alloc,
+                .sidebar = sidebar.ref(),
+                .workspace_page = workspace_page,
+                .action = action,
+            };
             return ctx;
         }
 
         fn deinit(self: *IdleWorkspaceActionContext) void {
+            const alloc = self.alloc;
             self.workspace_page.unref();
             self.sidebar.unref();
-            std.heap.c_allocator.destroy(self);
+            alloc.destroy(self);
         }
     };
+
+    fn workspaceActionAllocator() std.mem.Allocator {
+        const app = gio.Application.getDefault() orelse return std.heap.page_allocator;
+        const ghostty_app = gobject.ext.cast(Application, app) orelse return std.heap.page_allocator;
+        return ghostty_app.allocator();
+    }
 
     fn idleEmitPendingWorkspaceAction(ud: ?*anyopaque) callconv(.c) c_int {
         const ctx: *IdleWorkspaceActionContext = @ptrCast(@alignCast(ud orelse return 0));
@@ -585,6 +624,7 @@ pub const WorkspaceSidebar = extern struct {
     const C = Common(Self, Private);
     pub const as = C.as;
     pub const ref = C.ref;
+    pub const refSink = C.refSink;
     pub const unref = C.unref;
     const private = C.private;
 
@@ -625,3 +665,69 @@ pub const WorkspaceSidebar = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+test "workspace sidebar dispose cancels pending deferred actions" {
+    const testing = std.testing;
+
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+
+    gobject.ext.ensureType(WorkspaceSidebar);
+    gobject.ext.ensureType(WorkspacePage);
+
+    const sidebar = gobject.ext.newInstance(WorkspaceSidebar, .{});
+    _ = sidebar.refSink();
+    defer sidebar.unref();
+
+    const workspace_page = gobject.ext.newInstance(WorkspacePage, .{});
+    _ = workspace_page.refSink();
+    defer workspace_page.unref();
+
+    var delete_count: usize = 0;
+    var restore_count: usize = 0;
+    _ = WorkspaceSidebar.signals.@"delete-workspace".connect(
+        sidebar,
+        *usize,
+        struct {
+            fn handler(_: *WorkspaceSidebar, _: *WorkspacePage, count: *usize) callconv(.c) void {
+                count.* += 1;
+            }
+        }.handler,
+        &delete_count,
+        .{},
+    );
+    _ = WorkspaceSidebar.signals.@"restore-workspace".connect(
+        sidebar,
+        *usize,
+        struct {
+            fn handler(_: *WorkspaceSidebar, count: *usize) callconv(.c) void {
+                count.* += 1;
+            }
+        }.handler,
+        &restore_count,
+        .{},
+    );
+
+    const priv = sidebar.private();
+    priv.pending_context_workspace_page = workspace_page.ref();
+    priv.pending_context_workspace_action = .delete_saved;
+    WorkspaceSidebar.workspaceRowContextMenuClosed(undefined, sidebar);
+
+    priv.pending_workspace_empty_restore = true;
+    WorkspaceSidebar.workspaceEmptyContextMenuClosed(undefined, sidebar);
+
+    try testing.expect(priv.pending_context_action_source != null);
+    try testing.expect(priv.pending_context_action_ctx != null);
+    try testing.expect(priv.pending_restore_source != null);
+
+    WorkspaceSidebar.dispose(sidebar);
+
+    try testing.expect(priv.pending_context_action_source == null);
+    try testing.expect(priv.pending_context_action_ctx == null);
+    try testing.expect(priv.pending_restore_source == null);
+    try testing.expect(priv.pending_context_workspace_page == null);
+
+    while (glib.MainContext.iteration(null, 0) != 0) {}
+
+    try testing.expectEqual(@as(usize, 0), delete_count);
+    try testing.expectEqual(@as(usize, 0), restore_count);
+}

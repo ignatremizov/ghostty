@@ -302,14 +302,20 @@ pub fn finalizeAlloc(
                 try restored_placements.append(alloc, restored);
             },
             .failed => |failed| {
+                var code: ?[]u8 = try alloc.dupe(u8, failed.code.code());
+                errdefer if (code) |value| alloc.free(value);
+                var message: ?[]u8 = if (failed.message) |message|
+                    try alloc.dupe(u8, message)
+                else
+                    try alloc.dupe(u8, failed.code.message());
+                errdefer if (message) |value| alloc.free(value);
                 try failed_sessions.append(alloc, .{
                     .session_id = failed.session_id,
-                    .code = try alloc.dupe(u8, failed.code.code()),
-                    .message = if (failed.message) |message|
-                        try alloc.dupe(u8, message)
-                    else
-                        try alloc.dupe(u8, failed.code.message()),
+                    .code = code.?,
+                    .message = message.?,
                 });
+                code = null;
+                message = null;
             },
         }
     }
@@ -319,16 +325,21 @@ pub fn finalizeAlloc(
     const selection_fallback = try allocSelectionFallback(alloc, selection);
     errdefer if (selection_fallback) |value| alloc.free(value.reason);
 
+    const restored_session_ids = try restored_ids.toOwnedSlice(alloc);
+    errdefer alloc.free(restored_session_ids);
+    const owned_failed_sessions = try failed_sessions.toOwnedSlice(alloc);
+    failed_sessions = .empty;
+    errdefer {
+        freeRestoreFailures(alloc, owned_failed_sessions);
+        alloc.free(owned_failed_sessions);
+    }
+
     return .{
         .selection = selection,
         .results = .{
             .restored_workspace_id = plan.workspace_id,
-            .restored_session_ids = try restored_ids.toOwnedSlice(alloc),
-            .failed_sessions = failed: {
-                const owned = try failed_sessions.toOwnedSlice(alloc);
-                failed_sessions = .empty;
-                break :failed owned;
-            },
+            .restored_session_ids = restored_session_ids,
+            .failed_sessions = owned_failed_sessions,
             .selection_fallback = selection_fallback,
         },
     };
@@ -394,13 +405,8 @@ fn validateSelectionContext(
         return error.SelectedSplitRequiresWindow;
     }
 
-    const selected_split = if (value.selected_split_id) |selected_split_id|
-        split_map.get(selected_split_id) orelse return error.SelectedSplitNotFound
-    else
-        null;
-
-    if (selected_split != null and selected_split.?.window_id != null and value.selected_window_id.? != selected_split.?.window_id.?) {
-        return error.SelectedSplitOutsideWindow;
+    if (value.selected_split_id) |selected_split_id| {
+        if (!split_map.contains(selected_split_id)) return error.SelectedSplitNotFound;
     }
 
     if (value.selected_tab_id) |selected_tab_id| {

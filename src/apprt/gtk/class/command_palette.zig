@@ -285,7 +285,7 @@ pub const CommandPalette = extern struct {
         while (index > 0) {
             index -= 1;
             const entry = catalog.entries[index];
-            const target = entry.workspace_key orelse continue;
+            const target = restoreCommandTarget(entry) orelse continue;
             const gop = seen.getOrPut(target) catch |err| {
                 log.warn("failed to track restore command keys: {}", .{err});
                 return;
@@ -321,6 +321,12 @@ pub const CommandPalette = extern struct {
                 continue;
             };
         }
+    }
+
+    fn restoreCommandTarget(entry: workspace_snapshot.CatalogEntry) ?[]const u8 {
+        if (entry.workspace_key) |workspace_key| return workspace_key;
+        if (entry.workspace_name.len == 0) return null;
+        return entry.workspace_name;
     }
 
     fn appendPaneMoveCommand(
@@ -528,6 +534,21 @@ pub const CommandPalette = extern struct {
             "Restore work from snapshot-7.json (saved 2026-03-26T10:00:00Z).",
             description,
         );
+    }
+
+    test "workspace restore commands fall back to workspace name when key is absent" {
+        const testing = std.testing;
+
+        const entry: workspace_snapshot.CatalogEntry = .{
+            .snapshot_id = .init(7),
+            .workspace_id = .init(3),
+            .workspace_key = null,
+            .workspace_name = "work",
+            .saved_at = "2026-03-26T10:00:00Z",
+            .path = "snapshot-7.json",
+        };
+
+        try testing.expectEqualStrings("work", restoreCommandTarget(entry).?);
     }
 
     /// Check if an action is supported on GTK.

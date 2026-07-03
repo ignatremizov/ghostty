@@ -9,6 +9,7 @@ const gtk = @import("gtk");
 const apprt = @import("../../../apprt.zig");
 const configpkg = @import("../../../config.zig");
 const datastruct = @import("../../../datastruct/main.zig");
+const i18n = @import("../../../os/main.zig").i18n;
 const Common = @import("../class.zig").Common;
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
@@ -574,7 +575,7 @@ pub const SplitTabs = extern struct {
         const priv = self.private();
         if (priv.context_menu_popover != null) return;
 
-        const rename_button = gtk.Button.newWithLabel("Change Tab Title…");
+        const rename_button = gtk.Button.newWithLabel(i18n._("Change Tab Title…"));
         rename_button.as(gtk.Widget).setHalign(.fill);
         _ = gtk.Button.signals.clicked.connect(
             rename_button,

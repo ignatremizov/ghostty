@@ -344,5 +344,3 @@ pub const Tab = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
-
-pub const WorkspacePage = @import("workspace_page.zig").WorkspacePage;

@@ -2124,6 +2124,8 @@ pub const Surface = extern struct {
         if (priv.idle_focus_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove idle focus source", .{});
+            } else {
+                self.as(gobject.Object).unref();
             }
             priv.idle_focus_source = null;
         }
@@ -3303,16 +3305,20 @@ pub const Surface = extern struct {
         if (priv.idle_focus_source) |source| {
             if (glib.Source.remove(source) == 0) {
                 log.warn("unable to replace idle focus source", .{});
+            } else {
+                self.as(gobject.Object).unref();
             }
             priv.idle_focus_source = null;
         }
 
+        _ = self.as(gobject.Object).ref();
         priv.idle_focus_source = glib.idleAdd(idleFocus, self);
     }
 
     /// Userdata should be a `*Surface`.
     fn idleFocus(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.as(gobject.Object).unref();
 
         const priv = self.private();
         priv.idle_focus_source = null;
@@ -3598,9 +3604,9 @@ pub const Surface = extern struct {
 
             _ = self.as(gtk.Widget).activateAction(
                 if (priv.pending_horizontal_scroll < 0.0)
-                    "tab.next-page"
+                    "workspace.next-page"
                 else
-                    "tab.previous-page",
+                    "workspace.previous-page",
                 null,
             );
 

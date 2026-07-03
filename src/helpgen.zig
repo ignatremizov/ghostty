@@ -53,6 +53,7 @@ fn genConfigField(
     for (tokens, 0..) |token, i| {
         // We only care about identifiers that are preceded by doc comments.
         if (token != .identifier) continue;
+        if (i == 0) continue;
         if (tokens[i - 1] != .doc_comment) continue;
 
         // Identifier may have @"" so we strip that.
@@ -96,6 +97,7 @@ fn genActions(alloc: std.mem.Allocator, writer: *std.Io.Writer) !void {
         for (tokens, 0..) |token, i| {
             // We're looking for the function that carries help for this action.
             if (token != .keyword_fn) continue;
+            if (i < 2 or i + 1 >= tokens.len) continue;
             if (!std.mem.eql(u8, ast.tokenSlice(@intCast(i + 1)), action_fn)) continue;
 
             // The function must be preceded by a doc comment.

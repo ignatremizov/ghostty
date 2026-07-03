@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const internal_os = @import("../../os/main.zig");
 const snapshot = @import("workspace_snapshot.zig");
@@ -28,7 +29,8 @@ pub const Storage = struct {
         }
 
         if (buf.items.len == 0) return error.InvalidWorkspaceKey;
-        return std.fmt.allocPrint(self.allocator, "{s}.json", .{buf.items});
+        const hash = std.hash.Wyhash.hash(0, workspace_key);
+        return std.fmt.allocPrint(self.allocator, "{s}-{x}.json", .{ buf.items, hash });
     }
 
     pub fn writeSnapshot(self: Storage, value: snapshot.Snapshot) ![]u8 {
@@ -145,7 +147,20 @@ pub const Storage = struct {
         defer self.allocator.free(temp_name);
 
         {
-            const file = try self.dir.createFile(temp_name, .{ .truncate = true, .read = true });
+            const file = try self.dir.createFile(
+                temp_name,
+                switch (builtin.os.tag) {
+                    .windows => .{
+                        .truncate = true,
+                        .read = true,
+                    },
+                    else => .{
+                        .truncate = true,
+                        .read = true,
+                        .mode = 0o600,
+                    },
+                },
+            );
             defer file.close();
             try file.writeAll(data);
             try file.sync();
@@ -177,7 +192,7 @@ pub fn createDefaultStorageDirAlloc(
     });
     defer alloc.free(storage_path);
 
-    std.fs.makeDirAbsolute(storage_path) catch |err| switch (err) {
+    std.fs.cwd().makePath(storage_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -278,9 +293,8 @@ fn buildCatalogWithoutMatching(
         catalog.entries.len
     else
         catalog.entries.len - 1;
-    const empty_entries = [_]snapshot.CatalogEntry{};
     var entries: []snapshot.CatalogEntry = if (entry_count == 0)
-        empty_entries[0..]
+        &.{}
     else
         try alloc.alloc(snapshot.CatalogEntry, entry_count);
     var initialized: usize = 0;

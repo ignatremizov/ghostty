@@ -8,6 +8,7 @@ const workspace_control_protocol = @import("../apprt/workspace_control_protocol.
 const args = @import("args.zig");
 const build_config = @import("../build_config.zig");
 const diagnostics = @import("diagnostics.zig");
+const global = @import("../global.zig");
 
 const gtk_workspace_ipc = if (build_config.app_runtime == .gtk)
     @import("../apprt/gtk/ipc/workspace_control.zig")
@@ -16,29 +17,6 @@ else
 
 const Method = workspace_control_protocol.Method;
 const CommandUsageError = error{CommandUsage};
-
-const Stdio = struct {
-    stdout_buf: [1024]u8 = undefined,
-    stdout_writer: std.fs.File.Writer = undefined,
-    stdout: *std.Io.Writer = undefined,
-    stderr_buf: [1024]u8 = undefined,
-    stderr_writer: std.fs.File.Writer = undefined,
-    stderr: *std.Io.Writer = undefined,
-
-    fn init() Stdio {
-        var self: Stdio = .{};
-        self.stdout_writer = std.fs.File.stdout().writer(&self.stdout_buf);
-        self.stdout = &self.stdout_writer.interface;
-        self.stderr_writer = std.fs.File.stderr().writer(&self.stderr_buf);
-        self.stderr = &self.stderr_writer.interface;
-        return self;
-    }
-
-    fn flush(self: *Stdio) !void {
-        try self.stdout.flush();
-        try self.stderr.flush();
-    }
-};
 
 fn deinitOptions(self: anytype) void {
     if (self._arena) |arena| arena.deinit();
@@ -86,7 +64,7 @@ fn sendRequest(
         return 1;
     }
 
-    const request_id = try std.fmt.allocPrint(alloc, "cli-{d}", .{std.time.milliTimestamp()});
+    const request_id = try allocRequestId(alloc);
     defer alloc.free(request_id);
 
     const request_json = try workspace_control_protocol.encodeRequestAlloc(
@@ -110,6 +88,20 @@ fn sendRequest(
     return printResponse(stderr, stdout, response_json);
 }
 
+fn allocRequestId(alloc: Allocator) ![]u8 {
+    var random_bytes: [8]u8 = undefined;
+    global.io().random(&random_bytes);
+    const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
+    return std.fmt.allocPrint(
+        alloc,
+        "cli-{d}-{s}",
+        .{
+            std.Io.Timestamp.now(global.io(), .real).toMilliseconds(),
+            &random_hex,
+        },
+    );
+}
+
 fn encodeParamsAlloc(alloc: Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -131,17 +123,22 @@ fn runCommand(
     comptime method: Method,
     comptime buildParams: fn (Allocator, *std.Io.Writer, Options) anyerror![]u8,
 ) !u8 {
-    var iter = try args.argsIterator(alloc);
+    var iter = try args.argsIterator(alloc, global.args());
     defer iter.deinit();
 
     var opts: Options = .{};
     defer opts.deinit();
     try args.parse(Options, alloc, &opts, &iter);
 
-    var io = Stdio.init();
-    const params_json = buildParams(alloc, io.stderr, opts) catch |err| switch (err) {
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(global.io(), &stdout_buf);
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &stderr_buf);
+
+    const params_json = buildParams(alloc, &stderr_writer.interface, opts) catch |err| switch (err) {
         error.CommandUsage => {
-            try io.flush();
+            try stdout_writer.interface.flush();
+            try stderr_writer.interface.flush();
             return 1;
         },
         else => return err,
@@ -150,13 +147,14 @@ fn runCommand(
 
     const result = try sendRequest(
         alloc,
-        io.stderr,
-        io.stdout,
+        &stderr_writer.interface,
+        &stdout_writer.interface,
         targetForClass(opts.class),
         method,
         params_json,
     );
-    try io.flush();
+    try stdout_writer.interface.flush();
+    try stderr_writer.interface.flush();
     return result;
 }
 
@@ -168,7 +166,6 @@ pub const ListOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
 
     pub fn deinit(self: *ListOptions) void {
         deinitOptions(self);
@@ -189,7 +186,6 @@ pub const OpenOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     workspace: ?[:0]const u8 = null,
     create: bool = false,
 
@@ -212,7 +208,6 @@ pub const SaveOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     workspace: ?[:0]const u8 = null,
 
     pub fn deinit(self: *SaveOptions) void {
@@ -234,7 +229,6 @@ pub const RestoreOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     workspace: ?[:0]const u8 = null,
 
     pub fn deinit(self: *RestoreOptions) void {
@@ -256,7 +250,6 @@ pub const ListSessionsOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     workspace: ?[:0]const u8 = null,
 
     pub fn deinit(self: *ListSessionsOptions) void {
@@ -278,7 +271,6 @@ pub const FocusSessionOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     session: ?[:0]const u8 = null,
 
     pub fn deinit(self: *FocusSessionOptions) void {
@@ -307,7 +299,6 @@ pub const SplitOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     session: ?[:0]const u8 = null,
     direction: ?SplitDirection = null,
     cwd: ?[:0]const u8 = null,
@@ -332,7 +323,6 @@ pub const CloseSessionOptions = struct {
     _arena: ?ArenaAllocator = null,
     _diagnostics: diagnostics.DiagnosticList = .{},
     class: ?[:0]const u8 = null,
-    json: bool = false,
     session: ?[:0]const u8 = null,
 
     pub fn deinit(self: *CloseSessionOptions) void {
@@ -557,6 +547,16 @@ test "workspace cli encodeRequestAlloc rejects non-object params" {
             "[]",
         ),
     );
+}
+
+test "workspace cli allocRequestId adds random suffix" {
+    const testing = std.testing;
+
+    const request_id = try allocRequestId(testing.allocator);
+    defer testing.allocator.free(request_id);
+
+    try testing.expect(std.mem.startsWith(u8, request_id, "cli-"));
+    try testing.expect(std.mem.count(u8, request_id, "-") >= 2);
 }
 
 test "workspace cli printResponse returns exit code for success and error payloads" {
