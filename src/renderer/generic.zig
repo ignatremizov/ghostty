@@ -1389,9 +1389,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
-                _ = self.terminal_state.rows;
-                _ = self.terminal_state.cols;
-
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,

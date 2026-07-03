@@ -787,13 +787,13 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        // Use drawFrame(false) instead of the sync draw() path.
-        // CoreSurface.draw() calls drawFrame(true), which on size changes
-        // re-presents the last (stale) frame to avoid blank flashes during
-        // macOS CoreAnimation resize. On Linux/GTK, this prevents the
-        // renderer from ever updating to the new size. Using false lets
-        // the renderer detect the new GL viewport and resize its FBO.
-        self.core_surface.renderer.drawFrame(false) catch |err| {
+        // On macOS/CoreAnimation resize paths, a synchronous draw re-presents
+        // the last frame to avoid blank flashes while resizing. On Linux/GTK,
+        // that same behavior can keep the renderer stuck at the stale size,
+        // so use the non-sync path there to let the renderer detect the new
+        // GL viewport and resize its FBO.
+        const sync = builtin.target.os.tag != .linux;
+        self.core_surface.renderer.drawFrame(sync) catch |err| {
             log.err("error in draw err={}", .{err});
             return;
         };

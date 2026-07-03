@@ -2552,8 +2552,12 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // Recalculate our grid size. Because Ghostty supports fluid resizing,
     // its possible the grid doesn't change at all even if the screen size changes.
-    // We have to update the IO thread no matter what because we send
-    // pixel-level sizing to the subprocess.
+    // Once we still have a usable grid we update the IO thread even when only
+    // the pixel size changed, because we send pixel-level sizing to the
+    // subprocess. If the surface is temporarily too small for any cells, keep
+    // the last valid size and defer the IO-thread resize until a usable grid
+    // returns so we don't thrash the terminal/renderer through a transient
+    // 0xN or Nx0 layout state.
     const grid_size = self.size.grid();
     if (grid_size.columns == 0 or grid_size.rows == 0) {
         self.size = prev_size;

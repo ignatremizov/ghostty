@@ -334,17 +334,24 @@ pub fn present(self: *OpenGL, target: Target) !void {
     const fbobind = try target.framebuffer.bind(.read);
     defer fbobind.unbind();
 
-    // If the default framebuffer is larger than our target, clear the exposed
-    // area to the configured terminal background before replaying the old
-    // frame. This preserves Ghostty's live-resize behavior without stretching
-    // the previous frame to fill the new surface size.
-    gl.clearColor(
-        @as(f32, @floatFromInt(self.background.r)) / 255.0,
-        @as(f32, @floatFromInt(self.background.g)) / 255.0,
-        @as(f32, @floatFromInt(self.background.b)) / 255.0,
-        @floatCast(self.background_opacity),
-    );
-    gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+    // Presentation always targets the full framebuffer. A stale scissor box
+    // must not clip either the resize clear or the framebuffer blit.
+    try gl.disable(gl.c.GL_SCISSOR_TEST);
+
+    // If the default framebuffer is larger than our target, clear only the
+    // default framebuffer to the configured terminal background before
+    // replaying the old frame. We only need that extra clear when the
+    // framebuffer is larger than the replay target; otherwise the blit fully
+    // covers the destination and the clear would be redundant work.
+    if (surface.width > target.width or surface.height > target.height) {
+        gl.clearColor(
+            @as(f32, @floatFromInt(self.background.r)) / 255.0,
+            @as(f32, @floatFromInt(self.background.g)) / 255.0,
+            @as(f32, @floatFromInt(self.background.b)) / 255.0,
+            @floatCast(self.background_opacity),
+        );
+        gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
+    }
 
     const blit_width = @min(target.width, surface.width);
     const blit_height = @min(target.height, surface.height);

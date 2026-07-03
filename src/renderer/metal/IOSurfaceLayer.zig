@@ -80,8 +80,9 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
 /// Sets the layer's `contents` to the provided IOSurface without checking size.
 ///
 /// This is intended for "re-present last frame" paths during resize where we want
-/// CoreAnimation to scale the last good surface to cover new bounds (i.e. avoid
-/// a transient blank flash) even if the surface dimensions don't match the layer.
+/// CoreAnimation to keep showing the last good surface even if the surface
+/// dimensions don't match the layer, avoiding a transient blank flash while
+/// preserving the layer's top-left gravity.
 pub inline fn setSurfaceUnchecked(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     surface.retain();
 
