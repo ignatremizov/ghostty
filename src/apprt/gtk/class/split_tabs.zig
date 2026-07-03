@@ -664,7 +664,11 @@ pub const SplitTabs = extern struct {
                 null,
                 self,
             );
-            popover.as(gtk.Widget).unparent();
+            popover.popdown();
+            popover.setChild(null);
+            if (popover.as(gtk.Widget).getParent() != null) {
+                popover.as(gtk.Widget).unparent();
+            }
             priv.context_menu_popover = null;
         }
         priv.pending_context_menu_rect = null;
