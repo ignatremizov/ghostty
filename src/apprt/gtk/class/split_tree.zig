@@ -964,7 +964,7 @@ pub const SplitTree = extern struct {
         const tree = self.getTree() orelse return false;
         const leaf = tree.nodes[handle.idx()].leaf;
         if (leaf.getSurfaceCount() > 1) {
-            return leaf.removeSurface(surface);
+            return leaf.detachSurface(surface);
         }
 
         surface.setSplitBinding(null);

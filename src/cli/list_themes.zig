@@ -586,6 +586,16 @@ const Preview = struct {
         };
 
         try self.updateFiltered();
+        if (self.cmux) |*value| {
+            if (value.initialTheme()) |theme| {
+                for (self.filtered.items, 0..) |index, i| {
+                    if (std.ascii.eqlIgnoreCase(self.themes[index].theme, theme)) {
+                        self.current = i;
+                        break;
+                    }
+                }
+            }
+        }
 
         return self;
     }
@@ -645,7 +655,7 @@ const Preview = struct {
 
     fn updateFiltered(self: *Preview) !void {
         const relative = self.current -| self.window;
-        var selected: []const u8 = undefined;
+        var selected: []const u8 = "";
         if (self.filtered.items.len > 0) {
             selected = self.themes[self.filtered.items[self.current]].theme;
         }
@@ -821,6 +831,7 @@ const Preview = struct {
                             self.mode = .search;
                         if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{})) {
                             if (self.cmux != null) {
+                                try self.applyCmuxSelectionForCurrentTheme();
                                 self.outcome = .apply;
                                 self.should_quit = true;
                             } else {

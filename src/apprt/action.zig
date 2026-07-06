@@ -135,10 +135,6 @@ pub const Action = union(Key) {
     /// cyclically within the tab range.
     move_tab: MoveTab,
 
-    /// Move the currently focused split into another tab, merging it into
-    /// the destination tab's split tree.
-    move_split_to_tab: GotoTab,
-
     /// Jump to a specific tab. Must handle the scenario that the tab
     /// value is invalid.
     goto_tab: GotoTab,
@@ -354,6 +350,10 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Move the currently focused split into another tab, merging it into
+    /// the destination tab's split tree.
+    move_split_to_tab: GotoTab,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -371,7 +371,6 @@ pub const Action = union(Key) {
         toggle_visibility,
         toggle_background_opacity,
         move_tab,
-        move_split_to_tab,
         goto_tab,
         goto_split,
         goto_window,
@@ -423,6 +422,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        move_split_to_tab,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
