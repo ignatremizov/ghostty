@@ -428,6 +428,12 @@ pub const Action = union(Key) {
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
         }
+
+        test "stable action ordinals" {
+            try std.testing.expectEqual(@as(c_int, 15), @intFromEnum(Key.move_split_to_tab));
+            try std.testing.expectEqual(@as(c_int, 16), @intFromEnum(Key.goto_tab));
+            try std.testing.expectEqual(@as(c_int, 66), @intFromEnum(Key.copy_title_to_clipboard));
+        }
     };
 
     /// Sync with: ghostty_action_u

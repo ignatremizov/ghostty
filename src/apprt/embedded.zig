@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const lib = @import("../lib/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -415,6 +416,10 @@ pub const PlatformTag = enum(c_int) {
     macos = 1,
     ios = 2,
     linux = 3,
+
+    test "ghostty.h PlatformTag" {
+        try lib.checkGhosttyHEnum(PlatformTag, "GHOSTTY_PLATFORM_");
+    }
 };
 
 pub const EnvVar = extern struct {

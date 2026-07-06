@@ -4263,11 +4263,13 @@ pub fn workspaceControlCloseSession(
     refreshWorkspaceControlRuntime(self);
 
     const resolved = resolveWorkspaceControlSession(self, session_target) orelse return error.SessionNotFound;
-    if (!resolved.leaf.closeSurface(resolved.surface, .this)) return error.SessionNotFound;
+    const closed_session_id = resolved.route.session_id;
+    const split_tree = resolved.workspace_page.getSplitTree();
+    if (!split_tree.removeSurface(resolved.surface)) return error.SessionNotFound;
     refreshWorkspaceControlRuntime(resolved.window);
 
     return .{
-        .closed_session_id = resolved.route.session_id,
+        .closed_session_id = closed_session_id,
     };
 }
 

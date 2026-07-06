@@ -112,6 +112,7 @@ pub const SplitTabs = extern struct {
 
     const Private = struct {
         disposing: bool = false,
+        force_close_page: bool = false,
         suppress_next_selection_focus: bool = false,
         pending_close: PendingClosePage = .{},
         pending_close_dialog: ?*CloseConfirmationDialog = null,
@@ -226,10 +227,15 @@ pub const SplitTabs = extern struct {
     }
 
     fn getPageForSurface(self: *Self, surface: *Surface) ?*adw.TabPage {
+        return self.getPageForSurfaceId(@intFromPtr(surface));
+    }
+
+    fn getPageForSurfaceId(self: *Self, surface_id: usize) ?*adw.TabPage {
         const n = self.private().tab_view.getNPages();
         for (0..@intCast(n)) |i| {
             const page = self.private().tab_view.getNthPage(@intCast(i));
-            if (self.getPageSurface(page) == surface) return page;
+            const page_surface = self.getPageSurface(page) orelse continue;
+            if (@intFromPtr(page_surface) == surface_id) return page;
         }
         return null;
     }
@@ -313,9 +319,21 @@ pub const SplitTabs = extern struct {
     }
 
     pub fn removeSurface(self: *Self, surface: *Surface) bool {
+        return self.detachSurface(surface);
+    }
+
+    pub fn detachSurface(self: *Self, surface: *Surface) bool {
         const page = self.getPageForSurface(surface) orelse return false;
-        self.private().tab_view.closePage(page);
-        return true;
+        const surface_id = @intFromPtr(surface);
+        const self_ref = self.ref();
+        defer self_ref.unref();
+
+        const priv = self.private();
+        priv.force_close_page = true;
+        defer priv.force_close_page = false;
+        priv.tab_view.closePage(page);
+
+        return self.getPageForSurfaceId(surface_id) == null;
     }
 
     pub fn closeSurface(
@@ -427,7 +445,7 @@ pub const SplitTabs = extern struct {
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return @intFromBool(false);
 
-        if (!tab.getNeedsConfirmQuit()) {
+        if (self.private().force_close_page or !tab.getNeedsConfirmQuit()) {
             self.private().tab_view.closePageFinish(page, @intFromBool(true));
             return @intFromBool(true);
         }

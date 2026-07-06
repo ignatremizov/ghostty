@@ -66,6 +66,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_LINUX,
 } ghostty_platform_e;
 
 typedef enum {
@@ -453,9 +454,14 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+typedef struct {
+  void* reserved;
+} ghostty_platform_linux_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_linux_s linux_platform;
 } ghostty_platform_u;
 
 typedef enum {
