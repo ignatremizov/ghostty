@@ -40,8 +40,43 @@ const workspace_registry = @import("../workspace_registry.zig");
 const workspace_restore = @import("../workspace_restore.zig");
 const workspace_snapshot = @import("../workspace_snapshot.zig");
 const workspace_storage = @import("../workspace_storage.zig");
+const termio = @import("../../../termio.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
+const workspace_periodic_autosave_ms = 10 * 60 * 1000;
+const workspace_autosave_scrollback_session_bytes = 16 * 1024 * 1024;
+const workspace_autosave_scrollback_total_bytes = 32 * 1024 * 1024;
+
+const AutosaveScrollbackBudget = struct {
+    remaining: usize = workspace_autosave_scrollback_total_bytes,
+    per_session: usize,
+
+    fn init(session_count: usize) AutosaveScrollbackBudget {
+        const fair_share = if (session_count == 0)
+            workspace_autosave_scrollback_total_bytes
+        else
+            @max(
+                @as(usize, 1),
+                workspace_autosave_scrollback_total_bytes / session_count,
+            );
+        return .{
+            .per_session = @min(
+                workspace_autosave_scrollback_session_bytes,
+                fair_share,
+            ),
+        };
+    }
+};
+
+fn workspacePageSurfaceCount(workspace_page: *WorkspacePage) usize {
+    const tree = workspace_page.getSurfaceTree() orelse return 0;
+    var result: usize = 0;
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        result += @intCast(entry.view.getSurfaceCount());
+    }
+    return result;
+}
 
 pub const Window = extern struct {
     const Self = @This();
@@ -272,11 +307,13 @@ pub const Window = extern struct {
         pending_surface_focus_source: ?c_uint = null,
         pending_workspace_autosave_source: ?c_uint = null,
         pending_workspace_autosave_page: ?*WorkspacePage = null,
+        periodic_workspace_autosave_source: ?c_uint = null,
         shutdown_autosave_complete: bool = false,
         disposing_runtime: bool = false,
         runtime_window_id: ?workspace_ids.WindowId = null,
         runtime_registry: workspace_registry.Registry,
         session_identity_index: workspace_registry.SessionIdentityIndex,
+        scrollback_saved_states: std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState),
         workspace_ids_by_page: std.AutoHashMap(usize, workspace_ids.WorkspaceId),
         split_ids_by_leaf: std.AutoHashMap(usize, workspace_ids.SplitId),
         tab_ids_by_widget: std.AutoHashMap(usize, workspace_ids.TabId),
@@ -357,10 +394,16 @@ pub const Window = extern struct {
         priv.workspace_page_bindings.bind("title", self.as(gobject.Object), "title", .{});
         priv.runtime_registry = workspace_registry.Registry.init(app.allocator());
         priv.session_identity_index = workspace_registry.SessionIdentityIndex.init(app.allocator());
+        priv.scrollback_saved_states = std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState).init(app.allocator());
         priv.workspace_ids_by_page = std.AutoHashMap(usize, workspace_ids.WorkspaceId).init(app.allocator());
         priv.split_ids_by_leaf = std.AutoHashMap(usize, workspace_ids.SplitId).init(app.allocator());
         priv.tab_ids_by_widget = std.AutoHashMap(usize, workspace_ids.TabId).init(app.allocator());
         priv.surface_ids_by_widget = std.AutoHashMap(usize, workspace_ids.SurfaceId).init(app.allocator());
+        priv.periodic_workspace_autosave_source = glib.timeoutAdd(
+            workspace_periodic_autosave_ms,
+            periodicWorkspaceAutosave,
+            self,
+        );
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -1346,6 +1389,22 @@ pub const Window = extern struct {
         return gobject.ext.cast(WorkspacePage, child);
     }
 
+    fn findWorkspacePageByRuntimeId(
+        self: *Self,
+        workspace_id: workspace_ids.WorkspaceId,
+    ) ?*WorkspacePage {
+        const priv = self.private();
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            const mapped_id = priv.workspace_ids_by_page.get(ptrKey(workspace_page)) orelse continue;
+            if (mapped_id == workspace_id) return workspace_page;
+        }
+        return null;
+    }
+
     pub fn getWorkspaceRegistry(self: *Self) *workspace_registry.Registry {
         return &self.private().runtime_registry;
     }
@@ -1451,6 +1510,8 @@ pub const Window = extern struct {
         defer live_tab_keys.deinit(alloc);
         var live_surface_keys: std.ArrayList(usize) = .empty;
         defer live_surface_keys.deinit(alloc);
+        var live_session_ids: std.ArrayList(workspace_ids.SessionId) = .empty;
+        defer live_session_ids.deinit(alloc);
 
         for (0..@intCast(n)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
@@ -1541,6 +1602,7 @@ pub const Window = extern struct {
                     );
                     try priv.session_identity_index.bindSession(session_id, surface_key, session_path);
                     try session_ids.append(alloc, session_id);
+                    try live_session_ids.append(alloc, session_id);
 
                     const title = surface.getEffectiveTitle() orelse tab.getEffectiveTitle() orelse "Ghostty";
                     const tooltip = tab.getTooltip() orelse surface.getPwd();
@@ -1699,6 +1761,11 @@ pub const Window = extern struct {
         pruneIdMap(workspace_ids.TabId, &priv.tab_ids_by_widget, live_tab_keys.items);
         pruneIdMap(workspace_ids.SurfaceId, &priv.surface_ids_by_widget, live_surface_keys.items);
         try priv.session_identity_index.pruneAttachments(live_surface_keys.items);
+        pruneSavedScrollbackStates(
+            Application.default().allocator(),
+            &priv.scrollback_saved_states,
+            live_session_ids.items,
+        );
     }
 
     fn getOrCreateWorkspaceRuntime(self: *Self, workspace_page: *WorkspacePage) !*workspace_registry.WorkspaceRuntime {
@@ -1954,16 +2021,16 @@ pub const Window = extern struct {
         priv.pending_workspace_autosave_source = glib.timeoutAdd(200, idleWorkspaceAutosave, self);
     }
 
-    fn flushPendingWorkspaceAutosave(self: *Self) void {
+    fn cancelPendingWorkspaceAutosave(self: *Self) void {
         const priv = self.private();
         if (priv.pending_workspace_autosave_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_workspace_autosave_source = null;
         }
-        const workspace_page = priv.pending_workspace_autosave_page orelse return;
-        priv.pending_workspace_autosave_page = null;
-        defer workspace_page.unref();
-        self.autosaveWorkspacePage(workspace_page);
+        if (priv.pending_workspace_autosave_page) |workspace_page| {
+            workspace_page.unref();
+            priv.pending_workspace_autosave_page = null;
+        }
     }
 
     fn idleWorkspaceAutosave(ud: ?*anyopaque) callconv(.c) c_int {
@@ -1973,11 +2040,38 @@ pub const Window = extern struct {
         const workspace_page = priv.pending_workspace_autosave_page orelse return 0;
         priv.pending_workspace_autosave_page = null;
         defer workspace_page.unref();
-        self.autosaveWorkspacePage(workspace_page);
+        var scrollback_budget = AutosaveScrollbackBudget.init(
+            workspacePageSurfaceCount(workspace_page),
+        );
+        self.autosaveWorkspacePage(
+            workspace_page,
+            .autosave,
+            &scrollback_budget,
+        );
         return 0;
     }
 
-    fn autosaveWorkspacePage(self: *Self, workspace_page: *WorkspacePage) void {
+    fn periodicWorkspaceAutosave(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return @intFromBool(glib.SOURCE_REMOVE)));
+        const priv = self.private();
+        if (priv.disposing_runtime) {
+            priv.periodic_workspace_autosave_source = null;
+            return @intFromBool(glib.SOURCE_REMOVE);
+        }
+
+        var scrollback_budget = AutosaveScrollbackBudget.init(
+            self.savedWorkspaceSurfaceCount(),
+        );
+        self.autosaveSavedWorkspacePages(.autosave, &scrollback_budget);
+        return @intFromBool(glib.SOURCE_CONTINUE);
+    }
+
+    fn autosaveWorkspacePage(
+        self: *Self,
+        workspace_page: *WorkspacePage,
+        mode: WorkspaceSaveMode,
+        autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    ) void {
         if (self.private().disposing_runtime) return;
         if (workspace_page.getSurfaceTree()) |tree| {
             if (tree.isEmpty()) return;
@@ -1989,12 +2083,20 @@ pub const Window = extern struct {
         if (runtime.workspace.snapshot_ref == null) return;
 
         const alloc = Application.default().allocator();
-        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| switch (err) {
+        const result = saveWorkspaceWithModeAlloc(
+            self,
+            alloc,
+            workspace_page,
+            mode,
+            autosave_scrollback_budget,
+        ) catch |err| switch (err) {
             // During shutdown or structural page teardown, a saved workspace
             // can temporarily lose its selected tab/surface before the widget
             // graph is fully dismantled. Explicit save should still fail on
             // this, but autosave can safely skip the transient state.
-            error.SelectionRequired => return,
+            error.SelectionRequired,
+            error.WorkspaceStorageBusy,
+            => return,
             else => {
                 log.warn("failed to autosave workspace error={}", .{err});
                 return;
@@ -2003,20 +2105,45 @@ pub const Window = extern struct {
         result.deinit(alloc);
     }
 
-    pub fn autosaveAllWorkspacesOnShutdown(self: *Self) void {
+    fn autosaveSavedWorkspacePages(
+        self: *Self,
+        mode: WorkspaceSaveMode,
+        autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    ) void {
         const priv = self.private();
-        if (priv.shutdown_autosave_complete) return;
-        priv.shutdown_autosave_complete = true;
-
-        self.flushPendingWorkspaceAutosave();
-
         const page_count = priv.tab_view.getNPages();
         for (0..@intCast(page_count)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
-            self.autosaveWorkspacePage(workspace_page);
+            self.autosaveWorkspacePage(
+                workspace_page,
+                mode,
+                autosave_scrollback_budget,
+            );
         }
+    }
+
+    pub fn autosaveAllWorkspacesOnShutdown(self: *Self) void {
+        const priv = self.private();
+        if (priv.shutdown_autosave_complete) return;
+        priv.shutdown_autosave_complete = true;
+
+        self.cancelPendingWorkspaceAutosave();
+        self.autosaveSavedWorkspacePages(.shutdown, null);
+    }
+
+    fn savedWorkspaceSurfaceCount(self: *Self) usize {
+        const priv = self.private();
+        var result: usize = 0;
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            result += workspacePageSurfaceCount(workspace_page);
+        }
+        return result;
     }
 
     fn syncWorkspaceListBadges(self: *Self) void {
@@ -2469,6 +2596,10 @@ pub const Window = extern struct {
             workspace_page.unref();
             priv.pending_workspace_autosave_page = null;
         }
+        if (priv.periodic_workspace_autosave_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.periodic_workspace_autosave_source = null;
+        }
         const page_count = priv.tab_view.getNPages();
         for (0..@intCast(page_count)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
@@ -2493,6 +2624,8 @@ pub const Window = extern struct {
         );
 
         priv.session_identity_index.deinit();
+        deinitSavedScrollbackStates(self);
+        priv.scrollback_saved_states.deinit();
         priv.workspace_ids_by_page.deinit();
         priv.split_ids_by_leaf.deinit();
         priv.tab_ids_by_widget.deinit();
@@ -3084,6 +3217,9 @@ pub const Window = extern struct {
         surface: *Surface,
         self: *Self,
     ) callconv(.c) void {
+        if (self.private().session_identity_index.sessionForAttachment(@intFromPtr(surface))) |session_id| {
+            removeSavedScrollbackState(self, session_id);
+        }
         if (ext.getAncestor(Tab, surface.as(gtk.Widget))) |tab| {
             _ = gobject.signalHandlersDisconnectMatched(
                 tab.as(gobject.Object),
@@ -3636,8 +3772,10 @@ pub const Window = extern struct {
             if (results.selection_fallback) |selection_fallback| alloc.free(selection_fallback.reason);
         }
 
-        const restored_workspace_page = restoredWorkspacePage(self) orelse {
-            log.warn("restored workspace replay succeeded but selected page lookup failed", .{});
+        const restored_workspace_page = self.findWorkspacePageByRuntimeId(results.restored_workspace_id) orelse {
+            log.warn("restored workspace replay succeeded but restored page lookup failed workspace_id={}", .{
+                results.restored_workspace_id.raw(),
+            });
             self.as(gtk.Window).present();
             self.addToast(i18n._("Workspace restored"));
             return;
@@ -3710,6 +3848,11 @@ pub const Window = extern struct {
                 entry.path,
             );
         }
+
+        self.private().tab_view.setSelectedPage(
+            self.private().tab_view.getPage(restored_workspace_page.as(gtk.Widget)),
+        );
+        self.focusWorkspaceSelection(restored_workspace_page);
 
         self.as(gtk.Window).present();
         self.addToast(i18n._("Workspace restored"));
@@ -4230,33 +4373,590 @@ pub fn workspaceControlCloseSession(
     };
 }
 
+const WorkspaceSaveMode = enum {
+    explicit,
+    autosave,
+    shutdown,
+};
+
+const SavedScrollbackGeneration = struct {
+    session_id: workspace_ids.SessionId,
+    generation: u64,
+};
+
+const SavedScrollbackState = struct {
+    generation: u64,
+    path: []const u8,
+};
+
 pub fn saveWorkspaceAlloc(
     self: *Window,
     alloc: std.mem.Allocator,
     workspace_page: *WorkspacePage,
+) !WorkspaceControlSaveResult {
+    return saveWorkspaceWithModeAlloc(
+        self,
+        alloc,
+        workspace_page,
+        .explicit,
+        null,
+    );
+}
+
+fn saveWorkspaceWithModeAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+    mode: WorkspaceSaveMode,
+    autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
 ) !WorkspaceControlSaveResult {
     self.refreshWorkspaceRegistrySafe();
     const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
 
     const saved_at = try workspace_snapshot.currentUtcTimestampAlloc(alloc);
     errdefer alloc.free(saved_at);
-    const snapshot_id = Application.default().runtimeIds().next(.snapshot);
-    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(alloc, snapshot_id, saved_at, runtime);
-    defer snapshot_value.deinit(alloc);
 
     var dir = try workspace_storage.createDefaultStorageDirAlloc(alloc);
     defer dir.close();
     const storage = workspace_storage.Storage.init(alloc, dir);
-    const path = try storage.writeCheckpoint(snapshot_value);
+    const checkpoint_path = try storage.checkpointFilenameAlloc(runtime.workspace.slug);
+    defer alloc.free(checkpoint_path);
+
+    var transaction = try storage.beginTransaction(switch (mode) {
+        .autosave => .nonblocking,
+        .explicit, .shutdown => .blocking,
+    });
+    defer transaction.deinit();
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.checkScrollbackPruneBudgetAssumeLocked(checkpoint_path);
+
+    const snapshot_id = while (true) {
+        const candidate = Application.default().runtimeIds().next(.snapshot);
+        storage.createScrollbackDirForSnapshotExclusive(
+            checkpoint_path,
+            candidate,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        break candidate;
+    };
+    var snapshot_sidecar_committed = false;
+    errdefer if (!snapshot_sidecar_committed) {
+        storage.deleteScrollbackSnapshotDir(checkpoint_path, snapshot_id) catch |err| {
+            log.warn("failed to clean aborted workspace scrollback snapshot path={s} snapshot={} error={}", .{
+                checkpoint_path,
+                snapshot_id.raw(),
+                err,
+            });
+        };
+    };
+
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(
+        alloc,
+        snapshot_id,
+        saved_at,
+        runtime,
+    );
+    defer snapshot_value.deinit(alloc);
+
+    var scrollback_generations: std.ArrayList(SavedScrollbackGeneration) = .empty;
+    defer scrollback_generations.deinit(alloc);
+    try writeWorkspaceScrollbackAlloc(
+        self,
+        alloc,
+        storage,
+        checkpoint_path,
+        workspace_page,
+        &snapshot_value,
+        mode,
+        autosave_scrollback_budget,
+        &scrollback_generations,
+    );
+
+    var commit_state: workspace_storage.Storage.CheckpointCommitState = .uncommitted;
+    const path = storage.writeCheckpointTrackedAssumeLocked(
+        snapshot_value,
+        &commit_state,
+    ) catch |err| {
+        snapshot_sidecar_committed = commit_state == .committed;
+        return err;
+    };
     errdefer alloc.free(path);
+    snapshot_sidecar_committed = true;
+    storage.pruneScrollbackDirForSnapshotAssumeLocked(
+        checkpoint_path,
+        snapshot_value,
+    ) catch |err| {
+        log.warn("failed to prune workspace scrollback sidecars path={s} error={}", .{
+            checkpoint_path,
+            err,
+        });
+    };
 
     updateWorkspaceSnapshotRefAlloc(alloc, runtime, snapshot_id, saved_at, path);
+    syncSnapshotScrollbackGenerations(self, snapshot_value, scrollback_generations.items);
     return .{
         .workspace_id = runtime.workspace.workspace_id,
         .snapshot_id = snapshot_id,
         .saved_at = saved_at,
         .path = path,
     };
+}
+
+fn writeWorkspaceScrollbackAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    storage: workspace_storage.Storage,
+    checkpoint_path: []const u8,
+    workspace_page: *WorkspacePage,
+    snapshot_value: *workspace_snapshot.Snapshot,
+    mode: WorkspaceSaveMode,
+    autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+) !void {
+    const tree = workspace_page.getSurfaceTree() orelse return;
+    var unbounded_bytes_remaining: usize = std.math.maxInt(usize);
+    const autosave_budget = if (mode == .autosave)
+        autosave_scrollback_budget orelse return error.AutosaveScrollbackBudgetRequired
+    else
+        null;
+    const bytes_remaining = if (autosave_budget) |budget|
+        &budget.remaining
+    else
+        &unbounded_bytes_remaining;
+    var scrollback_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        snapshot_value.snapshot_id,
+    );
+    defer scrollback_dir.close();
+
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const leaf = entry.view;
+        const surface_count = leaf.getSurfaceCount();
+        for (0..@intCast(surface_count)) |surface_index| {
+            const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse {
+                log.warn("skipping optional scrollback: surface not found index={}", .{surface_index});
+                continue;
+            };
+            const session_id = self.private().session_identity_index.sessionForAttachment(@intFromPtr(surface)) orelse {
+                log.warn("skipping optional scrollback: session identity not found", .{});
+                continue;
+            };
+            const core_surface = surface.core() orelse {
+                log.warn("skipping optional scrollback: surface not initialized session={}", .{session_id.raw()});
+                continue;
+            };
+            const persisted_scrollback_limit =
+                core_surface.persistedScrollbackLimit();
+            if (persisted_scrollback_limit == 0) continue;
+
+            const current_generation = core_surface.scrollbackGeneration();
+            const saved_state = self.private().scrollback_saved_states.get(session_id);
+            const saved_path_exists = if (saved_state) |state|
+                try scrollbackFileUsable(
+                    storage,
+                    state.path,
+                    persisted_scrollback_limit,
+                )
+            else
+                false;
+            const should_write = shouldWriteScrollbackForSave(
+                mode,
+                saved_state,
+                saved_path_exists,
+                session_id,
+                checkpoint_path,
+                current_generation,
+            );
+            if (!should_write) {
+                const state = saved_state.?;
+                try workspace_snapshot.setSessionScrollbackPathAlloc(
+                    snapshot_value,
+                    alloc,
+                    session_id,
+                    state.path,
+                );
+                try scrollback_generations.append(alloc, .{
+                    .session_id = session_id,
+                    .generation = current_generation,
+                });
+                continue;
+            }
+
+            const relative_path = try storage.scrollbackFilenameAlloc(
+                checkpoint_path,
+                snapshot_value.snapshot_id,
+                session_id,
+            );
+            defer alloc.free(relative_path);
+
+            const filename = std.fs.path.basename(relative_path);
+            const operation_limit: usize = if (autosave_budget) |budget|
+                @min(
+                    budget.per_session,
+                    bytes_remaining.*,
+                )
+            else
+                termio.Termio.max_saved_scrollback_replay_bytes;
+            const write_limit = @min(
+                operation_limit,
+                persisted_scrollback_limit,
+            );
+
+            if (write_limit == 0) {
+                _ = try preserveExistingScrollbackForDeferredSave(
+                    snapshot_value,
+                    alloc,
+                    scrollback_generations,
+                    saved_state,
+                    saved_path_exists,
+                    checkpoint_path,
+                    session_id,
+                );
+                continue;
+            }
+
+            if (try copyUnchangedScrollbackSidecarForSave(
+                storage,
+                saved_state,
+                saved_path_exists,
+                checkpoint_path,
+                current_generation,
+                scrollback_dir,
+                filename,
+                @intCast(write_limit),
+            )) |copied_bytes| {
+                if (mode == .autosave) {
+                    bytes_remaining.* -= copied_bytes;
+                }
+                try workspace_snapshot.setSessionScrollbackPathAlloc(
+                    snapshot_value,
+                    alloc,
+                    session_id,
+                    relative_path,
+                );
+                try scrollback_generations.append(alloc, .{
+                    .session_id = session_id,
+                    .generation = current_generation,
+                });
+                continue;
+            }
+
+            const write_result = core_surface.writeScrollbackFile(
+                scrollback_dir,
+                filename,
+                write_limit,
+            ) catch |err| switch (err) {
+                error.NoScrollback => continue,
+                error.SavedScrollbackTooLarge => {
+                    if (mode == .autosave) {
+                        bytes_remaining.* -|= write_limit;
+                    }
+                    _ = try preserveExistingScrollbackForDeferredSave(
+                        snapshot_value,
+                        alloc,
+                        scrollback_generations,
+                        saved_state,
+                        saved_path_exists,
+                        checkpoint_path,
+                        session_id,
+                    );
+                    log.warn("saved scrollback exceeded save budget session={} mode={}", .{
+                        session_id.raw(),
+                        mode,
+                    });
+                    continue;
+                },
+                else => return err,
+            };
+            if (mode == .autosave) {
+                bytes_remaining.* -= write_result.bytes;
+            }
+            try workspace_snapshot.setSessionScrollbackPathAlloc(
+                snapshot_value,
+                alloc,
+                session_id,
+                relative_path,
+            );
+            try scrollback_generations.append(alloc, .{
+                .session_id = session_id,
+                .generation = write_result.generation,
+            });
+        }
+    }
+}
+
+fn preserveExistingScrollbackForDeferredSave(
+    snapshot_value: *workspace_snapshot.Snapshot,
+    alloc: std.mem.Allocator,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    checkpoint_path: []const u8,
+    session_id: workspace_ids.SessionId,
+) !bool {
+    const state = saved_state orelse return false;
+    if (!saved_path_exists) return false;
+    if (!savedScrollbackPathMatchesCheckpoint(
+        state.path,
+        checkpoint_path,
+        session_id,
+    )) return false;
+
+    try workspace_snapshot.setSessionScrollbackPathAlloc(
+        snapshot_value,
+        alloc,
+        session_id,
+        state.path,
+    );
+    try scrollback_generations.append(alloc, .{
+        .session_id = session_id,
+        .generation = state.generation,
+    });
+    return true;
+}
+
+fn shouldWriteScrollbackForSave(
+    mode: WorkspaceSaveMode,
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    session_id: workspace_ids.SessionId,
+    checkpoint_path: []const u8,
+    current_generation: u64,
+) bool {
+    const saved_path_matches_checkpoint = if (saved_state) |state|
+        savedScrollbackPathMatchesCheckpoint(state.path, checkpoint_path, session_id)
+    else
+        false;
+    _ = mode;
+    return !saved_path_exists or
+        !saved_path_matches_checkpoint or
+        shouldWriteScrollbackGeneration(saved_state, current_generation);
+}
+
+fn savedScrollbackPathMatchesCheckpoint(
+    path: []const u8,
+    checkpoint_path: []const u8,
+    session_id: workspace_ids.SessionId,
+) bool {
+    return workspace_storage.Storage.validScrollbackSidecarPathForCheckpointAndSession(
+        path,
+        checkpoint_path,
+        session_id,
+    );
+}
+
+fn shouldWriteScrollbackGeneration(
+    saved_state: ?SavedScrollbackState,
+    current_generation: u64,
+) bool {
+    if (saved_state) |state| {
+        return state.generation != current_generation;
+    }
+
+    // Restored sessions start at generation zero with an existing sidecar.
+    // Preserve that sidecar until the terminal actually receives new output.
+    return current_generation != 0;
+}
+
+fn copyUnchangedScrollbackSidecarForSave(
+    storage: workspace_storage.Storage,
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    checkpoint_path: []const u8,
+    current_generation: u64,
+    dest_dir: std.fs.Dir,
+    dest_filename: []const u8,
+    max_bytes: u64,
+) !?usize {
+    const state = saved_state orelse return null;
+    if (!saved_path_exists) return null;
+    if (shouldWriteScrollbackGeneration(state, current_generation)) return null;
+    if (!workspace_storage.Storage.validScrollbackSidecarPathForCheckpoint(
+        state.path,
+        checkpoint_path,
+    )) return null;
+
+    const copied = storage.copyScrollbackFileToDir(
+        state.path,
+        dest_dir,
+        dest_filename,
+        max_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.Unsupported,
+        error.InvalidWorkspaceScrollbackPath,
+        error.InvalidWorkspaceScrollbackFile,
+        error.SavedScrollbackTooLarge,
+        => return null,
+        else => return err,
+    };
+    return @intCast(copied);
+}
+
+fn scrollbackFileUsable(
+    storage: workspace_storage.Storage,
+    relative_path: []const u8,
+    max_bytes: usize,
+) !bool {
+    const file = storage.openScrollbackFileRead(relative_path) catch |err| switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.Unsupported,
+        error.InvalidWorkspaceScrollbackPath,
+        => return false,
+        else => return err,
+    };
+    defer file.close();
+
+    const stat = file.stat() catch return false;
+    return stat.kind == .file and
+        stat.size <= max_bytes;
+}
+
+fn syncSnapshotScrollbackGenerations(
+    self: *Window,
+    snapshot_value: workspace_snapshot.Snapshot,
+    scrollback_generations: []const SavedScrollbackGeneration,
+) void {
+    for (snapshot_value.sessions) |session| {
+        if (session.scrollback_path == null) {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        }
+
+        const generation = for (scrollback_generations) |entry| {
+            if (entry.session_id == session.session_id) break entry.generation;
+        } else {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        };
+        setSavedScrollbackStateAlloc(
+            self,
+            Application.default().allocator(),
+            session.session_id,
+            generation,
+            session.scrollback_path.?,
+        ) catch |err| {
+            log.warn("failed to record scrollback state session={} error={}", .{
+                session.session_id.raw(),
+                err,
+            });
+        };
+    }
+}
+
+fn syncRestoredScrollbackStates(self: *Window, sessions: []const workspace_restore.SessionPlan) void {
+    const alloc = Application.default().allocator();
+    for (sessions) |session| {
+        const path = session.scrollback_path orelse {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        };
+        if (!restoredScrollbackSidecarUsable(alloc, path)) {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        }
+        setSavedScrollbackStateAlloc(
+            self,
+            alloc,
+            session.session_id,
+            0,
+            path,
+        ) catch |err| {
+            log.warn("failed to record restored scrollback state session={} error={}", .{
+                session.session_id.raw(),
+                err,
+            });
+        };
+    }
+}
+
+fn restoredScrollbackSidecarUsable(
+    alloc: std.mem.Allocator,
+    relative_path: []const u8,
+) bool {
+    if (!validWorkspaceScrollbackPath(relative_path)) return false;
+    const file = openRestoreScrollbackFile(alloc, relative_path) catch return false;
+    defer file.close();
+
+    const stat = file.stat() catch return false;
+    return stat.kind == .file and
+        stat.size <= termio.Termio.max_saved_scrollback_replay_bytes;
+}
+
+fn setSavedScrollbackStateAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    session_id: workspace_ids.SessionId,
+    generation: u64,
+    path: []const u8,
+) !void {
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+
+    const next: SavedScrollbackState = .{
+        .generation = generation,
+        .path = owned_path,
+    };
+    if (try self.private().scrollback_saved_states.fetchPut(session_id, next)) |old| {
+        alloc.free(old.value.path);
+    }
+}
+
+fn removeSavedScrollbackState(self: *Window, session_id: workspace_ids.SessionId) void {
+    if (self.private().scrollback_saved_states.fetchRemove(session_id)) |removed| {
+        Application.default().allocator().free(removed.value.path);
+    }
+}
+
+fn pruneSavedScrollbackStates(
+    alloc: std.mem.Allocator,
+    states: *std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState),
+    live_session_ids: []const workspace_ids.SessionId,
+) void {
+    var stale_session_ids: std.ArrayList(workspace_ids.SessionId) = .empty;
+    defer stale_session_ids.deinit(alloc);
+
+    var it = states.keyIterator();
+    while (it.next()) |session_id| {
+        if (containsSessionId(live_session_ids, session_id.*)) continue;
+        stale_session_ids.append(alloc, session_id.*) catch continue;
+    }
+
+    for (stale_session_ids.items) |session_id| {
+        if (states.fetchRemove(session_id)) |removed| {
+            alloc.free(removed.value.path);
+        }
+    }
+}
+
+fn containsSessionId(
+    values: []const workspace_ids.SessionId,
+    needle: workspace_ids.SessionId,
+) bool {
+    for (values) |value| {
+        if (value == needle) return true;
+    }
+    return false;
+}
+
+fn deinitSavedScrollbackStates(self: *Window) void {
+    const alloc = Application.default().allocator();
+    var it = self.private().scrollback_saved_states.valueIterator();
+    while (it.next()) |state| {
+        alloc.free(state.path);
+    }
 }
 
 pub fn workspaceControlRestoreAlloc(
@@ -4333,6 +5033,7 @@ pub fn workspaceControlRestoreAlloc(
     const restored_runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
     var results = try cloneRestoreResultsAlloc(alloc, finalized.results);
     results.restored_workspace_id = restored_runtime.workspace.workspace_id;
+    syncRestoredScrollbackStates(self, live_plan.sessions);
     return results;
 }
 
@@ -4584,12 +5285,30 @@ fn createRestoreSurfaceAlloc(
     else
         null;
     defer if (title_override) |value| alloc.free(value);
+    var initial_scrollback_file = if (session.scrollback_path) |path| path: {
+        break :path openRestoreScrollbackFile(alloc, path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                log.warn("skipping saved scrollback restore session={} path={s} error={}", .{
+                    session.session_id.raw(),
+                    path,
+                    err,
+                });
+                break :path null;
+            },
+        };
+    } else null;
+    errdefer if (initial_scrollback_file) |file| file.close();
 
     const surface = Surface.new(.{
         .command = command,
         .working_directory = cwd,
+        .initial_scrollback_file = initial_scrollback_file,
         .title = title_override,
     });
+    var surface_owned = true;
+    errdefer if (surface_owned) surface.unref();
+    initial_scrollback_file = null;
     if (session.cwd.len > 0) {
         surface.setPwd(cwd);
         if (title_override == null) {
@@ -4600,7 +5319,25 @@ fn createRestoreSurfaceAlloc(
             surface.setTitle(display_cwd_z);
         }
     }
+    surface_owned = false;
     return surface;
+}
+
+fn openRestoreScrollbackFile(
+    alloc: std.mem.Allocator,
+    relative_path: []const u8,
+) !std.fs.File {
+    if (!workspace_storage.Storage.validScrollbackSidecarPath(relative_path)) return error.InvalidWorkspaceScrollbackPath;
+
+    var dir = try workspace_storage.openDefaultStorageDirAlloc(alloc) orelse return error.FileNotFound;
+    defer dir.close();
+
+    const storage = workspace_storage.Storage.init(alloc, dir);
+    return try storage.openScrollbackFileRead(relative_path);
+}
+
+fn validWorkspaceScrollbackPath(path: []const u8) bool {
+    return workspace_storage.Storage.validScrollbackSidecarPath(path);
 }
 
 fn allocRestoreDisplayPath(
@@ -4824,27 +5561,6 @@ fn workspaceRestoreShouldFork(
     }
 
     return false;
-}
-
-fn findWorkspacePageByRuntimeId(
-    self: *Window,
-    workspace_id: workspace_ids.WorkspaceId,
-) ?*WorkspacePage {
-    const tab_view = self.getTabView();
-    const n = tab_view.getNPages();
-    for (0..@intCast(n)) |i| {
-        const page = tab_view.getNthPage(@intCast(i));
-        const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
-        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
-        if (runtime.workspace.workspace_id == workspace_id) return workspace_page;
-    }
-
-    return null;
-}
-
-fn restoredWorkspacePage(self: *Window) ?*WorkspacePage {
-    const selected_page = self.getTabView().getSelectedPage() orelse return null;
-    return gobject.ext.cast(WorkspacePage, selected_page.getChild());
 }
 
 fn allocForkWorkspaceDisplayName(
@@ -5351,4 +6067,275 @@ test "saved workspace catalog lookup for runtime matches checkpoint path first" 
 
     try testing.expectEqualStrings("work-restored.json", matched.path);
     try testing.expectEqualStrings("work", matched.workspace_name);
+}
+
+test "saved scrollback restore path is validated" {
+    const testing = std.testing;
+    const valid_path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-404.vt";
+
+    try testing.expect(validWorkspaceScrollbackPath(valid_path));
+    try testing.expect(!validWorkspaceScrollbackPath(""));
+    try testing.expect(!validWorkspaceScrollbackPath("catalog.json"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json"));
+    try testing.expect(!validWorkspaceScrollbackPath("/tmp/session-1.vt"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json.scrollback/../session-1.vt"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json.scrollback/snapshot-1/session-404.vt\x00truncated"));
+}
+
+test "saved scrollback autosave rewrites after restored generation changes" {
+    const testing = std.testing;
+    const restored_state: SavedScrollbackState = .{
+        .generation = 0,
+        .path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt",
+    };
+
+    try testing.expect(!shouldWriteScrollbackGeneration(restored_state, 0));
+    try testing.expect(shouldWriteScrollbackGeneration(restored_state, 1));
+}
+
+test "saved scrollback budget deferral preserves the prior generation" {
+    const testing = std.testing;
+
+    var fixture = try testWorkspaceRuntime(testing.allocator);
+    defer fixture.registry.deinit();
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(
+        testing.allocator,
+        workspace_ids.SnapshotId.init(2),
+        "2026-07-10T00:00:00Z",
+        fixture.workspace,
+    );
+    defer snapshot_value.deinit(testing.allocator);
+
+    var generations: std.ArrayList(SavedScrollbackGeneration) = .empty;
+    defer generations.deinit(testing.allocator);
+    const checkpoint_path = "ghostty-deadbeef.json";
+    const session_id = workspace_ids.SessionId.init(31);
+    const prior_path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-31.vt";
+
+    try testing.expect(try preserveExistingScrollbackForDeferredSave(
+        &snapshot_value,
+        testing.allocator,
+        &generations,
+        .{
+            .generation = 7,
+            .path = prior_path,
+        },
+        true,
+        checkpoint_path,
+        session_id,
+    ));
+    try testing.expectEqualStrings(
+        prior_path,
+        snapshot_value.sessions[0].scrollback_path.?,
+    );
+    try testing.expectEqual(@as(usize, 1), generations.items.len);
+    try testing.expectEqual(@as(u64, 7), generations.items[0].generation);
+}
+
+test "saved scrollback explicit save preserves unchanged existing sidecar" {
+    const testing = std.testing;
+    const checkpoint_path = "ghostty-deadbeef.json";
+    const session_id = workspace_ids.SessionId.init(1);
+    const restored_state: SavedScrollbackState = .{
+        .generation = 0,
+        .path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt",
+    };
+
+    try testing.expect(!shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        checkpoint_path,
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        checkpoint_path,
+        1,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        false,
+        session_id,
+        checkpoint_path,
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        "fork-deadbeef.json",
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        restored_state,
+        true,
+        session_id,
+        "fork-deadbeef.json",
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        restored_state,
+        true,
+        workspace_ids.SessionId.init(2),
+        checkpoint_path,
+        0,
+    ));
+}
+
+test "saved scrollback save copies unchanged restored sidecar for remapped session" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = workspace_storage.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("ghostty");
+    defer testing.allocator.free(checkpoint_path);
+    const restored_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(1),
+        workspace_ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(restored_path);
+    const live_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(2),
+        workspace_ids.SessionId.init(99),
+    );
+    defer testing.allocator.free(live_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(1));
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(2));
+    {
+        const file = try tmp.dir.createFile(restored_path, .{});
+        defer file.close();
+        try file.writeAll("saved restored bytes");
+    }
+
+    var dest_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(2),
+    );
+    defer dest_dir.close();
+
+    const copied = try copyUnchangedScrollbackSidecarForSave(
+        storage,
+        .{
+            .generation = 0,
+            .path = restored_path,
+        },
+        true,
+        checkpoint_path,
+        0,
+        dest_dir,
+        std.fs.path.basename(live_path),
+        termio.Termio.max_saved_scrollback_replay_bytes,
+    );
+    try testing.expectEqual(
+        @as(?usize, "saved restored bytes".len),
+        copied,
+    );
+
+    const data = try tmp.dir.readFileAlloc(testing.allocator, live_path, 1024);
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("saved restored bytes", data);
+}
+
+test "saved scrollback fast path rejects oversized existing sidecar" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = workspace_storage.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("ghostty");
+    defer testing.allocator.free(checkpoint_path);
+    const restored_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(1),
+        workspace_ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(restored_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(1));
+    {
+        const file = try tmp.dir.createFile(restored_path, .{});
+        defer file.close();
+        try file.setEndPos(termio.Termio.max_saved_scrollback_replay_bytes + 1);
+    }
+
+    const usable = try scrollbackFileUsable(
+        storage,
+        restored_path,
+        termio.Termio.max_saved_scrollback_replay_bytes,
+    );
+    try testing.expect(!usable);
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        .{
+            .generation = 0,
+            .path = restored_path,
+        },
+        false,
+        workspace_ids.SessionId.init(43),
+        checkpoint_path,
+        0,
+    ));
+}
+
+test "saved scrollback state prune drops sessions missing from live runtime" {
+    const testing = std.testing;
+
+    var states = std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState).init(testing.allocator);
+    defer states.deinit();
+    defer {
+        var it = states.valueIterator();
+        while (it.next()) |state| testing.allocator.free(state.path);
+    }
+
+    const live_session = workspace_ids.SessionId.init(1);
+    const stale_session = workspace_ids.SessionId.init(2);
+    try states.put(live_session, .{
+        .generation = 1,
+        .path = try testing.allocator.dupe(u8, "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt"),
+    });
+    try states.put(stale_session, .{
+        .generation = 1,
+        .path = try testing.allocator.dupe(u8, "ghostty-deadbeef.json.scrollback/snapshot-1/session-2.vt"),
+    });
+
+    pruneSavedScrollbackStates(testing.allocator, &states, &.{live_session});
+
+    try testing.expect(states.contains(live_session));
+    try testing.expect(!states.contains(stale_session));
+}
+
+test "autosave scrollback budget divides the pass fairly" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        workspace_autosave_scrollback_session_bytes,
+        AutosaveScrollbackBudget.init(1).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_session_bytes,
+        AutosaveScrollbackBudget.init(2).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_total_bytes / 3,
+        AutosaveScrollbackBudget.init(3).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_total_bytes,
+        AutosaveScrollbackBudget.init(3).remaining,
+    );
 }

@@ -3156,6 +3156,10 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
     return try self.screens.active.dumpStringAllocUnwrapped(alloc, .{ .viewport = .{} });
 }
 
+pub fn clearPreviousChar(self: *Terminal) void {
+    self.previous_char = null;
+}
+
 /// Full reset.
 ///
 /// This will attempt to free the existing screen memory but if that fails

@@ -115,7 +115,14 @@ pub const SessionRecord = struct {
     command: model.Command,
     env_overrides: []const model.EnvOverride = &.{},
     title_override: ?[]const u8 = null,
+    scrollback_path: ?[]const u8 = null,
     focus_preferred: bool = false,
+
+    pub fn validate(self: SessionRecord) !void {
+        if (self.scrollback_path) |path| {
+            if (path.len == 0) return error.SessionScrollbackPathRequired;
+        }
+    }
 
     pub fn deinit(self: SessionRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.cwd);
@@ -132,6 +139,7 @@ pub const SessionRecord = struct {
         }
         alloc.free(self.env_overrides);
         if (self.title_override) |title_override| alloc.free(title_override);
+        if (self.scrollback_path) |scrollback_path| alloc.free(scrollback_path);
     }
 };
 
@@ -181,6 +189,7 @@ pub const Snapshot = struct {
         }
 
         for (self.sessions, 0..) |session, index| {
+            try session.validate();
             const gop = try session_map.getOrPut(session.session_id);
             if (gop.found_existing) return error.DuplicateSessionId;
             gop.value_ptr.* = index;
@@ -360,6 +369,25 @@ pub const Snapshot = struct {
         }
     }
 };
+
+pub fn setSessionScrollbackPathAlloc(
+    value: *Snapshot,
+    alloc: std.mem.Allocator,
+    session_id: ids.SessionId,
+    path: []const u8,
+) !void {
+    const sessions: []SessionRecord = @constCast(value.sessions);
+    for (sessions) |*session| {
+        if (session.session_id != session_id) continue;
+        const owned_path = try alloc.dupe(u8, path);
+        errdefer alloc.free(owned_path);
+        if (session.scrollback_path) |old_path| alloc.free(old_path);
+        session.scrollback_path = owned_path;
+        return;
+    }
+
+    return error.SessionNotFound;
+}
 
 pub fn fromRuntimeAlloc(
     alloc: std.mem.Allocator,

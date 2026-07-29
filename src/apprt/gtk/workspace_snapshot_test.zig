@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ids = @import("workspace_ids.zig");
 const model = @import("workspace_model.zig");
 const registry = @import("workspace_registry.zig");
@@ -222,6 +223,511 @@ test "workspace checkpoint updates latest catalog entry and prunes replaced snap
     try tmp.dir.access(expected_filename, .{});
 }
 
+test "workspace storage caps catalog and snapshot json reads and writes" {
+    const testing = std.testing;
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        {
+            const file = try tmp.dir.createFile(storage_mod.Storage.catalog_filename, .{});
+            defer file.close();
+            try file.setEndPos(storage_mod.Storage.max_catalog_json_bytes + 1);
+        }
+        try testing.expectError(
+            error.FileTooBig,
+            storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename),
+        );
+
+        const snapshot_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(snapshot_filename);
+        {
+            const file = try tmp.dir.createFile(snapshot_filename, .{});
+            defer file.close();
+            try file.setEndPos(storage_mod.Storage.max_snapshot_json_bytes + 1);
+        }
+        try testing.expectError(
+            error.FileTooBig,
+            storage.readSnapshotAlloc(testing.allocator, snapshot_filename),
+        );
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const huge_name = try testing.allocator.alloc(u8, storage_mod.Storage.max_catalog_json_bytes + 1);
+        defer testing.allocator.free(huge_name);
+        @memset(huge_name, 'a');
+        const catalog: snapshot.Catalog = .{
+            .entries = &.{.{
+                .snapshot_id = ids.SnapshotId.init(1),
+                .workspace_id = ids.WorkspaceId.init(1),
+                .workspace_key = "workspace-key-1",
+                .workspace_name = huge_name,
+                .saved_at = "2026-03-22T12:00:00Z",
+                .path = "workspace-key-1-deadbeef.json",
+            }},
+        };
+        try testing.expectError(
+            error.FileTooBig,
+            storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename),
+        );
+        try testing.expectError(
+            error.FileNotFound,
+            tmp.dir.access(storage_mod.Storage.catalog_filename, .{}),
+        );
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const huge_name = try testing.allocator.alloc(u8, storage_mod.Storage.max_snapshot_json_bytes + 1);
+        defer testing.allocator.free(huge_name);
+        @memset(huge_name, 'b');
+        var value = buildSnapshot();
+        value.workspace.name = huge_name;
+
+        try testing.expectError(error.FileTooBig, storage.writeSnapshot(value));
+        const snapshot_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(snapshot_filename);
+        try testing.expectError(error.FileNotFound, tmp.dir.access(snapshot_filename, .{}));
+    }
+}
+
+test "workspace storage reads json files without following symlinks" {
+    const testing = std.testing;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    {
+        const file = try tmp.dir.createFile("target.json", .{});
+        defer file.close();
+        try file.writeAll("{}");
+    }
+
+    try tmp.dir.symLink("target.json", storage_mod.Storage.catalog_filename, .{});
+    try testing.expectError(
+        error.SymLinkLoop,
+        storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename),
+    );
+    try testing.expectError(error.SymLinkLoop, storage.writeCheckpoint(buildSnapshot()));
+
+    var tmp_snapshot = testing.tmpDir(.{});
+    defer tmp_snapshot.cleanup();
+
+    const snapshot_storage = storage_mod.Storage.init(testing.allocator, tmp_snapshot.dir);
+    {
+        const file = try tmp_snapshot.dir.createFile("target.json", .{});
+        defer file.close();
+        try file.writeAll("{}");
+    }
+    const snapshot_filename = try snapshot_storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(snapshot_filename);
+    try tmp_snapshot.dir.symLink("target.json", snapshot_filename, .{});
+    try testing.expectError(
+        error.SymLinkLoop,
+        snapshot_storage.readSnapshotAlloc(testing.allocator, snapshot_filename),
+    );
+}
+
+test "workspace checkpoint save preserves oversized or malformed catalog" {
+    const testing = std.testing;
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const snapshot_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(snapshot_filename);
+        {
+            const file = try tmp.dir.createFile(snapshot_filename, .{});
+            defer file.close();
+            try file.writeAll("old snapshot");
+        }
+        {
+            const file = try tmp.dir.createFile(storage_mod.Storage.catalog_filename, .{});
+            defer file.close();
+            try file.setEndPos(storage_mod.Storage.max_catalog_json_bytes + 1);
+        }
+
+        try testing.expectError(error.FileTooBig, storage.writeCheckpoint(buildSnapshot()));
+        const stat = try tmp.dir.statFile(storage_mod.Storage.catalog_filename);
+        try testing.expectEqual(
+            @as(u64, storage_mod.Storage.max_catalog_json_bytes + 1),
+            stat.size,
+        );
+        const snapshot_data = try tmp.dir.readFileAlloc(testing.allocator, snapshot_filename, 1024);
+        defer testing.allocator.free(snapshot_data);
+        try testing.expectEqualStrings("old snapshot", snapshot_data);
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const snapshot_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(snapshot_filename);
+        {
+            const file = try tmp.dir.createFile(snapshot_filename, .{});
+            defer file.close();
+            try file.writeAll("old snapshot");
+        }
+        {
+            const file = try tmp.dir.createFile(storage_mod.Storage.catalog_filename, .{});
+            defer file.close();
+            try file.writeAll("{not-json");
+        }
+
+        if (storage.writeCheckpoint(buildSnapshot())) |filename| {
+            defer testing.allocator.free(filename);
+            return error.ExpectedCatalogWriteFailure;
+        } else |_| {}
+
+        const data = try tmp.dir.readFileAlloc(
+            testing.allocator,
+            storage_mod.Storage.catalog_filename,
+            1024,
+        );
+        defer testing.allocator.free(data);
+        try testing.expectEqualStrings("{not-json", data);
+        const snapshot_data = try tmp.dir.readFileAlloc(testing.allocator, snapshot_filename, 1024);
+        defer testing.allocator.free(snapshot_data);
+        try testing.expectEqualStrings("old snapshot", snapshot_data);
+    }
+}
+
+test "workspace checkpoint tracks successful rollback after catalog write failure" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const snapshot_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(snapshot_filename);
+    {
+        const file = try tmp.dir.createFile(snapshot_filename, .{});
+        defer file.close();
+        try file.writeAll("old snapshot");
+    }
+
+    const base_entry: snapshot.CatalogEntry = .{
+        .snapshot_id = ids.SnapshotId.init(1),
+        .workspace_id = ids.WorkspaceId.init(2),
+        .workspace_key = "other-workspace",
+        .workspace_name = "",
+        .saved_at = "2026-07-10T00:00:00Z",
+        .path = "other-workspace-deadbeef.json",
+    };
+    const base_catalog: snapshot.Catalog = .{
+        .entries = &.{base_entry},
+    };
+    const base_data = try base_catalog.encodeAlloc(testing.allocator);
+    defer testing.allocator.free(base_data);
+    const large_name = try testing.allocator.alloc(
+        u8,
+        storage_mod.Storage.max_catalog_json_bytes - base_data.len,
+    );
+    defer testing.allocator.free(large_name);
+    @memset(large_name, 'x');
+
+    const full_catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = base_entry.snapshot_id,
+            .workspace_id = base_entry.workspace_id,
+            .workspace_key = base_entry.workspace_key,
+            .workspace_name = large_name,
+            .saved_at = base_entry.saved_at,
+            .path = base_entry.path,
+        }},
+    };
+    try storage.writeCatalog(
+        full_catalog,
+        storage_mod.Storage.catalog_filename,
+    );
+
+    var transaction = try storage.beginTransaction(.blocking);
+    defer transaction.deinit();
+    var commit_state: storage_mod.Storage.CheckpointCommitState = .committed;
+    try testing.expectError(
+        error.FileTooBig,
+        storage.writeCheckpointTrackedAssumeLocked(
+            buildSnapshot(),
+            &commit_state,
+        ),
+    );
+    try testing.expectEqual(
+        storage_mod.Storage.CheckpointCommitState.uncommitted,
+        commit_state,
+    );
+
+    const snapshot_data = try tmp.dir.readFileAlloc(
+        testing.allocator,
+        snapshot_filename,
+        1024,
+    );
+    defer testing.allocator.free(snapshot_data);
+    try testing.expectEqualStrings("old snapshot", snapshot_data);
+
+    const restored_catalog = try storage.readCatalogAlloc(
+        testing.allocator,
+        storage_mod.Storage.catalog_filename,
+    );
+    defer restored_catalog.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), restored_catalog.entries.len);
+    try testing.expectEqual(
+        large_name.len,
+        restored_catalog.entries[0].workspace_name.len,
+    );
+}
+
+test "workspace storage atomic writes ignore stale deterministic temp symlinks" {
+    const testing = std.testing;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    {
+        const file = try tmp.dir.createFile("target", .{});
+        defer file.close();
+        try file.writeAll("keep");
+    }
+    try tmp.dir.symLink("target", "catalog.json.tmp", .{});
+
+    try storage.writeCatalog(.{}, storage_mod.Storage.catalog_filename);
+
+    const target = try tmp.dir.readFileAlloc(testing.allocator, "target", 1024);
+    defer testing.allocator.free(target);
+    try testing.expectEqualStrings("keep", target);
+}
+
+test "workspace checkpoint pruning ignores unsafe catalog cleanup paths" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer tmp.parent_dir.deleteTree("outside.scrollback") catch {};
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = ids.SnapshotId.init(1),
+            .workspace_id = ids.WorkspaceId.init(1),
+            .workspace_key = "workspace-key-1",
+            .workspace_name = "Developer Workspace",
+            .saved_at = "2026-03-22T12:00:00Z",
+            .path = "../outside",
+        }},
+    };
+
+    try tmp.parent_dir.makePath("outside.scrollback");
+    try storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename);
+    try storage.pruneCheckpoint("workspace-key-1");
+
+    try tmp.parent_dir.access("outside.scrollback", .{});
+    const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.entries.len);
+}
+
+test "workspace checkpoint pruning never deletes catalog from poisoned catalog path" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = ids.SnapshotId.init(1),
+            .workspace_id = ids.WorkspaceId.init(1),
+            .workspace_key = "workspace-key-1",
+            .workspace_name = "Developer Workspace",
+            .saved_at = "2026-03-22T12:00:00Z",
+            .path = storage_mod.Storage.catalog_filename,
+        }},
+    };
+
+    try storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename);
+    try storage.pruneCheckpoint("workspace-key-1");
+
+    const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.entries.len);
+}
+
+test "workspace checkpoint replacement never deletes catalog from poisoned catalog path" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const expected_filename = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(expected_filename);
+    const catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = ids.SnapshotId.init(1),
+            .workspace_id = ids.WorkspaceId.init(1),
+            .workspace_key = "workspace-key-1",
+            .workspace_name = "Developer Workspace",
+            .saved_at = "2026-03-22T12:00:00Z",
+            .path = storage_mod.Storage.catalog_filename,
+        }},
+    };
+
+    try storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename);
+    const filename = try storage.writeCheckpoint(buildSnapshot());
+    defer testing.allocator.free(filename);
+    try testing.expectEqualStrings(expected_filename, filename);
+
+    const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), loaded.entries.len);
+    try testing.expectEqualStrings(expected_filename, loaded.entries[0].path);
+}
+
+test "workspace checkpoint path pruning removes keyless valid checkpoint artifacts" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("legacy-key");
+    defer testing.allocator.free(checkpoint_path);
+    const catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = ids.SnapshotId.init(1),
+            .workspace_id = ids.WorkspaceId.init(1),
+            .workspace_key = null,
+            .workspace_name = "Legacy Workspace",
+            .saved_at = "2026-03-22T12:00:00Z",
+            .path = checkpoint_path,
+        }},
+    };
+
+    {
+        const file = try tmp.dir.createFile(checkpoint_path, .{});
+        defer file.close();
+        try file.writeAll("{}");
+    }
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename);
+
+    try storage.pruneCheckpointPath(checkpoint_path);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.access(checkpoint_path, .{}));
+    const sidecar_dir = try storage.scrollbackDirnameAlloc(checkpoint_path);
+    defer testing.allocator.free(sidecar_dir);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(sidecar_dir, .{}));
+    const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.entries.len);
+}
+
+test "workspace checkpoint path pruning preserves legacy cleanup when sidecar is absent" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("legacy-key");
+    defer testing.allocator.free(checkpoint_path);
+    const catalog: snapshot.Catalog = .{
+        .entries = &.{.{
+            .snapshot_id = ids.SnapshotId.init(1),
+            .workspace_id = ids.WorkspaceId.init(1),
+            .workspace_key = null,
+            .workspace_name = "Legacy Workspace",
+            .saved_at = "2026-03-22T12:00:00Z",
+            .path = checkpoint_path,
+        }},
+    };
+
+    {
+        const file = try tmp.dir.createFile(checkpoint_path, .{});
+        defer file.close();
+        try file.writeAll("{}");
+    }
+    try storage.writeCatalog(catalog, storage_mod.Storage.catalog_filename);
+
+    try storage.pruneCheckpointPath(checkpoint_path);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.access(checkpoint_path, .{}));
+    const loaded = try storage.readCatalogAlloc(testing.allocator, storage_mod.Storage.catalog_filename);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.entries.len);
+}
+
+test "workspace scrollback sidecar helpers reject unsafe checkpoint paths" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const valid_sidecar_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(1),
+    );
+    defer testing.allocator.free(valid_sidecar_path);
+
+    try testing.expect(storage_mod.Storage.validScrollbackSidecarPath(valid_sidecar_path));
+    try testing.expect(storage_mod.Storage.validScrollbackSidecarPathForCheckpoint(
+        valid_sidecar_path,
+        checkpoint_path,
+    ));
+    try testing.expect(storage_mod.Storage.validScrollbackSidecarPathForCheckpointAndSession(
+        valid_sidecar_path,
+        checkpoint_path,
+        ids.SessionId.init(1),
+    ));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPathForCheckpointAndSession(
+        valid_sidecar_path,
+        checkpoint_path,
+        ids.SessionId.init(2),
+    ));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPathForCheckpoint(
+        valid_sidecar_path,
+        "other-deadbeef.json",
+    ));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPath(storage_mod.Storage.catalog_filename));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPath("workspace-key-1-deadbeef.json"));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPath("workspace-key-1-deadbeef.json.scrollback/session-1.vt"));
+    try testing.expect(!storage_mod.Storage.validScrollbackSidecarPath("workspace-key-1-deadbeef.json.scrollback/snapshot-1/session-1.vt\x00truncated"));
+
+    try testing.expectError(error.InvalidCheckpointPath, storage.deleteScrollbackDir("../outside"));
+    try testing.expectError(error.InvalidCheckpointPath, storage.deleteScrollbackDir(storage_mod.Storage.catalog_filename));
+    try testing.expectError(error.InvalidCheckpointPath, storage.ensureScrollbackDir("nested/path.json"));
+    try testing.expectError(
+        error.InvalidCheckpointPath,
+        storage.ensureScrollbackDirForSnapshot("nested/path.json", ids.SnapshotId.init(1)),
+    );
+    try testing.expectError(error.InvalidCheckpointPath, storage.ensureScrollbackDir("nested\\path.json"));
+    try testing.expectError(
+        error.InvalidCheckpointPath,
+        storage.scrollbackFilenameAlloc("nested\\path.json", ids.SnapshotId.init(1), ids.SessionId.init(1)),
+    );
+}
+
 test "workspace checkpoint filenames include a hash to avoid sanitized collisions" {
     const testing = std.testing;
 
@@ -235,6 +741,566 @@ test "workspace checkpoint filenames include a hash to avoid sanitized collision
     defer testing.allocator.free(underscore);
 
     try testing.expect(!std.mem.eql(u8, slash, underscore));
+}
+
+test "workspace storage rejects snapshots with invalid scrollback sidecar paths" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = "workspace-key-1-deadbeef.json.scrollback/session-1.vt";
+    value.sessions = &sessions;
+
+    try testing.expectError(error.InvalidWorkspaceScrollbackPath, storage.writeSnapshot(value));
+}
+
+test "workspace storage rejects scrollback sidecars for another checkpoint" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const other_checkpoint_path = try storage.checkpointFilenameAlloc("other-workspace");
+    defer testing.allocator.free(other_checkpoint_path);
+    const other_sidecar_path = try storage.scrollbackFilenameAlloc(
+        other_checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(1),
+    );
+    defer testing.allocator.free(other_sidecar_path);
+
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = other_sidecar_path;
+    value.sessions = &sessions;
+
+    try testing.expect(storage_mod.Storage.validScrollbackSidecarPath(other_sidecar_path));
+    try testing.expectError(error.InvalidWorkspaceScrollbackPath, storage.writeSnapshot(value));
+}
+
+test "workspace storage rejects scrollback sidecars for another session" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const other_session_sidecar_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(2),
+    );
+    defer testing.allocator.free(other_session_sidecar_path);
+
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = other_session_sidecar_path;
+    value.sessions = &sessions;
+
+    try testing.expect(storage_mod.Storage.validScrollbackSidecarPathForCheckpoint(
+        other_session_sidecar_path,
+        checkpoint_path,
+    ));
+    try testing.expectError(error.InvalidWorkspaceScrollbackPath, storage.writeSnapshot(value));
+}
+
+test "workspace storage rejects persisted snapshots with invalid scrollback sidecar paths" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = "workspace-key-1-deadbeef.json.scrollback/session-1.vt";
+    value.sessions = &sessions;
+
+    const encoded = try value.encodeAlloc(testing.allocator);
+    defer testing.allocator.free(encoded);
+    const file = try tmp.dir.createFile("workspace-key-1-deadbeef.json", .{});
+    defer file.close();
+    try file.writeAll(encoded);
+
+    try testing.expectError(
+        error.InvalidWorkspaceScrollbackPath,
+        storage.readSnapshotAlloc(testing.allocator, "workspace-key-1-deadbeef.json"),
+    );
+}
+
+test "workspace storage rejects persisted scrollback sidecars for another session" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const other_session_sidecar_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(2),
+    );
+    defer testing.allocator.free(other_session_sidecar_path);
+
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = other_session_sidecar_path;
+    value.sessions = &sessions;
+
+    const encoded = try value.encodeAlloc(testing.allocator);
+    defer testing.allocator.free(encoded);
+    const file = try tmp.dir.createFile(checkpoint_path, .{});
+    defer file.close();
+    try file.writeAll(encoded);
+
+    try testing.expectError(
+        error.InvalidWorkspaceScrollbackPath,
+        storage.readSnapshotAlloc(testing.allocator, checkpoint_path),
+    );
+}
+
+test "workspace storage resets scrollback sidecar directory" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+    const scrollback_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(7),
+    );
+    defer testing.allocator.free(scrollback_path);
+
+    try storage.resetScrollbackDir(checkpoint_path);
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id);
+    {
+        const file = try tmp.dir.createFile(scrollback_path, .{});
+        defer file.close();
+        try file.writeAll("saved scrollback");
+    }
+    try tmp.dir.access(scrollback_path, .{});
+
+    try storage.resetScrollbackDir(checkpoint_path);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(scrollback_path, .{}));
+}
+
+test "workspace storage ensures scrollback sidecar directory without pruning" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+    const scrollback_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(7),
+    );
+    defer testing.allocator.free(scrollback_path);
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id);
+    {
+        const file = try tmp.dir.createFile(scrollback_path, .{});
+        defer file.close();
+        try file.writeAll("saved scrollback");
+    }
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try tmp.dir.access(scrollback_path, .{});
+}
+
+test "workspace storage snapshot staging directories are exclusive" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.createScrollbackDirForSnapshotExclusive(
+        checkpoint_path,
+        snapshot_id,
+    );
+
+    const marker_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(1),
+    );
+    defer testing.allocator.free(marker_path);
+    {
+        const marker = try tmp.dir.createFile(marker_path, .{});
+        defer marker.close();
+        try marker.writeAll("committed");
+    }
+
+    try testing.expectError(
+        error.PathAlreadyExists,
+        storage.createScrollbackDirForSnapshotExclusive(
+            checkpoint_path,
+            snapshot_id,
+        ),
+    );
+    const marker = try tmp.dir.readFileAlloc(
+        testing.allocator,
+        marker_path,
+        1024,
+    );
+    defer testing.allocator.free(marker);
+    try testing.expectEqualStrings("committed", marker);
+}
+
+test "workspace storage transaction lock excludes concurrent writers" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    var first = try storage.beginTransaction(.blocking);
+    defer first.deinit();
+
+    try testing.expectError(
+        error.WorkspaceStorageBusy,
+        storage.beginTransaction(.nonblocking),
+    );
+}
+
+test "workspace storage opens scrollback sidecars without following symlinks" {
+    const testing = std.testing;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+    const scrollback_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(7),
+    );
+    defer testing.allocator.free(scrollback_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id);
+    {
+        const file = try tmp.dir.createFile(scrollback_path, .{});
+        defer file.close();
+        try file.writeAll("saved scrollback");
+    }
+    {
+        const file = try storage.openScrollbackFileRead(scrollback_path);
+        defer file.close();
+    }
+
+    try tmp.dir.deleteFile(scrollback_path);
+    try tmp.dir.symLink("target.vt", scrollback_path, .{});
+    try testing.expectError(error.SymLinkLoop, storage.openScrollbackFileRead(scrollback_path));
+    try tmp.dir.deleteFile(scrollback_path);
+
+    const sidecar_dir = try storage.scrollbackDirnameAlloc(checkpoint_path);
+    defer testing.allocator.free(sidecar_dir);
+    try tmp.dir.deleteTree(sidecar_dir);
+    try tmp.dir.makePath("outside");
+    try tmp.dir.symLink("outside", sidecar_dir, .{ .is_directory = true });
+    storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id) catch |err| {
+        try testing.expect(err == error.SymLinkLoop or err == error.NotDir);
+        try testing.expectError(error.FileNotFound, tmp.dir.access("outside/snapshot-1", .{}));
+        return;
+    };
+    return error.ExpectedSymlinkRejection;
+}
+
+test "workspace storage copies scrollback sidecars into snapshot dirs" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const source_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(source_path);
+    const dest_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(2),
+        ids.SessionId.init(99),
+    );
+    defer testing.allocator.free(dest_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, ids.SnapshotId.init(1));
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, ids.SnapshotId.init(2));
+    {
+        const file = try tmp.dir.createFile(source_path, .{});
+        defer file.close();
+        try file.writeAll("restored saved scrollback");
+    }
+
+    var dest_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        ids.SnapshotId.init(2),
+    );
+    defer dest_dir.close();
+    const copied_bytes = try storage.copyScrollbackFileToDir(
+        source_path,
+        dest_dir,
+        std.fs.path.basename(dest_path),
+        1024,
+    );
+    try testing.expectEqual(@as(u64, "restored saved scrollback".len), copied_bytes);
+
+    const copied = try tmp.dir.readFileAlloc(testing.allocator, dest_path, 1024);
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("restored saved scrollback", copied);
+}
+
+test "workspace storage rejects oversized scrollback sidecar copies" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const source_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(1),
+        ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(source_path);
+    const dest_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        ids.SnapshotId.init(2),
+        ids.SessionId.init(99),
+    );
+    defer testing.allocator.free(dest_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, ids.SnapshotId.init(1));
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, ids.SnapshotId.init(2));
+    {
+        const file = try tmp.dir.createFile(source_path, .{});
+        defer file.close();
+        try file.writeAll("too large");
+    }
+
+    var dest_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        ids.SnapshotId.init(2),
+    );
+    defer dest_dir.close();
+    try testing.expectError(
+        error.SavedScrollbackTooLarge,
+        storage.copyScrollbackFileToDir(
+            source_path,
+            dest_dir,
+            std.fs.path.basename(dest_path),
+            4,
+        ),
+    );
+    try testing.expectError(error.FileNotFound, tmp.dir.access(dest_path, .{}));
+}
+
+test "workspace storage prunes unreferenced scrollback sidecars" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+    const keep_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(1),
+    );
+    defer testing.allocator.free(keep_path);
+    const stale_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        snapshot_id,
+        ids.SessionId.init(8),
+    );
+    defer testing.allocator.free(stale_path);
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id);
+    {
+        const file = try tmp.dir.createFile(keep_path, .{});
+        defer file.close();
+        try file.writeAll("saved scrollback");
+    }
+    {
+        const file = try tmp.dir.createFile(stale_path, .{});
+        defer file.close();
+        try file.writeAll("stale scrollback");
+    }
+
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = keep_path;
+    value.sessions = &sessions;
+
+    try storage.pruneScrollbackDirForSnapshot(checkpoint_path, value);
+    try tmp.dir.access(keep_path, .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.access(stale_path, .{}));
+}
+
+test "workspace storage bounds scrollback pruning" {
+    const testing = std.testing;
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(checkpoint_path);
+
+        try storage.ensureScrollbackDir(checkpoint_path);
+        const sidecar_dirname = try storage.scrollbackDirnameAlloc(checkpoint_path);
+        defer testing.allocator.free(sidecar_dirname);
+
+        var sidecar_dir = try tmp.dir.openDir(sidecar_dirname, .{});
+        defer sidecar_dir.close();
+
+        for (0..(storage_mod.Storage.max_prune_snapshot_dirs + 1)) |i| {
+            var buf: [64]u8 = undefined;
+            const dirname = try std.fmt.bufPrint(&buf, "snapshot-{d}", .{i + 1});
+            try sidecar_dir.makeDir(dirname);
+        }
+
+        try testing.expectError(
+            error.WorkspaceScrollbackPruneBudgetExceeded,
+            storage.pruneScrollbackDirForSnapshot(checkpoint_path, buildSnapshot()),
+        );
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+        const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+        defer testing.allocator.free(checkpoint_path);
+
+        try storage.ensureScrollbackDir(checkpoint_path);
+        const sidecar_dirname = try storage.scrollbackDirnameAlloc(checkpoint_path);
+        defer testing.allocator.free(sidecar_dirname);
+
+        var sidecar_dir = try tmp.dir.openDir(sidecar_dirname, .{});
+        defer sidecar_dir.close();
+
+        for (0..(storage_mod.Storage.max_prune_entries + 1)) |i| {
+            var buf: [64]u8 = undefined;
+            const filename = try std.fmt.bufPrint(&buf, "junk-{d}", .{i});
+            const file = try sidecar_dir.createFile(filename, .{});
+            file.close();
+        }
+
+        try testing.expectError(
+            error.WorkspaceScrollbackPruneBudgetExceeded,
+            storage.pruneScrollbackDirForSnapshot(checkpoint_path, buildSnapshot()),
+        );
+    }
+}
+
+test "workspace storage does not recursively delete unexpected scrollback trees" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const snapshot_id = ids.SnapshotId.init(1);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, snapshot_id);
+    const sidecar_dirname = try storage.scrollbackDirnameAlloc(checkpoint_path);
+    defer testing.allocator.free(sidecar_dirname);
+
+    const unexpected_top = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/unexpected/child",
+        .{sidecar_dirname},
+    );
+    defer testing.allocator.free(unexpected_top);
+    try tmp.dir.makePath(unexpected_top);
+
+    const unexpected_snapshot_child = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}/snapshot-99/nested/child",
+        .{sidecar_dirname},
+    );
+    defer testing.allocator.free(unexpected_snapshot_child);
+    try tmp.dir.makePath(unexpected_snapshot_child);
+
+    try storage.pruneScrollbackDirForSnapshot(checkpoint_path, buildSnapshot());
+    try tmp.dir.access(unexpected_top, .{});
+    try tmp.dir.access(unexpected_snapshot_child, .{});
+}
+
+test "workspace storage does not preserve invalid scrollback sidecar references" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = storage_mod.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("workspace-key-1");
+    defer testing.allocator.free(checkpoint_path);
+    const invalid_path = try std.fmt.allocPrint(
+        testing.allocator,
+        "{s}.scrollback/session-1.vt",
+        .{checkpoint_path},
+    );
+    defer testing.allocator.free(invalid_path);
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    {
+        const file = try tmp.dir.createFile(invalid_path, .{});
+        defer file.close();
+        try file.writeAll("invalid saved scrollback");
+    }
+
+    var value = buildSnapshot();
+    var sessions = [_]snapshot.SessionRecord{fixture_sessions[0]};
+    sessions[0].scrollback_path = invalid_path;
+    value.sessions = &sessions;
+
+    try storage.pruneScrollbackDirForSnapshot(checkpoint_path, value);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(invalid_path, .{}));
 }
 
 test "workspace snapshot validates workspace-level split topology" {

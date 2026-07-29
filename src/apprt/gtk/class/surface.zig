@@ -814,6 +814,7 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
+            initial_scrollback_file: ?std.fs.File = null,
 
             pub const none: @This() = .{};
         } = .none,
@@ -824,6 +825,7 @@ pub const Surface = extern struct {
     pub fn new(overrides: struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
+        initial_scrollback_file: ?std.fs.File = null,
         title: ?[:0]const u8 = null,
 
         pub const none: @This() = .{};
@@ -836,6 +838,7 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+            .initial_scrollback_file = overrides.initial_scrollback_file,
         };
         return self;
     }
@@ -2138,6 +2141,10 @@ pub const Surface = extern struct {
         if (priv.overrides.working_directory) |wd| {
             alloc.free(wd);
             priv.overrides.working_directory = null;
+        }
+        if (priv.overrides.initial_scrollback_file) |file| {
+            file.close();
+            priv.overrides.initial_scrollback_file = null;
         }
 
         // Clean up key sequence and key table state
@@ -3823,6 +3830,9 @@ pub const Surface = extern struct {
             config.@"working-directory" = wd_val;
         }
 
+        const initial_scrollback_file = priv.overrides.initial_scrollback_file;
+        priv.overrides.initial_scrollback_file = null;
+
         // Initialize the surface
         surface.init(
             alloc,
@@ -3830,6 +3840,9 @@ pub const Surface = extern struct {
             app.core(),
             app.rt(),
             &priv.rt_surface,
+            .{
+                .initial_scrollback_file = initial_scrollback_file,
+            },
         ) catch |err| {
             log.warn("failed to initialize surface err={}", .{err});
             return error.SurfaceError;
