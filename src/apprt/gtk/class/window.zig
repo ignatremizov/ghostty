@@ -4283,6 +4283,9 @@ pub fn workspaceControlOpen(
     const title = try alloc.dupeZ(u8, target);
     defer alloc.free(title);
     self.newWorkspaceForWindow(null, .{ .title = title });
+    const workspace_page = self.getSelectedWorkspacePage() orelse
+        return error.WorkspaceNotFound;
+    workspace_page.setTitleOverride(title);
     refreshWorkspaceControlRuntime(self);
 
     const resolved = resolveWorkspaceControlWorkspace(self, null) orelse return error.WorkspaceNotFound;
