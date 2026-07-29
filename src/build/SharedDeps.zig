@@ -455,10 +455,13 @@ pub fn add(
         return static_libs;
     }
 
-    // On Linux, we need to add a couple common library paths that aren't
-    // on the standard search list. i.e. GTK is often in /usr/lib/x86_64-linux-gnu
-    // on x86_64.
-    if (step.rootModuleTarget().os.tag == .linux) {
+    // On Linux outside Nix, add common multiarch library paths that aren't
+    // on the standard search list. Inside a Nix shell, pkg-config already
+    // supplies the declared store paths, and adding the host path can make
+    // Zig link older host libraries against newer Nix headers.
+    if (step.rootModuleTarget().os.tag == .linux and
+        self.config.env.get("IN_NIX_SHELL") == null)
+    {
         const triple = try step.rootModuleTarget().linuxTriple(b.allocator);
         const path = b.fmt("/usr/lib/{s}", .{triple});
         if (std.Io.Dir.accessAbsolute(b.graph.io, path, .{})) {
