@@ -3,6 +3,7 @@
 const xev = @import("../global.zig").xev;
 const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
+const std = @import("std");
 const Config = @import("../config.zig").Config;
 const termio = @import("../termio.zig");
 
@@ -39,3 +40,8 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Optional already-open VT-formatted scrollback file to replay before the
+/// backend starts. Termio takes ownership of the file when initialization
+/// succeeds.
+initial_scrollback_file: ?std.Io.File = null,

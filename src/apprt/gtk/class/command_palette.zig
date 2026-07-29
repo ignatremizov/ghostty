@@ -318,6 +318,7 @@ pub const CommandPalette = extern struct {
 
             commands.append(alloc, cmd) catch |err| {
                 log.warn("failed to add restore command to list: {}", .{err});
+                cmd.unref();
                 continue;
             };
         }

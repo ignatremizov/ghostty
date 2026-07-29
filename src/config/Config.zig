@@ -43,6 +43,9 @@ pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
 const string = @import("string.zig");
 const Limit = @import("limit.zig").Limit;
 
+/// Hard safety ceiling for persisted workspace scrollback and replay.
+pub const max_persisted_scrollback_bytes: usize = 256 * 1024 * 1024;
+
 // We do this instead of importing all of terminal/main.zig to
 // limit the dependency graph. This is important because some things
 // like the `ghostty-build-data` binary depend on the Config but don't
@@ -1430,6 +1433,17 @@ input: RepeatableReadableIO = .{},
 /// Changing this at runtime affects future compression work. Pages which are
 /// already compressed remain compressed until their contents are accessed.
 @"scrollback-compression": bool = true,
+
+/// The maximum number of bytes of scrollback persisted per terminal surface
+/// in workspace snapshots. When the current scrollback is larger, the newest
+/// complete terminal rows that fit are saved.
+///
+/// Set this to zero to disable saving and restoring workspace scrollback while
+/// continuing to save the workspace layout. Values above 256 MiB are clamped
+/// to that hard replay safety limit.
+///
+/// This can be changed at runtime and affects subsequent workspace saves.
+@"persisted-scrollback-limit": usize = max_persisted_scrollback_bytes,
 
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
@@ -4783,6 +4797,10 @@ pub fn finalize(self: *Config) !void {
     }
 
     self.@"faint-opacity" = std.math.clamp(self.@"faint-opacity", 0.0, 1.0);
+    self.@"persisted-scrollback-limit" = @min(
+        self.@"persisted-scrollback-limit",
+        max_persisted_scrollback_bytes,
+    );
 
     // Finalize key remapping set for efficient lookups
     self.@"key-remap".finalize();
@@ -10400,6 +10418,24 @@ test "test entryFormatter" {
     var p: Duration = .{ .duration = std.math.maxInt(u64) };
     try p.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
     try std.testing.expectEqualStrings("a = 584y 49w 23h 34m 33s 709ms 551µs 615ns\n", buf.written());
+}
+
+test "persisted scrollback limit defaults and clamps to replay ceiling" {
+    const testing = std.testing;
+
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    try testing.expectEqual(
+        max_persisted_scrollback_bytes,
+        cfg.@"persisted-scrollback-limit",
+    );
+
+    cfg.@"persisted-scrollback-limit" = std.math.maxInt(usize);
+    try cfg.finalize();
+    try testing.expectEqual(
+        max_persisted_scrollback_bytes,
+        cfg.@"persisted-scrollback-limit",
+    );
 }
 
 const TestIterator = struct {

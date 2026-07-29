@@ -1,9 +1,11 @@
 const std = @import("std");
+const global = @import("../../global.zig");
 const ids = @import("workspace_ids.zig");
 const model = @import("workspace_model.zig");
 const registry = @import("workspace_registry.zig");
 
 pub const current_version: u32 = 1;
+pub const max_layout_depth: usize = 256;
 
 pub fn formatUtcTimestampAlloc(alloc: std.mem.Allocator, unix_seconds: i64) ![]u8 {
     if (unix_seconds < 0) return error.UnsupportedTimestamp;
@@ -27,7 +29,10 @@ pub fn formatUtcTimestampAlloc(alloc: std.mem.Allocator, unix_seconds: i64) ![]u
 }
 
 pub fn currentUtcTimestampAlloc(alloc: std.mem.Allocator) ![]u8 {
-    return formatUtcTimestampAlloc(alloc, std.time.timestamp());
+    return formatUtcTimestampAlloc(
+        alloc,
+        std.Io.Timestamp.now(global.io(), .real).toSeconds(),
+    );
 }
 
 pub const WorkspaceSelection = struct {
@@ -87,6 +92,11 @@ pub const LayoutNodeRecord = struct {
     is_selected: bool = false,
 
     pub fn validate(self: LayoutNodeRecord) !void {
+        if (self.ratio) |ratio| {
+            if (!std.math.isFinite(ratio) or ratio < 0 or ratio > 1) {
+                return error.InvalidSplitRatio;
+            }
+        }
         switch (self.node_type) {
             .split_root => if (self.child_ids == null) return error.SplitRootRequiresChildren,
             .tab_root => if (self.child_ids == null) return error.TabRootRequiresChildren,
@@ -115,7 +125,14 @@ pub const SessionRecord = struct {
     command: model.Command,
     env_overrides: []const model.EnvOverride = &.{},
     title_override: ?[]const u8 = null,
+    scrollback_path: ?[]const u8 = null,
     focus_preferred: bool = false,
+
+    pub fn validate(self: SessionRecord) !void {
+        if (self.scrollback_path) |path| {
+            if (path.len == 0) return error.SessionScrollbackPathRequired;
+        }
+    }
 
     pub fn deinit(self: SessionRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.cwd);
@@ -132,6 +149,7 @@ pub const SessionRecord = struct {
         }
         alloc.free(self.env_overrides);
         if (self.title_override) |title_override| alloc.free(title_override);
+        if (self.scrollback_path) |scrollback_path| alloc.free(scrollback_path);
     }
 };
 
@@ -181,6 +199,7 @@ pub const Snapshot = struct {
         }
 
         for (self.sessions, 0..) |session, index| {
+            try session.validate();
             const gop = try session_map.getOrPut(session.session_id);
             if (gop.found_existing) return error.DuplicateSessionId;
             gop.value_ptr.* = index;
@@ -192,6 +211,7 @@ pub const Snapshot = struct {
             if (gop.found_existing) return error.DuplicateLayoutNodeId;
             gop.value_ptr.* = index;
         }
+        try validateLayoutAcyclic(alloc, self.layout, &layout_map);
 
         for (self.splits) |split| {
             const root_index = layout_map.get(split.root_layout_node_id) orelse return error.SplitRootMissing;
@@ -277,6 +297,7 @@ pub const Snapshot = struct {
             var reachable_split_roots = std.StringHashMap(void).init(alloc);
             defer reachable_split_roots.deinit();
             try collectReachableSplitRoots(
+                alloc,
                 self.layout,
                 &layout_map,
                 &reachable_split_roots,
@@ -674,6 +695,25 @@ fn deinitEnvOverrides(
     alloc.free(env_overrides);
 }
 
+pub fn setSessionScrollbackPathAlloc(
+    value: *Snapshot,
+    alloc: std.mem.Allocator,
+    session_id: ids.SessionId,
+    path: []const u8,
+) !void {
+    const sessions: []SessionRecord = @constCast(value.sessions);
+    for (sessions) |*session| {
+        if (session.session_id != session_id) continue;
+        const owned_path = try alloc.dupe(u8, path);
+        errdefer alloc.free(owned_path);
+        if (session.scrollback_path) |old_path| alloc.free(old_path);
+        session.scrollback_path = owned_path;
+        return;
+    }
+
+    return error.SessionNotFound;
+}
+
 pub fn fromRuntimeAlloc(
     alloc: std.mem.Allocator,
     snapshot_id: ids.SnapshotId,
@@ -902,7 +942,11 @@ fn cloneStringSliceAlloc(
     }
 
     for (values) |value| {
-        try owned.append(alloc, try alloc.dupe(u8, value));
+        const copy = try alloc.dupe(u8, value);
+        owned.append(alloc, copy) catch |err| {
+            alloc.free(copy);
+            return err;
+        };
     }
 
     return owned.toOwnedSlice(alloc);
@@ -934,37 +978,122 @@ fn cloneEnvOverridesAlloc(
     }
 
     for (env_overrides, 0..) |value, index| {
-        owned[index] = .{
-            .key = try alloc.dupe(u8, value.key),
-            .value = try alloc.dupe(u8, value.value),
-        };
+        owned[index] = try cloneEnvOverrideAlloc(alloc, value);
         initialized += 1;
     }
 
     return owned;
 }
 
+fn cloneEnvOverrideAlloc(
+    alloc: std.mem.Allocator,
+    value: model.EnvOverride,
+) !model.EnvOverride {
+    const key = try alloc.dupe(u8, value.key);
+    errdefer alloc.free(key);
+    const copied_value = try alloc.dupe(u8, value.value);
+    errdefer alloc.free(copied_value);
+    return .{ .key = key, .value = copied_value };
+}
+
 fn collectReachableSplitRoots(
+    alloc: std.mem.Allocator,
     layout: []const LayoutNodeRecord,
     layout_map: *const std.StringHashMap(usize),
     reachable_split_roots: *std.StringHashMap(void),
     layout_node_id: []const u8,
 ) !void {
-    const entry = layout[layout_map.get(layout_node_id) orelse return error.LayoutChildMissing];
-    switch (entry.node_type) {
-        .split_root => {
-            const gop = try reachable_split_roots.getOrPut(entry.layout_node_id);
-            if (gop.found_existing) return;
-        },
-        .split => {
-            if (entry.tab_id != null) return error.WorkspaceLayoutChildInvalid;
-            const child_ids = entry.child_ids orelse return error.LayoutNodeMissingChildren;
-            for (child_ids) |child_id| {
-                try collectReachableSplitRoots(layout, layout_map, reachable_split_roots, child_id);
-            }
-        },
-        else => return error.WorkspaceLayoutChildInvalid,
+    var visited = std.StringHashMap(void).init(alloc);
+    defer visited.deinit();
+    var pending: std.ArrayList([]const u8) = .empty;
+    defer pending.deinit(alloc);
+    try pending.append(alloc, layout_node_id);
+
+    while (pending.pop()) |pending_id| {
+        const visited_gop = try visited.getOrPut(pending_id);
+        if (visited_gop.found_existing) continue;
+        const entry = layout[
+            layout_map.get(pending_id) orelse return error.LayoutChildMissing
+        ];
+        switch (entry.node_type) {
+            .split_root => {
+                _ = try reachable_split_roots.getOrPut(entry.layout_node_id);
+            },
+            .split => {
+                if (entry.tab_id != null) {
+                    return error.WorkspaceLayoutChildInvalid;
+                }
+                const child_ids = entry.child_ids orelse
+                    return error.LayoutNodeMissingChildren;
+                try pending.appendSlice(alloc, child_ids);
+            },
+            else => return error.WorkspaceLayoutChildInvalid,
+        }
     }
+}
+
+fn validateLayoutAcyclic(
+    alloc: std.mem.Allocator,
+    layout: []const LayoutNodeRecord,
+    layout_map: *const std.StringHashMap(usize),
+) !void {
+    const incoming = try alloc.alloc(usize, layout.len);
+    defer alloc.free(incoming);
+    @memset(incoming, 0);
+    const depth = try alloc.alloc(usize, layout.len);
+    defer alloc.free(depth);
+    @memset(depth, 1);
+
+    for (layout) |entry| {
+        const child_ids = entry.child_ids orelse continue;
+        for (child_ids) |child_id| {
+            const child_index = layout_map.get(child_id) orelse
+                return error.LayoutChildMissing;
+            if (incoming[child_index] != 0) {
+                return error.LayoutNodeMultipleParents;
+            }
+            incoming[child_index] = std.math.add(
+                usize,
+                incoming[child_index],
+                1,
+            ) catch return error.LayoutChildCountOverflow;
+        }
+    }
+
+    const pending = try alloc.alloc(usize, layout.len);
+    defer alloc.free(pending);
+    var pending_read: usize = 0;
+    var pending_len: usize = 0;
+    for (incoming, 0..) |count, index| {
+        if (count == 0) {
+            pending[pending_len] = index;
+            pending_len += 1;
+        }
+    }
+
+    while (pending_read < pending_len) : (pending_read += 1) {
+        const entry = layout[pending[pending_read]];
+        const child_ids = entry.child_ids orelse continue;
+        for (child_ids) |child_id| {
+            const child_index = layout_map.get(child_id).?;
+            const child_depth = std.math.add(
+                usize,
+                depth[pending[pending_read]],
+                1,
+            ) catch return error.LayoutDepthExceeded;
+            depth[child_index] = @max(depth[child_index], child_depth);
+            if (depth[child_index] > max_layout_depth) {
+                return error.LayoutDepthExceeded;
+            }
+            incoming[child_index] -= 1;
+            if (incoming[child_index] == 0) {
+                pending[pending_len] = child_index;
+                pending_len += 1;
+            }
+        }
+    }
+
+    if (pending_len != layout.len) return error.LayoutCycle;
 }
 
 fn findLayoutNode(
@@ -1084,6 +1213,85 @@ pub const Catalog = struct {
         if (self.entries.len > 0) alloc.free(self.entries);
     }
 };
+
+fn testCloneSnapshotCollectionsAllocation(alloc: std.mem.Allocator) !void {
+    const strings = try cloneStringSliceAlloc(alloc, &.{ "one", "two", "three" });
+    defer {
+        for (strings) |value| alloc.free(value);
+        alloc.free(strings);
+    }
+
+    const overrides = try cloneEnvOverridesAlloc(alloc, &.{
+        .{ .key = "ONE", .value = "1" },
+        .{ .key = "TWO", .value = "2" },
+    });
+    defer {
+        for (overrides) |item| {
+            alloc.free(item.key);
+            alloc.free(item.value);
+        }
+        alloc.free(overrides);
+    }
+}
+
+test "workspace snapshot collection clones clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testCloneSnapshotCollectionsAllocation,
+        .{},
+    );
+}
+
+fn testLayoutDepth(alloc: std.mem.Allocator, node_count: usize) !void {
+    const node_ids = try alloc.alloc([]u8, node_count);
+    var initialized_ids: usize = 0;
+    defer {
+        for (node_ids[0..initialized_ids]) |id| alloc.free(id);
+        alloc.free(node_ids);
+    }
+    for (node_ids, 0..) |*id, index| {
+        id.* = try std.fmt.allocPrint(alloc, "node-{d}", .{index});
+        initialized_ids += 1;
+    }
+
+    const child_refs = try alloc.alloc([]const u8, node_count - 1);
+    defer alloc.free(child_refs);
+    for (child_refs, 0..) |*child_id, index| {
+        child_id.* = node_ids[index + 1];
+    }
+
+    const layout = try alloc.alloc(LayoutNodeRecord, node_count);
+    defer alloc.free(layout);
+    for (layout, 0..) |*node, index| {
+        node.* = .{
+            .layout_node_id = node_ids[index],
+            .node_type = if (index + 1 == node_count)
+                .session_leaf
+            else
+                .split,
+            .split_direction = if (index + 1 == node_count) null else .right,
+            .child_ids = if (index + 1 == node_count)
+                null
+            else
+                child_refs[index .. index + 1],
+        };
+    }
+
+    var layout_map = std.StringHashMap(usize).init(alloc);
+    defer layout_map.deinit();
+    for (layout, 0..) |node, index| {
+        try layout_map.put(node.layout_node_id, index);
+    }
+    try validateLayoutAcyclic(alloc, layout, &layout_map);
+}
+
+test "workspace snapshot layout depth is bounded before restore" {
+    try testLayoutDepth(std.testing.allocator, max_layout_depth);
+    try std.testing.expectError(
+        error.LayoutDepthExceeded,
+        testLayoutDepth(std.testing.allocator, max_layout_depth + 1),
+    );
+}
 
 test {
     _ = @import("workspace_snapshot_test.zig");

@@ -9,6 +9,7 @@ pub const SurfaceAction = enum {
 
 pub const ScrollbackPolicy = enum {
     do_not_restore,
+    restore_saved,
 };
 
 pub const SelectionHints = struct {
@@ -52,6 +53,7 @@ pub const SessionPlan = struct {
     command: model.Command,
     env_overrides: []const model.EnvOverride = &.{},
     title_override: ?[]const u8 = null,
+    scrollback_path: ?[]const u8 = null,
     focus_preferred: bool = false,
     surface_action: SurfaceAction = .realize_replacement_surface,
     scrollback_policy: ScrollbackPolicy = .do_not_restore,
@@ -546,8 +548,13 @@ fn visitLayoutNode(
                 .command = session.command,
                 .env_overrides = session.env_overrides,
                 .title_override = session.title_override,
+                .scrollback_path = session.scrollback_path,
                 .focus_preferred = session.focus_preferred or
                     (selected_session_id != null and selected_session_id.? == session.session_id),
+                .scrollback_policy = if (session.scrollback_path == null)
+                    .do_not_restore
+                else
+                    .restore_saved,
             });
         },
     }

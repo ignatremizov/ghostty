@@ -209,6 +209,22 @@ test "restore planner builds first-class split replay order with multiple tabs p
     try testing.expectEqual(restore.ScrollbackPolicy.do_not_restore, plan.sessions[0].scrollback_policy);
 }
 
+test "restore planner carries saved scrollback sidecar paths" {
+    const testing = std.testing;
+    const scrollback_path = "client-a-deadbeef.json.scrollback/snapshot-11/session-43.vt";
+
+    var sessions = split_aware_sessions;
+    sessions[1].scrollback_path = scrollback_path;
+    var value = buildSplitAwareSnapshot();
+    value.sessions = &sessions;
+
+    const plan = try restore.planAlloc(testing.allocator, value);
+    defer plan.deinit(testing.allocator);
+
+    try testing.expectEqual(restore.ScrollbackPolicy.restore_saved, plan.sessions[2].scrollback_policy);
+    try testing.expectEqualStrings(scrollback_path, plan.sessions[2].scrollback_path.?);
+}
+
 test "restore finalizer keeps split-aware restored and failed sessions in plan order" {
     const testing = std.testing;
 
