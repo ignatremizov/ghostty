@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_config = @import("../../../build_config.zig");
+const global = @import("../../../global.zig");
 const assert = @import("../../../quirks.zig").inlineAssert;
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -40,8 +41,158 @@ const workspace_registry = @import("../workspace_registry.zig");
 const workspace_restore = @import("../workspace_restore.zig");
 const workspace_snapshot = @import("../workspace_snapshot.zig");
 const workspace_storage = @import("../workspace_storage.zig");
+const termio = @import("../../../termio.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
+const workspace_periodic_autosave_ms = 10 * 60 * 1000;
+const workspace_autosave_retry_ms = 1000;
+const workspace_registry_refresh_ms = 250;
+const workspace_autosave_scrollback_session_bytes = 16 * 1024 * 1024;
+const workspace_autosave_scrollback_total_bytes = 32 * 1024 * 1024;
+pub const max_saved_scrollback_replay_bytes = termio.Termio.max_saved_scrollback_replay_bytes;
+
+const AutosaveScrollbackBudget = struct {
+    remaining: usize = workspace_autosave_scrollback_total_bytes,
+    per_session: usize,
+
+    fn init(session_count: usize) AutosaveScrollbackBudget {
+        const fair_share = if (session_count == 0)
+            workspace_autosave_scrollback_total_bytes
+        else
+            @max(
+                @as(usize, 1),
+                workspace_autosave_scrollback_total_bytes / session_count,
+            );
+        return .{
+            .per_session = @min(
+                workspace_autosave_scrollback_session_bytes,
+                fair_share,
+            ),
+        };
+    }
+};
+
+const WorkspaceSurfaceMoveRecovery = struct {
+    source_page: *WorkspacePage,
+    surface: *Surface,
+
+    fn deinit(self: WorkspaceSurfaceMoveRecovery) void {
+        self.source_page.unref();
+        self.surface.unref();
+    }
+};
+
+pub const PreparedWorkspaceRestoreAssociation = union(enum) {
+    checkpoint: workspace_model.WorkspaceSnapshotRef,
+    fork: struct {
+        name: []u8,
+        name_z: [:0]u8,
+        slug: []u8,
+    },
+    consumed,
+
+    pub fn deinit(self: *PreparedWorkspaceRestoreAssociation, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .checkpoint => |snapshot_ref| {
+                alloc.free(snapshot_ref.saved_at);
+                alloc.free(snapshot_ref.path);
+            },
+            .fork => |value| {
+                alloc.free(value.name);
+                alloc.free(value.name_z);
+                alloc.free(value.slug);
+            },
+            .consumed => {},
+        }
+        self.* = .consumed;
+    }
+};
+
+const WorkspaceExplicitSaveJobs = struct {
+    jobs: std.AutoHashMap(workspace_ids.WorkspaceId, *WorkspaceExplicitSaveJob),
+
+    fn init(alloc: std.mem.Allocator) WorkspaceExplicitSaveJobs {
+        return .{ .jobs = .init(alloc) };
+    }
+
+    fn deinit(self: *WorkspaceExplicitSaveJobs) void {
+        self.jobs.deinit();
+    }
+
+    fn contains(
+        self: *const WorkspaceExplicitSaveJobs,
+        workspace_id: workspace_ids.WorkspaceId,
+    ) bool {
+        return self.jobs.contains(workspace_id);
+    }
+
+    fn register(
+        self: *WorkspaceExplicitSaveJobs,
+        workspace_id: workspace_ids.WorkspaceId,
+        job: *WorkspaceExplicitSaveJob,
+    ) !bool {
+        const entry = try self.jobs.getOrPut(workspace_id);
+        if (entry.found_existing) return false;
+        entry.value_ptr.* = job;
+        return true;
+    }
+
+    fn removeIfCurrent(
+        self: *WorkspaceExplicitSaveJobs,
+        workspace_id: workspace_ids.WorkspaceId,
+        job: *WorkspaceExplicitSaveJob,
+    ) bool {
+        if (self.jobs.get(workspace_id) != job) return false;
+        return self.jobs.remove(workspace_id);
+    }
+
+    fn cancel(
+        self: *WorkspaceExplicitSaveJobs,
+        workspace_id: workspace_ids.WorkspaceId,
+    ) bool {
+        const job = self.jobs.get(workspace_id) orelse return false;
+        job.capture.cancelled.store(true, .release);
+        return true;
+    }
+
+    fn cancelAll(self: *WorkspaceExplicitSaveJobs) void {
+        var jobs = self.jobs.valueIterator();
+        while (jobs.next()) |job| {
+            job.*.capture.cancelled.store(true, .release);
+        }
+    }
+};
+
+const PendingWorkspaceClose = struct {
+    page: ?*adw.TabPage = null,
+
+    fn begin(self: *PendingWorkspaceClose, page: *adw.TabPage) bool {
+        if (self.page != null) return false;
+        self.page = page;
+        return true;
+    }
+
+    fn take(self: *PendingWorkspaceClose) ?*adw.TabPage {
+        const page = self.page;
+        self.page = null;
+        return page;
+    }
+
+    fn takeIf(self: *PendingWorkspaceClose, page: *adw.TabPage) ?*adw.TabPage {
+        if (self.page != page) return null;
+        return self.take();
+    }
+};
+
+fn workspacePageSurfaceCount(workspace_page: *WorkspacePage) usize {
+    const tree = workspace_page.getSurfaceTree() orelse return 0;
+    var result: usize = 0;
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        result += @intCast(entry.view.getSurfaceCount());
+    }
+    return result;
+}
 
 pub const Window = extern struct {
     const Self = @This();
@@ -269,14 +420,30 @@ pub const Window = extern struct {
         /// Workspace page that the context menu was opened for.
         /// setup by `setup-menu`.
         context_menu_page: ?*adw.TabPage = null,
+        pending_workspace_close: PendingWorkspaceClose = .{},
         pending_surface_focus_source: ?c_uint = null,
+        pending_workspace_registry_refresh_source: ?c_uint = null,
         pending_workspace_autosave_source: ?c_uint = null,
-        pending_workspace_autosave_page: ?*WorkspacePage = null,
+        workspace_autosave_retry_source: ?c_uint = null,
+        periodic_workspace_autosave_source: ?c_uint = null,
+        workspace_dirty_generations: std.AutoHashMap(usize, u64),
+        workspace_save_epochs: std.AutoHashMap(usize, u64),
+        workspace_checkpoint_possible: std.AutoHashMap(usize, void),
+        next_workspace_dirty_generation: u64 = 1,
+        workspace_autosave_in_flight: bool = false,
+        workspace_autosave_rerun_requested: bool = false,
+        workspace_autosave_job: ?*WorkspaceAutosaveJob = null,
+        workspace_explicit_save_jobs: WorkspaceExplicitSaveJobs,
+        workspace_surface_move_source_page: ?*WorkspacePage = null,
+        workspace_surface_move_recovery: ?WorkspaceSurfaceMoveRecovery = null,
+        workspace_surface_move_recovery_source: ?c_uint = null,
+        force_close_uncommitted_workspace_page: ?*adw.TabPage = null,
         shutdown_autosave_complete: bool = false,
         disposing_runtime: bool = false,
         runtime_window_id: ?workspace_ids.WindowId = null,
         runtime_registry: workspace_registry.Registry,
         session_identity_index: workspace_registry.SessionIdentityIndex,
+        scrollback_saved_states: std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState),
         workspace_ids_by_page: std.AutoHashMap(usize, workspace_ids.WorkspaceId),
         split_ids_by_leaf: std.AutoHashMap(usize, workspace_ids.SplitId),
         tab_ids_by_widget: std.AutoHashMap(usize, workspace_ids.TabId),
@@ -357,10 +524,20 @@ pub const Window = extern struct {
         priv.workspace_page_bindings.bind("title", self.as(gobject.Object), "title", .{});
         priv.runtime_registry = workspace_registry.Registry.init(app.allocator());
         priv.session_identity_index = workspace_registry.SessionIdentityIndex.init(app.allocator());
+        priv.scrollback_saved_states = std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState).init(app.allocator());
         priv.workspace_ids_by_page = std.AutoHashMap(usize, workspace_ids.WorkspaceId).init(app.allocator());
         priv.split_ids_by_leaf = std.AutoHashMap(usize, workspace_ids.SplitId).init(app.allocator());
         priv.tab_ids_by_widget = std.AutoHashMap(usize, workspace_ids.TabId).init(app.allocator());
         priv.surface_ids_by_widget = std.AutoHashMap(usize, workspace_ids.SurfaceId).init(app.allocator());
+        priv.workspace_dirty_generations = std.AutoHashMap(usize, u64).init(app.allocator());
+        priv.workspace_save_epochs = std.AutoHashMap(usize, u64).init(app.allocator());
+        priv.workspace_checkpoint_possible = std.AutoHashMap(usize, void).init(app.allocator());
+        priv.workspace_explicit_save_jobs = .init(app.allocator());
+        priv.periodic_workspace_autosave_source = glib.timeoutAdd(
+            workspace_periodic_autosave_ms,
+            periodicWorkspaceAutosave,
+            self,
+        );
 
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
@@ -471,6 +648,7 @@ pub const Window = extern struct {
             .init("close", actionClose, null),
             .init("close-tab", actionCloseTab, s_variant_type),
             .init("new-tab", actionNewTab, null),
+            .init("new-workspace", actionNewWorkspace, null),
             .init("new-window", actionNewWindow, null),
             .init("prompt-workspace-title", actionPromptWorkspaceTitle, null),
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
@@ -726,6 +904,10 @@ pub const Window = extern struct {
         target: SelectTab,
     ) bool {
         const priv = self.private();
+        if (priv.workspace_surface_move_recovery != null) {
+            self.addToast(i18n._("A pane move is still being recovered"));
+            return false;
+        }
         const tab_view = priv.tab_view;
 
         const source_workspace_page = ext.getAncestor(
@@ -793,6 +975,8 @@ pub const Window = extern struct {
             self.newEmptyWorkspacePage(destination_pos, true)
         else
             tab_view.getNthPage(destination_pos);
+        var keep_destination = !create_destination;
+        defer if (!keep_destination) self.forceCloseUncommittedWorkspacePage(destination_page);
         const destination_workspace_page = gobject.ext.cast(
             WorkspacePage,
             destination_page.getChild(),
@@ -802,7 +986,13 @@ pub const Window = extern struct {
         const destination_tree = destination_workspace_page.getSplitTree();
 
         _ = surface.ref();
-        defer surface.unref();
+        var release_surface = true;
+        defer if (release_surface) surface.unref();
+        self.private().workspace_surface_move_source_page = source_workspace_page;
+        var clear_move_source = true;
+        defer {
+            if (clear_move_source) self.private().workspace_surface_move_source_page = null;
+        }
 
         if (!source_tree.removeSurface(surface)) {
             self.addToast(i18n._("Unable to move pane to that workspace"));
@@ -813,19 +1003,68 @@ pub const Window = extern struct {
             log.warn("unable to move surface into destination workspace: {}", .{err});
             source_tree.addExistingSurface(.right, surface) catch |restore_err| {
                 log.warn("unable to restore moved surface after failed move: {}", .{restore_err});
+                self.private().workspace_surface_move_recovery = .{
+                    .source_page = source_workspace_page.ref(),
+                    .surface = surface,
+                };
+                release_surface = false;
+                clear_move_source = false;
+                self.scheduleWorkspaceSurfaceMoveRecovery();
             };
-            if (create_destination) tab_view.closePage(destination_page);
             self.addToast(i18n._("Unable to move pane to that workspace"));
             return false;
         };
 
+        keep_destination = true;
         if (!source_tree.getHasSurfaces()) {
+            self.private().workspace_surface_move_source_page = null;
             tab_view.closePage(source_page);
         }
 
         tab_view.setSelectedPage(tab_view.getPage(destination_workspace_page.as(gtk.Widget)));
         surface.grabFocus();
         return true;
+    }
+
+    fn scheduleWorkspaceSurfaceMoveRecovery(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing_runtime or
+            priv.workspace_surface_move_recovery == null or
+            priv.workspace_surface_move_recovery_source != null)
+        {
+            return;
+        }
+
+        priv.workspace_surface_move_recovery_source = glib.timeoutAdd(
+            100,
+            retryWorkspaceSurfaceMoveRecovery,
+            self,
+        );
+    }
+
+    fn retryWorkspaceSurfaceMoveRecovery(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse
+            return @intFromBool(glib.SOURCE_REMOVE)));
+        const priv = self.private();
+        priv.workspace_surface_move_recovery_source = null;
+        if (priv.disposing_runtime) return @intFromBool(glib.SOURCE_REMOVE);
+
+        const recovery = priv.workspace_surface_move_recovery orelse
+            return @intFromBool(glib.SOURCE_REMOVE);
+        recovery.source_page.getSplitTree().addExistingSurface(
+            .right,
+            recovery.surface,
+        ) catch |err| {
+            log.warn("unable to retry restoring moved surface: {}", .{err});
+            self.scheduleWorkspaceSurfaceMoveRecovery();
+            return @intFromBool(glib.SOURCE_REMOVE);
+        };
+
+        priv.workspace_surface_move_recovery = null;
+        priv.workspace_surface_move_source_page = null;
+        recovery.surface.grabFocus();
+        recovery.deinit();
+        return @intFromBool(glib.SOURCE_REMOVE);
     }
 
     pub fn moveSurfaceToTab(
@@ -848,6 +1087,9 @@ pub const Window = extern struct {
 
         split_view.setStartChild(priv.workspace_sidebar.as(gtk.Widget));
         split_view.setPosition(priv.workspace_sidebar_position);
+        self.syncWorkspaceListDescriptors();
+        self.syncWorkspaceListBadges();
+        self.syncWorkspaceSidebarSelection();
     }
 
     pub fn toggleTabOverview(self: *Self) void {
@@ -1128,14 +1370,14 @@ pub const Window = extern struct {
         _ = gobject.Object.signals.notify.connect(
             surface.as(gobject.Object),
             *Self,
-            surfaceRuntimeStateChanged,
+            surfaceTerminalTitleChanged,
             self,
             .{ .detail = "title" },
         );
         _ = gobject.Object.signals.notify.connect(
             surface.as(gobject.Object),
             *Self,
-            surfaceRuntimeStateChanged,
+            surfacePwdChanged,
             self,
             .{ .detail = "pwd" },
         );
@@ -1346,6 +1588,22 @@ pub const Window = extern struct {
         return gobject.ext.cast(WorkspacePage, child);
     }
 
+    fn findWorkspacePageByRuntimeId(
+        self: *Self,
+        workspace_id: workspace_ids.WorkspaceId,
+    ) ?*WorkspacePage {
+        const priv = self.private();
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            const mapped_id = priv.workspace_ids_by_page.get(ptrKey(workspace_page)) orelse continue;
+            if (mapped_id == workspace_id) return workspace_page;
+        }
+        return null;
+    }
+
     pub fn getWorkspaceRegistry(self: *Self) *workspace_registry.Registry {
         return &self.private().runtime_registry;
     }
@@ -1443,21 +1701,23 @@ pub const Window = extern struct {
         const alloc = Application.default().allocator();
         const n = priv.tab_view.getNPages();
 
-        var live_workspace_keys: std.ArrayList(usize) = .empty;
-        defer live_workspace_keys.deinit(alloc);
-        var live_split_keys: std.ArrayList(usize) = .empty;
-        defer live_split_keys.deinit(alloc);
-        var live_tab_keys: std.ArrayList(usize) = .empty;
-        defer live_tab_keys.deinit(alloc);
-        var live_surface_keys: std.ArrayList(usize) = .empty;
-        defer live_surface_keys.deinit(alloc);
+        var live_workspace_keys = std.AutoHashMap(usize, void).init(alloc);
+        defer live_workspace_keys.deinit();
+        var live_split_keys = std.AutoHashMap(usize, void).init(alloc);
+        defer live_split_keys.deinit();
+        var live_tab_keys = std.AutoHashMap(usize, void).init(alloc);
+        defer live_tab_keys.deinit();
+        var live_surface_keys = std.AutoHashMap(usize, void).init(alloc);
+        defer live_surface_keys.deinit();
+        var live_session_ids = std.AutoHashMap(workspace_ids.SessionId, void).init(alloc);
+        defer live_session_ids.deinit();
 
         for (0..@intCast(n)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
             const workspace_key = ptrKey(workspace_page);
-            try live_workspace_keys.append(alloc, workspace_key);
+            try live_workspace_keys.put(workspace_key, {});
 
             const runtime = try self.getOrCreateWorkspaceRuntime(workspace_page);
             runtime.resetRuntime();
@@ -1484,7 +1744,7 @@ pub const Window = extern struct {
             while (it.next()) |entry| {
                 const leaf = entry.view;
                 const split_key = ptrKey(leaf);
-                try live_split_keys.append(alloc, split_key);
+                try live_split_keys.put(split_key, {});
                 const split_id = try self.getOrCreateSplitId(leaf);
                 try split_ids.append(alloc, split_id);
 
@@ -1511,8 +1771,8 @@ pub const Window = extern struct {
                     const surface = tab.getSurface() orelse continue;
                     const tab_key = ptrKey(tab);
                     const surface_key = ptrKey(surface);
-                    try live_tab_keys.append(alloc, tab_key);
-                    try live_surface_keys.append(alloc, surface_key);
+                    try live_tab_keys.put(tab_key, {});
+                    try live_surface_keys.put(surface_key, {});
 
                     const tab_id = try self.getOrCreateTabId(tab);
                     const surface_id = try self.getOrCreateSurfaceId(surface);
@@ -1535,12 +1795,13 @@ pub const Window = extern struct {
                             tab_id.raw(),
                         },
                     );
-                    const session_id = try priv.session_identity_index.resolvePath(
+                    const session_id = try priv.session_identity_index.resolveAttachmentPath(
                         Application.default().runtimeIds(),
+                        surface_key,
                         session_path,
                     );
-                    try priv.session_identity_index.bindSession(session_id, surface_key, session_path);
                     try session_ids.append(alloc, session_id);
+                    try live_session_ids.put(session_id, {});
 
                     const title = surface.getEffectiveTitle() orelse tab.getEffectiveTitle() orelse "Ghostty";
                     const tooltip = tab.getTooltip() orelse surface.getPwd();
@@ -1694,11 +1955,16 @@ pub const Window = extern struct {
             }
         }
 
-        try self.pruneWorkspaceRegistry(live_workspace_keys.items);
-        pruneIdMap(workspace_ids.SplitId, &priv.split_ids_by_leaf, live_split_keys.items);
-        pruneIdMap(workspace_ids.TabId, &priv.tab_ids_by_widget, live_tab_keys.items);
-        pruneIdMap(workspace_ids.SurfaceId, &priv.surface_ids_by_widget, live_surface_keys.items);
-        try priv.session_identity_index.pruneAttachments(live_surface_keys.items);
+        try self.pruneWorkspaceRegistry(&live_workspace_keys);
+        pruneIdMap(workspace_ids.SplitId, &priv.split_ids_by_leaf, &live_split_keys);
+        pruneIdMap(workspace_ids.TabId, &priv.tab_ids_by_widget, &live_tab_keys);
+        pruneIdMap(workspace_ids.SurfaceId, &priv.surface_ids_by_widget, &live_surface_keys);
+        try priv.session_identity_index.pruneAttachmentsSet(&live_surface_keys);
+        pruneSavedScrollbackStates(
+            Application.default().allocator(),
+            &priv.scrollback_saved_states,
+            &live_session_ids,
+        );
     }
 
     fn getOrCreateWorkspaceRuntime(self: *Self, workspace_page: *WorkspacePage) !*workspace_registry.WorkspaceRuntime {
@@ -1711,7 +1977,7 @@ pub const Window = extern struct {
             _ = priv.workspace_ids_by_page.remove(key);
         }
 
-        const title = workspace_page.getSidebarTitle() orelse workspace_page.getTitleOverride() orelse "workspace";
+        const title = workspace_page.getTitleOverride() orelse workspace_page.getSidebarTitle() orelse "workspace";
         const created_at = try allocUtcTimestamp(Application.default().allocator());
         defer Application.default().allocator().free(created_at);
         const title_text: []const u8 = title;
@@ -1734,14 +2000,14 @@ pub const Window = extern struct {
         workspace_page: *WorkspacePage,
     ) !void {
         const alloc = Application.default().allocator();
-        const title = workspace_page.getSidebarTitle() orelse workspace_page.getTitleOverride() orelse "workspace";
+        const title = workspace_page.getTitleOverride() orelse workspace_page.getSidebarTitle() orelse "workspace";
         const title_text: []const u8 = title;
-        const updated_at = try allocUtcTimestamp(alloc);
-
-        alloc.free(runtime.workspace.name);
-        alloc.free(runtime.workspace.updated_at);
-        runtime.workspace.name = try alloc.dupe(u8, title_text);
-        runtime.workspace.updated_at = updated_at;
+        try replaceWorkspaceMetadataTextAlloc(
+            alloc,
+            &runtime.workspace.name,
+            &runtime.workspace.updated_at,
+            title_text,
+        );
         runtime.workspace.attention_summary = .{};
         runtime.workspace.selected_window_id = null;
         runtime.workspace.selected_split_id = null;
@@ -1762,7 +2028,10 @@ pub const Window = extern struct {
         });
     }
 
-    fn pruneWorkspaceRegistry(self: *Self, live_workspace_keys: []const usize) !void {
+    fn pruneWorkspaceRegistry(
+        self: *Self,
+        live_workspace_keys: *const std.AutoHashMap(usize, void),
+    ) !void {
         const alloc = Application.default().allocator();
         const priv = self.private();
         var stale_workspace_keys: std.ArrayList(usize) = .empty;
@@ -1770,7 +2039,7 @@ pub const Window = extern struct {
 
         var it = priv.workspace_ids_by_page.iterator();
         while (it.next()) |entry| {
-            if (containsUsize(live_workspace_keys, entry.key_ptr.*)) continue;
+            if (live_workspace_keys.contains(entry.key_ptr.*)) continue;
             try stale_workspace_keys.append(alloc, entry.key_ptr.*);
         }
 
@@ -1778,6 +2047,8 @@ pub const Window = extern struct {
             const workspace_id = priv.workspace_ids_by_page.get(key) orelse continue;
             _ = priv.runtime_registry.removeWorkspace(workspace_id);
             _ = priv.workspace_ids_by_page.remove(key);
+            _ = priv.workspace_dirty_generations.remove(key);
+            _ = priv.workspace_save_epochs.remove(key);
         }
     }
 
@@ -1812,17 +2083,10 @@ pub const Window = extern struct {
         return @intFromPtr(ptr);
     }
 
-    fn containsUsize(items: []const usize, needle: usize) bool {
-        for (items) |item| {
-            if (item == needle) return true;
-        }
-        return false;
-    }
-
     fn pruneIdMap(
         comptime T: type,
         map: *std.AutoHashMap(usize, T),
-        live_keys: []const usize,
+        live_keys: *const std.AutoHashMap(usize, void),
     ) void {
         const alloc = Application.default().allocator();
         var stale_keys: std.ArrayList(usize) = .empty;
@@ -1830,7 +2094,7 @@ pub const Window = extern struct {
 
         var it = map.iterator();
         while (it.next()) |entry| {
-            if (containsUsize(live_keys, entry.key_ptr.*)) continue;
+            if (live_keys.contains(entry.key_ptr.*)) continue;
             stale_keys.append(alloc, entry.key_ptr.*) catch continue;
         }
 
@@ -1839,8 +2103,25 @@ pub const Window = extern struct {
         }
     }
 
+    fn replaceWorkspaceMetadataTextAlloc(
+        alloc: std.mem.Allocator,
+        name: *[]const u8,
+        updated_at: *[]const u8,
+        title: []const u8,
+    ) !void {
+        const next_updated_at = try allocUtcTimestamp(alloc);
+        errdefer alloc.free(next_updated_at);
+        const next_name = try alloc.dupe(u8, title);
+        errdefer alloc.free(next_name);
+
+        alloc.free(name.*);
+        alloc.free(updated_at.*);
+        name.* = next_name;
+        updated_at.* = next_updated_at;
+    }
+
     fn allocUtcTimestamp(alloc: std.mem.Allocator) ![]u8 {
-        const unix_seconds = std.time.timestamp();
+        const unix_seconds = std.Io.Timestamp.now(global.io(), .real).toSeconds();
         if (unix_seconds < 0) return error.UnsupportedTimestamp;
 
         const epoch_seconds = std.time.epoch.EpochSeconds{
@@ -1862,12 +2143,40 @@ pub const Window = extern struct {
     }
 
     pub fn refreshWorkspaceRegistrySafe(self: *Self) void {
-        if (self.private().disposing_runtime) return;
+        const priv = self.private();
+        if (priv.disposing_runtime) return;
+        if (priv.pending_workspace_registry_refresh_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_workspace_registry_refresh_source = null;
+        }
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to refresh workspace registry error={}", .{err});
         };
+        if (priv.workspace_split_view.getStartChild() == null) return;
         self.syncWorkspaceListDescriptors();
         self.syncWorkspaceListBadges();
+    }
+
+    fn scheduleWorkspaceRegistryRefresh(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing_runtime or priv.pending_workspace_registry_refresh_source != null) return;
+        const source = glib.timeoutAdd(
+            workspace_registry_refresh_ms,
+            idleRefreshWorkspaceRegistry,
+            self,
+        );
+        if (source == 0) {
+            self.refreshWorkspaceRegistrySafe();
+            return;
+        }
+        priv.pending_workspace_registry_refresh_source = source;
+    }
+
+    fn idleRefreshWorkspaceRegistry(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().pending_workspace_registry_refresh_source = null;
+        self.refreshWorkspaceRegistrySafe();
+        return 0;
     }
 
     pub fn getWorkspaceRuntimeForPage(
@@ -1932,9 +2241,43 @@ pub const Window = extern struct {
         self.scheduleWorkspaceAutosaveForPage(workspace_page);
     }
 
+    fn markWorkspaceDirty(self: *Self, workspace_page: *WorkspacePage) void {
+        const priv = self.private();
+        const generation = priv.next_workspace_dirty_generation;
+        priv.next_workspace_dirty_generation +%= 1;
+        if (priv.next_workspace_dirty_generation == 0) {
+            priv.next_workspace_dirty_generation = 1;
+        }
+        priv.workspace_dirty_generations.put(
+            ptrKey(workspace_page),
+            generation,
+        ) catch |err| {
+            log.warn("failed to mark workspace dirty error={}", .{err});
+        };
+    }
+
+    fn bumpWorkspaceSaveEpoch(self: *Self, workspace_page: *WorkspacePage) void {
+        const key = ptrKey(workspace_page);
+        const current = self.private().workspace_save_epochs.get(key) orelse 0;
+        self.private().workspace_save_epochs.put(key, current +% 1) catch |err| {
+            log.warn("failed to advance workspace save epoch error={}", .{err});
+        };
+    }
+
+    fn cancelWorkspaceAutosave(self: *Self, workspace_page: *WorkspacePage) void {
+        const job = self.private().workspace_autosave_job orelse return;
+        const page_key = ptrKey(workspace_page);
+        for (job.captures) |*capture| {
+            if (capture.page_key != page_key) continue;
+            capture.cancelled.store(true, .release);
+            return;
+        }
+    }
+
     fn scheduleWorkspaceAutosaveForPage(self: *Self, workspace_page: *WorkspacePage) void {
         const priv = self.private();
         if (priv.disposing_runtime) return;
+        self.markWorkspaceDirty(workspace_page);
         if (workspace_page.getSurfaceTree()) |tree| {
             if (tree.isEmpty()) return;
         } else {
@@ -1945,39 +2288,199 @@ pub const Window = extern struct {
             _ = glib.Source.remove(source);
             priv.pending_workspace_autosave_source = null;
         }
-        if (priv.pending_workspace_autosave_page) |page| {
-            page.unref();
-            priv.pending_workspace_autosave_page = null;
-        }
-
-        priv.pending_workspace_autosave_page = workspace_page.ref();
         priv.pending_workspace_autosave_source = glib.timeoutAdd(200, idleWorkspaceAutosave, self);
     }
 
-    fn flushPendingWorkspaceAutosave(self: *Self) void {
+    fn workspacePageNeedsAutosave(
+        self: *Self,
+        workspace_page: *WorkspacePage,
+    ) bool {
+        const priv = self.private();
+        if (priv.workspace_dirty_generations.contains(ptrKey(workspace_page))) return true;
+        const tree = workspace_page.getSurfaceTree() orelse return false;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const surface_count = leaf.getSurfaceCount();
+            for (0..@intCast(surface_count)) |surface_index| {
+                const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse continue;
+                const core_surface = surface.core() orelse continue;
+                if (core_surface.persistedScrollbackLimit() == 0) continue;
+                const session_id = priv.session_identity_index.sessionForAttachment(
+                    @intFromPtr(surface),
+                ) orelse continue;
+                const generation = core_surface.scrollbackGeneration();
+                if (shouldWriteScrollbackGeneration(
+                    priv.scrollback_saved_states.get(session_id),
+                    generation,
+                )) return true;
+            }
+        }
+        return false;
+    }
+
+    fn hasDirtySavedWorkspace(self: *Self) bool {
+        const priv = self.private();
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const workspace_page = gobject.ext.cast(
+                WorkspacePage,
+                page.getChild(),
+            ) orelse continue;
+            const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+            if (runtime.workspace.snapshot_ref == null) continue;
+            if (self.workspacePageNeedsAutosave(workspace_page)) return true;
+        }
+        return false;
+    }
+
+    fn cancelPendingWorkspaceAutosave(self: *Self) void {
         const priv = self.private();
         if (priv.pending_workspace_autosave_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_workspace_autosave_source = null;
         }
-        const workspace_page = priv.pending_workspace_autosave_page orelse return;
-        priv.pending_workspace_autosave_page = null;
-        defer workspace_page.unref();
-        self.autosaveWorkspacePage(workspace_page);
     }
 
     fn idleWorkspaceAutosave(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
         const priv = self.private();
         priv.pending_workspace_autosave_source = null;
-        const workspace_page = priv.pending_workspace_autosave_page orelse return 0;
-        priv.pending_workspace_autosave_page = null;
-        defer workspace_page.unref();
-        self.autosaveWorkspacePage(workspace_page);
+        self.startWorkspaceAutosavePass(null) catch |err| {
+            log.warn("failed to start workspace autosave pass error={}", .{err});
+        };
         return 0;
     }
 
-    fn autosaveWorkspacePage(self: *Self, workspace_page: *WorkspacePage) void {
+    fn periodicWorkspaceAutosave(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return @intFromBool(glib.SOURCE_REMOVE)));
+        const priv = self.private();
+        if (priv.disposing_runtime) {
+            priv.periodic_workspace_autosave_source = null;
+            return @intFromBool(glib.SOURCE_REMOVE);
+        }
+
+        self.startWorkspaceAutosavePass(null) catch |err| {
+            log.warn("failed to start periodic workspace autosave pass error={}", .{err});
+        };
+        return @intFromBool(glib.SOURCE_CONTINUE);
+    }
+
+    fn scheduleWorkspaceAutosaveRetry(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing_runtime or priv.workspace_autosave_retry_source != null) return;
+        priv.workspace_autosave_retry_source = glib.timeoutAdd(
+            workspace_autosave_retry_ms,
+            retryWorkspaceAutosave,
+            self,
+        );
+    }
+
+    fn retryWorkspaceAutosave(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        priv.workspace_autosave_retry_source = null;
+        if (priv.disposing_runtime) return @intFromBool(glib.SOURCE_REMOVE);
+        self.startWorkspaceAutosavePass(null) catch |err| {
+            log.warn("failed to retry workspace autosave error={}", .{err});
+        };
+        return @intFromBool(glib.SOURCE_REMOVE);
+    }
+
+    fn startWorkspaceAutosavePass(
+        self: *Self,
+        requested_page: ?*WorkspacePage,
+    ) !void {
+        const priv = self.private();
+        if (priv.disposing_runtime) return;
+        if (priv.workspace_autosave_in_flight) {
+            priv.workspace_autosave_rerun_requested = true;
+            return;
+        }
+        if (requested_page == null and !self.hasDirtySavedWorkspace()) return;
+
+        self.refreshWorkspaceRegistrySafe();
+        const alloc = Application.default().allocator();
+        var captures: std.ArrayList(AutosaveWorkspaceCapture) = .empty;
+        defer captures.deinit(alloc);
+        errdefer {
+            for (captures.items) |*capture| capture.deinit(alloc);
+        }
+
+        var surface_count: usize = 0;
+        const page_count = priv.tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = priv.tab_view.getNthPage(@intCast(i));
+            const child = page.getChild();
+            const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
+            if (requested_page) |requested| {
+                if (workspace_page != requested) continue;
+            }
+            const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
+            if (runtime.workspace.snapshot_ref == null) continue;
+            if (priv.workspace_explicit_save_jobs.contains(
+                runtime.workspace.workspace_id,
+            )) {
+                priv.workspace_autosave_rerun_requested = true;
+                continue;
+            }
+            if (requested_page == null and
+                !self.workspacePageNeedsAutosave(workspace_page)) continue;
+
+            try priv.workspace_checkpoint_possible.put(
+                ptrKey(workspace_page),
+                {},
+            );
+            var capture = try captureWorkspaceAutosaveAlloc(
+                self,
+                alloc,
+                workspace_page,
+                runtime,
+            );
+            errdefer capture.deinit(alloc);
+            surface_count += capture.surfaces.len;
+            try captures.append(alloc, capture);
+        }
+        if (captures.items.len == 0) return;
+
+        const owned_captures = try captures.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_captures) |*capture| capture.deinit(alloc);
+            alloc.free(owned_captures);
+        }
+        const outcomes = try alloc.alloc(AutosaveWorkspaceOutcome, owned_captures.len);
+        for (outcomes) |*outcome| outcome.* = .{};
+        errdefer alloc.free(outcomes);
+
+        const job = try alloc.create(WorkspaceAutosaveJob);
+        job.* = .{
+            .alloc = alloc,
+            .window = self.ref(),
+            .captures = owned_captures,
+            .outcomes = outcomes,
+            .budget = AutosaveScrollbackBudget.init(surface_count),
+        };
+
+        priv.workspace_autosave_in_flight = true;
+        priv.workspace_autosave_job = job;
+        const thread = std.Thread.spawn(.{}, workspaceAutosaveThreadMain, .{job}) catch |err| {
+            priv.workspace_autosave_in_flight = false;
+            priv.workspace_autosave_job = null;
+            log.warn("failed to start workspace autosave worker error={}", .{err});
+            job.deinitOnMain();
+            return;
+        };
+        thread.setName(global.io(), "workspace-autosave") catch {};
+        thread.detach();
+    }
+
+    fn autosaveWorkspacePage(
+        self: *Self,
+        workspace_page: *WorkspacePage,
+        mode: WorkspaceSaveMode,
+        autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    ) void {
         if (self.private().disposing_runtime) return;
         if (workspace_page.getSurfaceTree()) |tree| {
             if (tree.isEmpty()) return;
@@ -1987,14 +2490,23 @@ pub const Window = extern struct {
         self.refreshWorkspaceRegistrySafe();
         const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return;
         if (runtime.workspace.snapshot_ref == null) return;
+        if (mode == .autosave and !self.workspacePageNeedsAutosave(workspace_page)) return;
 
         const alloc = Application.default().allocator();
-        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| switch (err) {
+        const result = saveWorkspaceWithModeAlloc(
+            self,
+            alloc,
+            workspace_page,
+            mode,
+            autosave_scrollback_budget,
+        ) catch |err| switch (err) {
             // During shutdown or structural page teardown, a saved workspace
             // can temporarily lose its selected tab/surface before the widget
             // graph is fully dismantled. Explicit save should still fail on
             // this, but autosave can safely skip the transient state.
-            error.SelectionRequired => return,
+            error.SelectionRequired,
+            error.WorkspaceStorageBusy,
+            => return,
             else => {
                 log.warn("failed to autosave workspace error={}", .{err});
                 return;
@@ -2003,20 +2515,33 @@ pub const Window = extern struct {
         result.deinit(alloc);
     }
 
-    pub fn autosaveAllWorkspacesOnShutdown(self: *Self) void {
+    fn autosaveSavedWorkspacePages(
+        self: *Self,
+        mode: WorkspaceSaveMode,
+        autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    ) void {
         const priv = self.private();
-        if (priv.shutdown_autosave_complete) return;
-        priv.shutdown_autosave_complete = true;
-
-        self.flushPendingWorkspaceAutosave();
-
         const page_count = priv.tab_view.getNPages();
         for (0..@intCast(page_count)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
-            self.autosaveWorkspacePage(workspace_page);
+            self.autosaveWorkspacePage(
+                workspace_page,
+                mode,
+                autosave_scrollback_budget,
+            );
         }
+    }
+
+    pub fn autosaveAllWorkspacesOnShutdown(self: *Self) void {
+        const priv = self.private();
+        if (priv.shutdown_autosave_complete) return;
+        priv.shutdown_autosave_complete = true;
+
+        self.cancelPendingWorkspaceAutosave();
+        priv.workspace_explicit_save_jobs.cancelAll();
+        self.autosaveSavedWorkspacePages(.shutdown, null);
     }
 
     fn syncWorkspaceListBadges(self: *Self) void {
@@ -2055,62 +2580,75 @@ pub const Window = extern struct {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
             const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse continue;
-
-            const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
-                priv.workspace_sidebar.updateRowDescriptor(
-                    @intCast(i),
-                    workspace_page.getSidebarTitle() orelse "Workspace",
-                    workspace_page.getSidebarSubtitle() orelse "",
-                    workspace_page.getTooltip(),
-                );
-                continue;
-            };
-
-            const selected = workspace_registry.selectedSessionDescriptor(runtime);
-            var fallback_title_allocated = false;
-            const title: [:0]const u8 = workspace_page.getSidebarTitle() orelse
-                workspace_page.getTitleOverride() orelse title: {
-                fallback_title_allocated = true;
-                break :title alloc.dupeZ(u8, runtime.workspace.name) catch "Workspace";
-            };
-            defer if (fallback_title_allocated) alloc.free(title);
-
-            var fallback_subtitle_allocated = false;
-            const base_subtitle: ?[:0]const u8 = workspace_page.getSidebarSubtitle() orelse subtitle: {
-                const selected_desc = selected orelse break :subtitle null;
-                fallback_subtitle_allocated = true;
-                const display = allocRestoreDisplayPath(alloc, selected_desc.cwd) catch {
-                    fallback_subtitle_allocated = false;
-                    break :subtitle null;
-                };
-                defer alloc.free(display);
-                break :subtitle alloc.dupeZ(u8, display) catch {
-                    fallback_subtitle_allocated = false;
-                    break :subtitle null;
-                };
-            };
-            defer if (fallback_subtitle_allocated and base_subtitle != null) alloc.free(base_subtitle.?);
-
-            var subtitle_allocated = true;
-            const subtitle = WorkspaceSidebar.formatSidebarSubtitle(
+            self.syncWorkspaceListDescriptor(
                 alloc,
-                base_subtitle,
-                workspace_registry.sidebarCounts(runtime),
-            ) catch blk: {
-                subtitle_allocated = false;
-                break :blk base_subtitle orelse "";
-            };
-            defer if (subtitle_allocated) alloc.free(subtitle);
-
-            const tooltip = WorkspaceSidebar.formatSidebarTooltip(alloc, runtime) catch null;
-            defer if (tooltip) |text| alloc.free(text);
-            priv.workspace_sidebar.updateRowDescriptor(
                 @intCast(i),
-                title,
-                subtitle,
-                if (tooltip) |text| text else workspace_page.getTooltip(),
+                workspace_page,
             );
         }
+    }
+
+    fn syncWorkspaceListDescriptor(
+        self: *Self,
+        alloc: std.mem.Allocator,
+        index: c_int,
+        workspace_page: *WorkspacePage,
+    ) void {
+        const priv = self.private();
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+            priv.workspace_sidebar.updateRowDescriptor(
+                index,
+                workspace_page.getSidebarTitle() orelse "Workspace",
+                workspace_page.getSidebarSubtitle() orelse "",
+                workspace_page.getTooltip(),
+            );
+            return;
+        };
+
+        const selected = workspace_registry.selectedSessionDescriptor(runtime);
+        var fallback_title_allocated = false;
+        const title: [:0]const u8 = workspace_page.getTitleOverride() orelse
+            workspace_page.getSidebarTitle() orelse title: {
+            fallback_title_allocated = true;
+            break :title alloc.dupeZ(u8, runtime.workspace.name) catch "Workspace";
+        };
+        defer if (fallback_title_allocated) alloc.free(title);
+
+        var fallback_subtitle_allocated = false;
+        const base_subtitle: ?[:0]const u8 = workspace_page.getSidebarSubtitle() orelse subtitle: {
+            const selected_desc = selected orelse break :subtitle null;
+            fallback_subtitle_allocated = true;
+            const display = allocRestoreDisplayPath(alloc, selected_desc.cwd) catch {
+                fallback_subtitle_allocated = false;
+                break :subtitle null;
+            };
+            defer alloc.free(display);
+            break :subtitle alloc.dupeZ(u8, display) catch {
+                fallback_subtitle_allocated = false;
+                break :subtitle null;
+            };
+        };
+        defer if (fallback_subtitle_allocated and base_subtitle != null) alloc.free(base_subtitle.?);
+
+        var subtitle_allocated = true;
+        const subtitle = WorkspaceSidebar.formatSidebarSubtitle(
+            alloc,
+            base_subtitle,
+            workspace_registry.sidebarCounts(runtime),
+        ) catch blk: {
+            subtitle_allocated = false;
+            break :blk base_subtitle orelse "";
+        };
+        defer if (subtitle_allocated) alloc.free(subtitle);
+
+        const tooltip = WorkspaceSidebar.formatSidebarTooltip(alloc, runtime) catch null;
+        defer if (tooltip) |text| alloc.free(text);
+        priv.workspace_sidebar.updateRowDescriptor(
+            index,
+            title,
+            subtitle,
+            if (tooltip) |text| text else workspace_page.getTooltip(),
+        );
     }
 
     fn summarizeWorkspacePageAttention(workspace_page: *WorkspacePage) workspace_attention.AttentionSummary {
@@ -2441,6 +2979,13 @@ pub const Window = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        if (priv.disposing_runtime) {
+            gobject.Object.virtual_methods.dispose.call(
+                Class.parent,
+                self.as(Parent),
+            );
+            return;
+        }
         self.autosaveAllWorkspacesOnShutdown();
         priv.disposing_runtime = true;
 
@@ -2460,17 +3005,37 @@ pub const Window = extern struct {
 
         priv.workspace_page_bindings.setSource(null);
         priv.context_menu_page = null;
+        if (priv.pending_workspace_close.take()) |page| {
+            page.unref();
+        }
         if (priv.pending_surface_focus_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_surface_focus_source = null;
+        }
+        if (priv.pending_workspace_registry_refresh_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.pending_workspace_registry_refresh_source = null;
         }
         if (priv.pending_workspace_autosave_source) |source| {
             _ = glib.Source.remove(source);
             priv.pending_workspace_autosave_source = null;
         }
-        if (priv.pending_workspace_autosave_page) |workspace_page| {
-            workspace_page.unref();
-            priv.pending_workspace_autosave_page = null;
+        if (priv.workspace_autosave_retry_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.workspace_autosave_retry_source = null;
+        }
+        if (priv.periodic_workspace_autosave_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.periodic_workspace_autosave_source = null;
+        }
+        if (priv.workspace_surface_move_recovery_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.workspace_surface_move_recovery_source = null;
+        }
+        if (priv.workspace_surface_move_recovery) |recovery| {
+            priv.workspace_surface_move_recovery = null;
+            priv.workspace_surface_move_source_page = null;
+            recovery.deinit();
         }
         const page_count = priv.tab_view.getNPages();
         for (0..@intCast(page_count)) |i| {
@@ -2490,16 +3055,31 @@ pub const Window = extern struct {
                 self.disconnectSurfaceHandlers(tree);
             }
         }
+        _ = gobject.signalHandlersDisconnectMatched(
+            priv.workspace_sidebar.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
             getGObjectType(),
         );
 
         priv.session_identity_index.deinit();
+        deinitSavedScrollbackStates(self);
+        priv.scrollback_saved_states.deinit();
         priv.workspace_ids_by_page.deinit();
         priv.split_ids_by_leaf.deinit();
         priv.tab_ids_by_widget.deinit();
         priv.surface_ids_by_widget.deinit();
+        priv.workspace_dirty_generations.deinit();
+        priv.workspace_save_epochs.deinit();
+        priv.workspace_checkpoint_possible.deinit();
+        priv.workspace_explicit_save_jobs.deinit();
         priv.runtime_registry.deinit();
 
         gobject.Object.virtual_methods.dispose.call(
@@ -2586,11 +3166,18 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        const tab = self.getSelectedTab() orelse return;
-        const tree = tab.getSurfaceTree() orelse return;
+        const workspace_page = self.getSelectedWorkspacePage() orelse return;
+        const tree = workspace_page.getSurfaceTree() orelse return;
 
         var it = tree.iterator();
-        while (it.next()) |entry| entry.view.updateOcclusion();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                surface.updateOcclusion();
+            }
+        }
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
@@ -2694,30 +3281,30 @@ pub const Window = extern struct {
 
     fn closeConfirmationCloseTab(
         _: *CloseConfirmationDialog,
-        page: *adw.TabPage,
+        self: *Self,
     ) callconv(.c) void {
-        const tab_view = ext.getAncestor(
-            adw.TabView,
-            page.getChild().as(gtk.Widget),
-        ) orelse {
-            log.warn("close confirmation called for non-existent page", .{});
-            return;
-        };
-        tab_view.closePageFinish(page, @intFromBool(true));
+        self.finishPendingWorkspaceClose(true);
     }
 
     fn closeConfirmationCancelTab(
         _: *CloseConfirmationDialog,
-        page: *adw.TabPage,
+        self: *Self,
     ) callconv(.c) void {
-        const tab_view = ext.getAncestor(
-            adw.TabView,
-            page.getChild().as(gtk.Widget),
-        ) orelse {
-            log.warn("close confirmation called for non-existent page", .{});
-            return;
-        };
-        tab_view.closePageFinish(page, @intFromBool(false));
+        self.finishPendingWorkspaceClose(false);
+    }
+
+    fn finishPendingWorkspaceClose(self: *Self, confirmed: bool) void {
+        const priv = self.private();
+        const page = priv.pending_workspace_close.take() orelse return;
+        defer page.unref();
+        priv.tab_view.closePageFinish(page, @intFromBool(confirmed));
+    }
+
+    fn forceCloseUncommittedWorkspacePage(self: *Self, page: *adw.TabPage) void {
+        const priv = self.private();
+        priv.force_close_uncommitted_workspace_page = page;
+        defer priv.force_close_uncommitted_workspace_page = null;
+        priv.tab_view.closePage(page);
     }
 
     fn tabViewClosePage(
@@ -2730,6 +3317,21 @@ pub const Window = extern struct {
         const workspace_page = gobject.ext.cast(WorkspacePage, child) orelse
             return @intFromBool(false);
 
+        if (priv.force_close_uncommitted_workspace_page == page) {
+            priv.tab_view.closePageFinish(page, @intFromBool(true));
+            return @intFromBool(true);
+        }
+
+        const surface_tree = workspace_page.getSurfaceTree();
+        if (surface_tree == null or surface_tree.?.isEmpty()) {
+            if (priv.workspace_surface_move_source_page == workspace_page or
+                !self.pruneEmptyWorkspaceCheckpoint(workspace_page))
+            {
+                priv.tab_view.closePageFinish(page, @intFromBool(false));
+                return @intFromBool(true);
+            }
+        }
+
         // If the workspace page says it doesn't need confirmation then we go ahead
         // and close immediately.
         if (!workspace_page.getNeedsConfirmQuit()) {
@@ -2737,24 +3339,30 @@ pub const Window = extern struct {
             return @intFromBool(true);
         }
 
+        if (!priv.pending_workspace_close.begin(page)) {
+            priv.tab_view.closePageFinish(page, @intFromBool(false));
+            return @intFromBool(true);
+        }
+
         // Show a confirmation dialog
         const dialog: *CloseConfirmationDialog = .new(.workspace);
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
-            *adw.TabPage,
+            *Self,
             closeConfirmationCloseTab,
-            page,
+            self,
             .{},
         );
         _ = CloseConfirmationDialog.signals.cancel.connect(
             dialog,
-            *adw.TabPage,
+            *Self,
             closeConfirmationCancelTab,
-            page,
+            self,
             .{},
         );
 
         // Show it
+        page.ref();
         dialog.present(child);
         return @intFromBool(true);
     }
@@ -2840,20 +3448,6 @@ pub const Window = extern struct {
             self,
             .{ .detail = "title-override" },
         );
-        _ = gobject.Object.signals.notify.connect(
-            workspace_page.as(gobject.Object),
-            *Self,
-            workspacePageRestorableStateChanged,
-            self,
-            .{ .detail = "sidebar-title" },
-        );
-        _ = gobject.Object.signals.notify.connect(
-            workspace_page.as(gobject.Object),
-            *Self,
-            workspacePageRestorableStateChanged,
-            self,
-            .{ .detail = "sidebar-subtitle" },
-        );
         self.refreshWorkspaceRegistrySafe();
     }
 
@@ -2863,7 +3457,11 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
-        if (self.private().disposing_runtime) return;
+        const priv = self.private();
+        if (priv.pending_workspace_close.takeIf(page)) |pending_page| {
+            pending_page.unref();
+        }
+        if (priv.disposing_runtime) return;
 
         // We need to get the workspace page to disconnect the signals.
         const child = page.getChild();
@@ -2883,12 +3481,14 @@ pub const Window = extern struct {
             self.disconnectSurfaceHandlers(tree);
         }
 
-        const priv = self.private();
         const page_key = ptrKey(workspace_page);
         if (priv.workspace_ids_by_page.get(page_key)) |workspace_id| {
             _ = priv.runtime_registry.removeWorkspace(workspace_id);
             _ = priv.workspace_ids_by_page.remove(page_key);
         }
+        _ = priv.workspace_dirty_generations.remove(page_key);
+        _ = priv.workspace_save_epochs.remove(page_key);
+        _ = priv.workspace_checkpoint_possible.remove(page_key);
         self.refreshWorkspaceRegistrySafe();
     }
 
@@ -3090,7 +3690,7 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
         self.scheduleWorkspaceAutosaveForWidget(split_tree.as(gtk.Widget));
     }
 
@@ -3100,12 +3700,12 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.connectSurfaceHandler(surface);
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
         self.scheduleWorkspaceAutosaveForWidget(surface.as(gtk.Widget));
     }
 
     fn workspacePageSurfaceRemoved(
-        _: *SplitTree,
+        split_tree: *SplitTree,
         surface: *Surface,
         self: *Self,
     ) callconv(.c) void {
@@ -3129,16 +3729,40 @@ pub const Window = extern struct {
             null,
             self,
         );
-        self.refreshWorkspaceRegistrySafe();
-        self.scheduleWorkspaceAutosaveForWidget(surface.as(gtk.Widget));
+        // Moves emit removal before insertion. Defer pruning so the same
+        // attachment can retain its session identity at its new path.
+        self.scheduleWorkspaceRegistryRefresh();
+        const workspace_page = self.workspacePageForSplitTree(split_tree) orelse return;
+        self.scheduleWorkspaceAutosaveForPage(workspace_page);
+    }
+
+    fn workspacePageForSplitTree(
+        self: *Self,
+        split_tree: *SplitTree,
+    ) ?*WorkspacePage {
+        const tab_view = self.getTabView();
+        const page_count = tab_view.getNPages();
+        for (0..@intCast(page_count)) |i| {
+            const page = tab_view.getNthPage(@intCast(i));
+            const workspace_page = gobject.ext.cast(
+                WorkspacePage,
+                page.getChild(),
+            ) orelse continue;
+            if (workspace_page.getSplitTree() == split_tree) {
+                return workspace_page;
+            }
+        }
+        return null;
     }
 
     fn workspacePageRuntimeStateChanged(
-        _: *gobject.Object,
+        object: *gobject.Object,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
+        const workspace_page = gobject.ext.cast(WorkspacePage, object) orelse return;
+        self.markWorkspaceDirty(workspace_page);
     }
 
     fn workspacePageRestorableStateChanged(
@@ -3146,7 +3770,7 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
         const workspace_page = gobject.ext.cast(WorkspacePage, object) orelse return;
         self.scheduleWorkspaceAutosaveForPage(workspace_page);
     }
@@ -3156,7 +3780,141 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
+    }
+
+    fn surfaceTerminalTitleChanged(
+        object: *gobject.Object,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        const surface = gobject.ext.cast(Surface, object) orelse return;
+        if (surface.getTitleOverride() != null) return;
+        const workspace_page = ext.getAncestor(
+            WorkspacePage,
+            surface.as(gtk.Widget),
+        ) orelse return;
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        };
+        const session_id = self.private().session_identity_index.sessionForAttachment(
+            ptrKey(surface),
+        ) orelse {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        };
+        const title = surface.getEffectiveTitle() orelse "Ghostty";
+        var tab_id: ?workspace_ids.TabId = null;
+        for (runtime.sessions.items) |*session| {
+            if (session.session_id != session_id) continue;
+            session.title = title;
+            tab_id = session.tab_id;
+            break;
+        }
+        if (tab_id) |id| {
+            for (runtime.tabs.items) |*tab| {
+                if (tab.tab_id != id) continue;
+                tab.title = title;
+                break;
+            }
+        } else {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        }
+
+        if (workspace_page.getTitleOverride() != null) return;
+        if (workspace_page.getActiveSurface() != surface or
+            surface.getPwd() != null) return;
+        self.markWorkspaceDirty(workspace_page);
+
+        replaceWorkspaceMetadataTextAlloc(
+            Application.default().allocator(),
+            &runtime.workspace.name,
+            &runtime.workspace.updated_at,
+            title,
+        ) catch |err| {
+            log.warn("failed to update workspace title metadata error={}", .{err});
+            return;
+        };
+        const page = self.private().tab_view.getPage(
+            workspace_page.as(gtk.Widget),
+        );
+        const index = self.private().tab_view.getPagePosition(page);
+        if (index < 0) return;
+        self.syncWorkspaceListDescriptor(
+            Application.default().allocator(),
+            index,
+            workspace_page,
+        );
+    }
+
+    fn surfacePwdChanged(
+        object: *gobject.Object,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        const surface = gobject.ext.cast(Surface, object) orelse return;
+        const workspace_page = ext.getAncestor(
+            WorkspacePage,
+            surface.as(gtk.Widget),
+        ) orelse return;
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        };
+        const session_id = self.private().session_identity_index.sessionForAttachment(
+            ptrKey(surface),
+        ) orelse {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        };
+        const cwd = surface.getPwd() orelse "";
+        var tab_id: ?workspace_ids.TabId = null;
+        for (runtime.sessions.items) |*session| {
+            if (session.session_id != session_id) continue;
+            session.cwd = cwd;
+            tab_id = session.tab_id;
+            break;
+        }
+        const tab_widget = ext.getAncestor(Tab, surface.as(gtk.Widget));
+        if (tab_id) |id| {
+            for (runtime.tabs.items) |*tab| {
+                if (tab.tab_id != id) continue;
+                tab.tooltip = if (tab_widget) |widget|
+                    widget.getTooltip() orelse surface.getPwd()
+                else
+                    surface.getPwd();
+                break;
+            }
+        } else {
+            self.scheduleWorkspaceRegistryRefresh();
+            return;
+        }
+
+        self.markWorkspaceDirty(workspace_page);
+        if (workspace_page.getActiveSurface() != surface) return;
+        if (workspace_page.getTitleOverride() == null) {
+            replaceWorkspaceMetadataTextAlloc(
+                Application.default().allocator(),
+                &runtime.workspace.name,
+                &runtime.workspace.updated_at,
+                surface.getWorkspaceTitle() orelse "workspace",
+            ) catch |err| {
+                log.warn("failed to update workspace cwd metadata error={}", .{err});
+                return;
+            };
+        }
+        const page = self.private().tab_view.getPage(
+            workspace_page.as(gtk.Widget),
+        );
+        const index = self.private().tab_view.getPagePosition(page);
+        if (index < 0) return;
+        self.syncWorkspaceListDescriptor(
+            Application.default().allocator(),
+            index,
+            workspace_page,
+        );
     }
 
     fn surfaceRestorableStateChanged(
@@ -3164,7 +3922,7 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
         const surface = gobject.ext.cast(Surface, object) orelse return;
         self.scheduleWorkspaceAutosaveForWidget(surface.as(gtk.Widget));
     }
@@ -3174,7 +3932,7 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        self.refreshWorkspaceRegistrySafe();
+        self.scheduleWorkspaceRegistryRefresh();
         const tab = gobject.ext.cast(Tab, object) orelse return;
         self.scheduleWorkspaceAutosaveForWidget(tab.as(gtk.Widget));
     }
@@ -3274,6 +4032,14 @@ pub const Window = extern struct {
         self: *Window,
     ) callconv(.c) void {
         self.performBindingAction(.new_tab);
+    }
+
+    fn actionNewWorkspace(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        self.newWorkspace(if (self.getActiveSurface()) |surface| surface.core() else null);
     }
 
     fn idleWorkspacePageAction(ud: ?*anyopaque) callconv(.c) c_int {
@@ -3461,13 +4227,28 @@ pub const Window = extern struct {
     }
 
     fn saveWorkspacePage(self: *Self, workspace_page: *WorkspacePage) void {
-        const alloc = Application.default().allocator();
-        const result = saveWorkspaceAlloc(self, alloc, workspace_page) catch |err| {
+        saveWorkspaceAsync(self, workspace_page, workspaceSavePageCompleted, null) catch |err| {
             log.warn("failed to save workspace error={}", .{err});
+            self.addToast(i18n._("Failed to save workspace"));
+        };
+    }
+
+    fn workspaceSavePageCompleted(
+        self: *Self,
+        result_: ?WorkspaceSaveAsyncResult,
+        err: ?anyerror,
+        _: ?*anyopaque,
+    ) void {
+        if (err) |save_err| {
+            log.warn("failed to save workspace error={}", .{save_err});
+            self.addToast(i18n._("Failed to save workspace"));
+            return;
+        }
+        const result = result_ orelse {
             self.addToast(i18n._("Failed to save workspace"));
             return;
         };
-        defer result.deinit(alloc);
+        const alloc = Application.default().allocator();
         const title = std.fmt.allocPrintSentinel(alloc, "{s}: {s}", .{
             i18n._("Workspace saved"),
             std.fs.path.basename(result.path),
@@ -3515,7 +4296,7 @@ pub const Window = extern struct {
         };
         defer alloc.free(snapshot_path);
 
-        internal_os.open(alloc, .text, snapshot_path) catch |err| {
+        internal_os.open(.text, snapshot_path) catch |err| {
             log.warn("failed to open workspace snapshot error={}", .{err});
             self.addToast(i18n._("Failed to open workspace snapshot"));
             return;
@@ -3523,12 +4304,16 @@ pub const Window = extern struct {
     }
 
     fn deleteWorkspaceSnapshot(self: *Self, workspace_page: *WorkspacePage) void {
+        self.cancelWorkspaceAutosave(workspace_page);
         self.refreshWorkspaceRegistrySafe();
         const alloc = Application.default().allocator();
         const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse {
             self.addToast(i18n._("Failed to delete saved workspace"));
             return;
         };
+        _ = self.private().workspace_explicit_save_jobs.cancel(
+            runtime.workspace.workspace_id,
+        );
         var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
             log.warn("failed to read workspace catalog for delete error={}", .{err});
             self.addToast(i18n._("Failed to delete saved workspace"));
@@ -3536,34 +4321,108 @@ pub const Window = extern struct {
         };
         defer catalog.deinit(alloc);
 
-        const entry = findSavedWorkspaceCatalogEntryForRuntime(catalog.entries, runtime) orelse {
+        const entry = findSavedWorkspaceCatalogEntryForRuntime(
+            catalog.entries,
+            runtime,
+        );
+        const fallback_path: ?[]const u8 = if (runtime.workspace.snapshot_ref) |snapshot_ref|
+            snapshot_ref.path
+        else if (entry) |saved_entry|
+            saved_entry.path
+        else
+            null;
+        if (entry == null and
+            fallback_path == null and
+            !self.private().workspace_checkpoint_possible.contains(
+                ptrKey(workspace_page),
+            ))
+        {
             self.addToast(i18n._("This workspace has no saved snapshot to delete"));
             return;
-        };
+        }
 
         var dir = workspace_storage.createDefaultStorageDirAlloc(alloc) catch |err| {
             log.warn("failed to open workspace storage directory error={}", .{err});
             self.addToast(i18n._("Failed to delete saved workspace"));
             return;
         };
-        defer dir.close();
+        defer dir.close(global.io());
 
         const storage = workspace_storage.Storage.init(alloc, dir);
-        if (entry.workspace_key) |workspace_key| {
-            storage.pruneCheckpoint(workspace_key) catch |err| {
-                log.warn("failed to delete workspace checkpoint error={}", .{err});
-                self.addToast(i18n._("Failed to delete saved workspace"));
-                return;
-            };
-        } else storage.pruneCheckpointPath(entry.path) catch |err| {
+        storage.pruneCheckpointWithFallbackPath(
+            runtime.workspace.slug,
+            fallback_path,
+        ) catch |err| {
             log.warn("failed to delete workspace checkpoint error={}", .{err});
             self.addToast(i18n._("Failed to delete saved workspace"));
             return;
         };
 
         clearWorkspaceSnapshotRefAlloc(alloc, runtime);
+        _ = self.private().workspace_checkpoint_possible.remove(
+            ptrKey(workspace_page),
+        );
+        self.bumpWorkspaceSaveEpoch(workspace_page);
         self.refreshWorkspaceRegistrySafe();
         self.addToast(i18n._("Saved workspace deleted"));
+    }
+
+    fn pruneEmptyWorkspaceCheckpoint(
+        self: *Self,
+        workspace_page: *WorkspacePage,
+    ) bool {
+        self.cancelWorkspaceAutosave(workspace_page);
+        self.refreshWorkspaceRegistrySafe();
+        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse
+            return false;
+        const has_pending_save = self.private().workspace_explicit_save_jobs.contains(
+            runtime.workspace.workspace_id,
+        );
+        if (runtime.workspace.snapshot_ref == null and
+            !has_pending_save and
+            !self.private().workspace_checkpoint_possible.contains(
+                ptrKey(workspace_page),
+            ))
+        {
+            _ = self.private().workspace_dirty_generations.remove(
+                ptrKey(workspace_page),
+            );
+            return true;
+        }
+        _ = self.private().workspace_explicit_save_jobs.cancel(
+            runtime.workspace.workspace_id,
+        );
+        self.bumpWorkspaceSaveEpoch(workspace_page);
+
+        const alloc = Application.default().allocator();
+        var dir = workspace_storage.createDefaultStorageDirAlloc(alloc) catch |err| {
+            log.warn("failed to open storage for empty workspace cleanup error={}", .{err});
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return false;
+        };
+        defer dir.close(global.io());
+        const storage = workspace_storage.Storage.init(alloc, dir);
+        storage.pruneCheckpointWithFallbackPath(
+            runtime.workspace.slug,
+            if (runtime.workspace.snapshot_ref) |snapshot_ref|
+                snapshot_ref.path
+            else
+                null,
+        ) catch |err| {
+            log.warn("failed to prune empty workspace checkpoint error={}", .{err});
+            self.addToast(i18n._("Failed to delete saved workspace"));
+            return false;
+        };
+
+        clearWorkspaceSnapshotRefAlloc(alloc, runtime);
+        _ = self.private().workspace_checkpoint_possible.remove(
+            ptrKey(workspace_page),
+        );
+        _ = self.private().workspace_dirty_generations.remove(
+            ptrKey(workspace_page),
+        );
+        self.refreshWorkspaceRegistrySafe();
+        return true;
     }
 
     pub fn showRestoreWorkspaceCommands(self: *Window) void {
@@ -3588,18 +4447,6 @@ pub const Window = extern struct {
     pub fn restoreSavedWorkspace(self: *Window, target: []const u8) void {
         self.refreshWorkspaceRegistrySafe();
         const alloc = Application.default().allocator();
-        var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
-            log.warn("failed to read restore workspace catalog error={}", .{err});
-            self.addToast(i18n._("Failed to load saved workspaces"));
-            return;
-        };
-        defer catalog.deinit(alloc);
-
-        const entry = findSavedWorkspaceCatalogEntry(catalog.entries, target) orelse {
-            self.addToast(i18n._("Saved workspace snapshot not found"));
-            return;
-        };
-
         var dir = workspace_storage.openDefaultStorageDirAlloc(alloc) catch |err| {
             log.warn("failed to open workspace storage directory error={}", .{err});
             self.addToast(i18n._("Failed to restore workspace"));
@@ -3608,15 +4455,44 @@ pub const Window = extern struct {
             self.addToast(i18n._("No saved workspaces to restore"));
             return;
         };
-        defer dir.close();
+        defer dir.close(global.io());
 
         const storage = workspace_storage.Storage.init(alloc, dir);
-        var snapshot_value = storage.readSnapshotAlloc(alloc, entry.path) catch |err| {
+        var transaction = storage.beginTransaction(.blocking) catch |err| {
+            log.warn("failed to lock workspace storage for restore error={}", .{err});
+            self.addToast(i18n._("Failed to restore workspace"));
+            return;
+        };
+        var catalog = storage.readCatalogAlloc(
+            alloc,
+            workspace_storage.Storage.catalog_filename,
+        ) catch |err| {
+            transaction.deinit();
+            log.warn("failed to read restore workspace catalog error={}", .{err});
+            self.addToast(i18n._("Failed to load saved workspaces"));
+            return;
+        };
+        defer catalog.deinit(alloc);
+
+        const entry = findSavedWorkspaceCatalogEntry(catalog.entries, target) orelse {
+            transaction.deinit();
+            self.addToast(i18n._("Saved workspace snapshot not found"));
+            return;
+        };
+
+        var opened_snapshot = storage.readSnapshotWithScrollbackAllocAssumeLocked(
+            alloc,
+            entry.path,
+            max_saved_scrollback_replay_bytes,
+        ) catch |err| {
+            transaction.deinit();
             log.warn("failed to load workspace snapshot error={}", .{err});
             self.addToast(i18n._("Failed to restore workspace"));
             return;
         };
-        defer snapshot_value.deinit(alloc);
+        transaction.deinit();
+        defer opened_snapshot.deinit(alloc);
+        const snapshot_value = opened_snapshot.snapshot;
 
         var plan = workspace_restore.planAlloc(alloc, snapshot_value) catch |err| {
             log.warn("failed to plan workspace restore error={}", .{err});
@@ -3626,11 +4502,27 @@ pub const Window = extern struct {
         defer plan.deinit(alloc);
 
         const fork_restore = workspaceRestoreShouldFork(
-            self,
             entry.workspace_key orelse target,
             snapshot_value.workspace.name,
         );
-        const results = workspaceControlRestoreAlloc(self, alloc, snapshot_value, &plan) catch |err| switch (err) {
+        var association = prepareRestoredWorkspaceAssociationAlloc(
+            self,
+            alloc,
+            entry,
+            fork_restore,
+        ) catch |err| {
+            log.warn("failed to prepare restored workspace association error={}", .{err});
+            self.addToast(i18n._("Failed to restore workspace"));
+            return;
+        };
+        defer association.deinit(alloc);
+        const results = workspaceControlRestoreAlloc(
+            self,
+            alloc,
+            snapshot_value,
+            &plan,
+            &opened_snapshot,
+        ) catch |err| switch (err) {
             error.TabMultiSessionUnsupported => {
                 self.addToast(i18n._("Restore does not yet support multiple sessions inside one tab"));
                 return;
@@ -3661,8 +4553,10 @@ pub const Window = extern struct {
             if (results.selection_fallback) |selection_fallback| alloc.free(selection_fallback.reason);
         }
 
-        const restored_workspace_page = restoredWorkspacePage(self) orelse {
-            log.warn("restored workspace replay succeeded but selected page lookup failed", .{});
+        const restored_workspace_page = self.findWorkspacePageByRuntimeId(results.restored_workspace_id) orelse {
+            log.warn("restored workspace replay succeeded but restored page lookup failed workspace_id={}", .{
+                results.restored_workspace_id.raw(),
+            });
             self.as(gtk.Window).present();
             self.addToast(i18n._("Workspace restored"));
             return;
@@ -3674,67 +4568,18 @@ pub const Window = extern struct {
             return;
         };
 
-        if (fork_restore) {
-            const fork_name = allocForkWorkspaceDisplayName(
-                self,
-                restored_runtime.workspace.workspace_id,
-                snapshot_value.workspace.name,
-            ) catch |err| {
-                log.warn("failed to allocate restore fork workspace name error={}", .{err});
-                self.as(gtk.Window).present();
-                self.addToast(i18n._("Workspace restored"));
-                return;
-            };
-            defer alloc.free(fork_name);
-            const fork_name_z = alloc.dupeZ(u8, fork_name) catch {
-                log.warn("failed to allocate restore fork workspace display name", .{});
-                self.as(gtk.Window).present();
-                self.addToast(i18n._("Workspace restored"));
-                return;
-            };
-            defer alloc.free(fork_name_z);
-            const fresh_key = allocFreshWorkspaceKey(restored_runtime.workspace.workspace_id) catch |err| {
-                log.warn("failed to allocate restore fork workspace key error={}", .{err});
-                self.as(gtk.Window).present();
-                self.addToast(i18n._("Workspace restored"));
-                return;
-            };
-            defer alloc.free(fresh_key);
-            const next_name = alloc.dupe(u8, fork_name) catch {
-                log.warn("failed to persist restore fork workspace name", .{});
-                self.as(gtk.Window).present();
-                self.addToast(i18n._("Workspace restored"));
-                return;
-            };
-            errdefer alloc.free(next_name);
-            const next_slug = alloc.dupe(u8, fresh_key) catch {
-                log.warn("failed to persist restore fork workspace key", .{});
-                self.as(gtk.Window).present();
-                self.addToast(i18n._("Workspace restored"));
-                return;
-            };
-            errdefer alloc.free(next_slug);
+        associateRestoredWorkspace(
+            self,
+            alloc,
+            restored_workspace_page,
+            restored_runtime,
+            &association,
+        );
 
-            restored_workspace_page.setSidebarTitle(fork_name_z);
-            alloc.free(restored_runtime.workspace.name);
-            restored_runtime.workspace.name = next_name;
-            alloc.free(restored_runtime.workspace.slug);
-            restored_runtime.workspace.slug = next_slug;
-            if (restored_runtime.workspace.snapshot_ref) |*snapshot_ref| {
-                alloc.free(snapshot_ref.saved_at);
-                alloc.free(snapshot_ref.path);
-                restored_runtime.workspace.snapshot_ref = null;
-            }
-            self.syncWorkspaceListDescriptors();
-        } else {
-            updateWorkspaceSnapshotRefAlloc(
-                alloc,
-                restored_runtime,
-                entry.snapshot_id,
-                entry.saved_at,
-                entry.path,
-            );
-        }
+        self.private().tab_view.setSelectedPage(
+            self.private().tab_view.getPage(restored_workspace_page.as(gtk.Widget)),
+        );
+        self.focusWorkspaceSelection(restored_workspace_page);
 
         self.as(gtk.Window).present();
         self.addToast(i18n._("Workspace restored"));
@@ -4047,6 +4892,20 @@ pub const WorkspaceControlSaveResult = struct {
     }
 };
 
+pub const WorkspaceSaveAsyncResult = struct {
+    workspace_id: workspace_ids.WorkspaceId,
+    snapshot_id: workspace_ids.SnapshotId,
+    saved_at: []const u8,
+    path: []const u8,
+};
+
+pub const WorkspaceSaveAsyncCallback = *const fn (
+    *Window,
+    ?WorkspaceSaveAsyncResult,
+    ?anyerror,
+    ?*anyopaque,
+) void;
+
 pub const WorkspaceControlRestoreUnsupported = error{
     TabMultiSessionUnsupported,
     WorkspaceLayoutMissing,
@@ -4273,27 +5132,366 @@ pub fn workspaceControlCloseSession(
     };
 }
 
+const WorkspaceSaveMode = enum {
+    explicit,
+    autosave,
+    shutdown,
+};
+
+const SavedScrollbackGeneration = struct {
+    session_id: workspace_ids.SessionId,
+    generation: u64,
+};
+
+const SavedScrollbackState = struct {
+    generation: u64,
+    path: []const u8,
+};
+
+const AutosaveSurfaceCapture = struct {
+    surface: *Surface,
+    core: *CoreSurface,
+    session_id: workspace_ids.SessionId,
+    persisted_scrollback_limit: usize,
+    saved_state: ?SavedScrollbackState,
+
+    fn deinit(self: *AutosaveSurfaceCapture, alloc: std.mem.Allocator) void {
+        if (self.saved_state) |state| alloc.free(state.path);
+        self.surface.unref();
+        self.* = undefined;
+    }
+};
+
+const AutosaveWorkspaceCapture = struct {
+    page_key: usize,
+    dirty_generation: u64,
+    save_epoch: u64,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    snapshot: workspace_snapshot.Snapshot,
+    previous_checkpoint_path: ?[]u8,
+    surfaces: []AutosaveSurfaceCapture,
+
+    fn deinit(self: *AutosaveWorkspaceCapture, alloc: std.mem.Allocator) void {
+        for (self.surfaces) |*surface| surface.deinit(alloc);
+        alloc.free(self.surfaces);
+        if (self.previous_checkpoint_path) |path| alloc.free(path);
+        self.snapshot.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const AutosaveWorkspaceOutcome = struct {
+    path: ?[]u8 = null,
+    scrollback_generations: std.ArrayList(SavedScrollbackGeneration) = .empty,
+    err: ?anyerror = null,
+
+    fn deinit(self: *AutosaveWorkspaceOutcome, alloc: std.mem.Allocator) void {
+        if (self.path) |path| alloc.free(path);
+        self.scrollback_generations.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const WorkspaceAutosaveJob = struct {
+    alloc: std.mem.Allocator,
+    window: *Window,
+    captures: []AutosaveWorkspaceCapture,
+    outcomes: []AutosaveWorkspaceOutcome,
+    budget: AutosaveScrollbackBudget,
+
+    fn deinitOnMain(self: *WorkspaceAutosaveJob) void {
+        const alloc = self.alloc;
+        const window = self.window;
+        for (self.captures) |*capture| capture.deinit(alloc);
+        alloc.free(self.captures);
+        for (self.outcomes) |*outcome| outcome.deinit(alloc);
+        alloc.free(self.outcomes);
+        alloc.destroy(self);
+        window.unref();
+    }
+};
+
+const WorkspaceExplicitSaveJob = struct {
+    alloc: std.mem.Allocator,
+    window: *Window,
+    capture: AutosaveWorkspaceCapture,
+    outcome: AutosaveWorkspaceOutcome = .{},
+    budget: AutosaveScrollbackBudget = .{
+        .remaining = std.math.maxInt(usize),
+        .per_session = std.math.maxInt(usize),
+    },
+    callback: WorkspaceSaveAsyncCallback,
+    userdata: ?*anyopaque,
+
+    fn deinitOnMain(self: *WorkspaceExplicitSaveJob) void {
+        const alloc = self.alloc;
+        const window = self.window;
+        self.capture.deinit(alloc);
+        self.outcome.deinit(alloc);
+        alloc.destroy(self);
+        window.unref();
+    }
+};
+
+fn captureWorkspaceAutosaveAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+    runtime: *workspace_registry.WorkspaceRuntime,
+) !AutosaveWorkspaceCapture {
+    const saved_at = try workspace_snapshot.currentUtcTimestampAlloc(alloc);
+    defer alloc.free(saved_at);
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(
+        alloc,
+        Application.default().runtimeIds().next(.snapshot),
+        saved_at,
+        runtime,
+    );
+    errdefer snapshot_value.deinit(alloc);
+
+    var surfaces: std.ArrayList(AutosaveSurfaceCapture) = .empty;
+    errdefer {
+        for (surfaces.items) |*surface| surface.deinit(alloc);
+        surfaces.deinit(alloc);
+    }
+    const tree = workspace_page.getSurfaceTree() orelse return error.WorkspaceNotFound;
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const leaf = entry.view;
+        const surface_count = leaf.getSurfaceCount();
+        for (0..@intCast(surface_count)) |surface_index| {
+            const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse continue;
+            const core = surface.core() orelse continue;
+            const session_id = self.private().session_identity_index.sessionForAttachment(
+                @intFromPtr(surface),
+            ) orelse continue;
+            const saved_state = if (self.private().scrollback_saved_states.get(session_id)) |state|
+                SavedScrollbackState{
+                    .generation = state.generation,
+                    .path = try alloc.dupe(u8, state.path),
+                }
+            else
+                null;
+            var captured_surface: AutosaveSurfaceCapture = .{
+                .surface = surface.ref(),
+                .core = core,
+                .session_id = session_id,
+                .persisted_scrollback_limit = core.persistedScrollbackLimit(),
+                .saved_state = saved_state,
+            };
+            errdefer captured_surface.deinit(alloc);
+            try surfaces.append(alloc, captured_surface);
+        }
+    }
+
+    const page_key = @intFromPtr(workspace_page);
+    const save_epoch = try self.private().workspace_save_epochs.getOrPut(page_key);
+    if (!save_epoch.found_existing) save_epoch.value_ptr.* = 0;
+    const previous_checkpoint_path = if (runtime.workspace.snapshot_ref) |snapshot_ref|
+        try alloc.dupe(u8, snapshot_ref.path)
+    else
+        null;
+    errdefer if (previous_checkpoint_path) |path| alloc.free(path);
+    return .{
+        .page_key = page_key,
+        .dirty_generation = self.private().workspace_dirty_generations.get(
+            @intFromPtr(workspace_page),
+        ) orelse 0,
+        .save_epoch = save_epoch.value_ptr.*,
+        .cancelled = .init(false),
+        .snapshot = snapshot_value,
+        .previous_checkpoint_path = previous_checkpoint_path,
+        .surfaces = try surfaces.toOwnedSlice(alloc),
+    };
+}
+
 pub fn saveWorkspaceAlloc(
     self: *Window,
     alloc: std.mem.Allocator,
     workspace_page: *WorkspacePage,
 ) !WorkspaceControlSaveResult {
+    return saveWorkspaceWithModeAlloc(
+        self,
+        alloc,
+        workspace_page,
+        .explicit,
+        null,
+    );
+}
+
+pub fn saveWorkspaceAsync(
+    self: *Window,
+    workspace_page: *WorkspacePage,
+    callback: WorkspaceSaveAsyncCallback,
+    userdata: ?*anyopaque,
+) !void {
+    self.cancelWorkspaceAutosave(workspace_page);
+    self.refreshWorkspaceRegistrySafe();
+    const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse
+        return error.WorkspaceNotFound;
+    const workspace_id = runtime.workspace.workspace_id;
+    if (self.private().workspace_explicit_save_jobs.contains(workspace_id)) {
+        return error.WorkspaceSaveInProgress;
+    }
+
+    try self.private().workspace_checkpoint_possible.put(
+        @intFromPtr(workspace_page),
+        {},
+    );
+    self.bumpWorkspaceSaveEpoch(workspace_page);
+    const alloc = Application.default().allocator();
+    var capture = try captureWorkspaceAutosaveAlloc(
+        self,
+        alloc,
+        workspace_page,
+        runtime,
+    );
+    var capture_owned = true;
+    errdefer if (capture_owned) capture.deinit(alloc);
+
+    const job = try alloc.create(WorkspaceExplicitSaveJob);
+    job.* = .{
+        .alloc = alloc,
+        .window = self.ref(),
+        .capture = capture,
+        .callback = callback,
+        .userdata = userdata,
+    };
+    capture_owned = false;
+
+    const registered = self.private().workspace_explicit_save_jobs.register(
+        workspace_id,
+        job,
+    ) catch |err| {
+        job.deinitOnMain();
+        return err;
+    };
+    if (!registered) {
+        job.deinitOnMain();
+        return error.WorkspaceSaveInProgress;
+    }
+    const thread = std.Thread.spawn(.{}, workspaceExplicitSaveThreadMain, .{job}) catch |err| {
+        _ = self.private().workspace_explicit_save_jobs.removeIfCurrent(
+            workspace_id,
+            job,
+        );
+        job.deinitOnMain();
+        return err;
+    };
+    thread.setName(global.io(), "workspace-save") catch {};
+    thread.detach();
+}
+
+fn saveWorkspaceWithModeAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+    mode: WorkspaceSaveMode,
+    autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+) !WorkspaceControlSaveResult {
+    self.cancelWorkspaceAutosave(workspace_page);
     self.refreshWorkspaceRegistrySafe();
     const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
+    if (mode == .explicit and self.private().workspace_explicit_save_jobs.contains(
+        runtime.workspace.workspace_id,
+    )) {
+        return error.WorkspaceSaveInProgress;
+    }
 
+    try self.private().workspace_checkpoint_possible.put(
+        @intFromPtr(workspace_page),
+        {},
+    );
     const saved_at = try workspace_snapshot.currentUtcTimestampAlloc(alloc);
     errdefer alloc.free(saved_at);
-    const snapshot_id = Application.default().runtimeIds().next(.snapshot);
-    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(alloc, snapshot_id, saved_at, runtime);
-    defer snapshot_value.deinit(alloc);
 
     var dir = try workspace_storage.createDefaultStorageDirAlloc(alloc);
-    defer dir.close();
+    defer dir.close(global.io());
     const storage = workspace_storage.Storage.init(alloc, dir);
-    const path = try storage.writeCheckpoint(snapshot_value);
-    errdefer alloc.free(path);
+    const checkpoint_path = try storage.checkpointFilenameAlloc(runtime.workspace.slug);
+    defer alloc.free(checkpoint_path);
 
-    updateWorkspaceSnapshotRefAlloc(alloc, runtime, snapshot_id, saved_at, path);
+    var transaction = try storage.beginTransaction(switch (mode) {
+        .autosave => .nonblocking,
+        .explicit, .shutdown => .blocking,
+    });
+    defer transaction.deinit();
+
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.checkScrollbackPruneBudgetAssumeLocked(checkpoint_path);
+
+    const snapshot_id = while (true) {
+        const candidate = Application.default().runtimeIds().next(.snapshot);
+        storage.createScrollbackDirForSnapshotExclusive(
+            checkpoint_path,
+            candidate,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        break candidate;
+    };
+    var snapshot_sidecar_committed = false;
+    errdefer if (!snapshot_sidecar_committed) {
+        storage.deleteScrollbackSnapshotDir(checkpoint_path, snapshot_id) catch |err| {
+            log.warn("failed to clean aborted workspace scrollback snapshot path={s} snapshot={} error={}", .{
+                checkpoint_path,
+                snapshot_id.raw(),
+                err,
+            });
+        };
+    };
+
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(
+        alloc,
+        snapshot_id,
+        saved_at,
+        runtime,
+    );
+    defer snapshot_value.deinit(alloc);
+
+    var scrollback_generations: std.ArrayList(SavedScrollbackGeneration) = .empty;
+    defer scrollback_generations.deinit(alloc);
+    try writeWorkspaceScrollbackAlloc(
+        self,
+        alloc,
+        storage,
+        checkpoint_path,
+        workspace_page,
+        &snapshot_value,
+        mode,
+        autosave_scrollback_budget,
+        &scrollback_generations,
+    );
+
+    var commit_state: workspace_storage.Storage.CheckpointCommitState = .uncommitted;
+    const path = storage.writeCheckpointTrackedReplacingPathAssumeLocked(
+        snapshot_value,
+        if (runtime.workspace.snapshot_ref) |snapshot_ref|
+            snapshot_ref.path
+        else
+            null,
+        &commit_state,
+    ) catch |err| {
+        snapshot_sidecar_committed = commit_state == .committed;
+        return err;
+    };
+    errdefer alloc.free(path);
+    snapshot_sidecar_committed = true;
+    storage.pruneScrollbackDirForSnapshotAssumeLocked(
+        checkpoint_path,
+        snapshot_value,
+    ) catch |err| {
+        log.warn("failed to prune workspace scrollback sidecars path={s} error={}", .{
+            checkpoint_path,
+            err,
+        });
+    };
+
+    try updateWorkspaceSnapshotRefAlloc(alloc, runtime, snapshot_id, saved_at, path);
+    syncSnapshotScrollbackGenerations(self, snapshot_value, scrollback_generations.items);
+    self.bumpWorkspaceSaveEpoch(workspace_page);
+    _ = self.private().workspace_dirty_generations.remove(@intFromPtr(workspace_page));
     return .{
         .workspace_id = runtime.workspace.workspace_id,
         .snapshot_id = snapshot_id,
@@ -4302,11 +5500,863 @@ pub fn saveWorkspaceAlloc(
     };
 }
 
+fn workspaceAutosaveThreadMain(job: *WorkspaceAutosaveJob) void {
+    for (job.captures, job.outcomes) |*capture, *outcome| {
+        if (capture.cancelled.load(.acquire)) continue;
+        outcome.path = persistCapturedWorkspaceAutosave(
+            job.alloc,
+            capture,
+            .autosave,
+            &job.budget,
+            &outcome.scrollback_generations,
+        ) catch |err| {
+            outcome.err = err;
+            continue;
+        };
+    }
+
+    if (glib.idleAdd(workspaceAutosaveCompleted, job) == 0) {
+        log.err("failed to schedule workspace autosave completion", .{});
+    }
+}
+
+fn workspaceExplicitSaveThreadMain(job: *WorkspaceExplicitSaveJob) void {
+    job.outcome.path = persistCapturedWorkspaceAutosave(
+        job.alloc,
+        &job.capture,
+        .explicit,
+        &job.budget,
+        &job.outcome.scrollback_generations,
+    ) catch |err| failed: {
+        job.outcome.err = err;
+        break :failed null;
+    };
+
+    if (glib.idleAdd(workspaceExplicitSaveCompleted, job) == 0) {
+        log.err("failed to schedule explicit workspace save completion", .{});
+    }
+}
+
+fn workspaceExplicitSaveCompleted(ud: ?*anyopaque) callconv(.c) c_int {
+    const job: *WorkspaceExplicitSaveJob = @ptrCast(@alignCast(ud orelse return 0));
+    defer job.deinitOnMain();
+    const self = job.window;
+    const priv = self.private();
+
+    if (priv.disposing_runtime) {
+        job.callback(self, null, error.WindowClosed, job.userdata);
+        return 0;
+    }
+    const workspace_id = job.capture.snapshot.workspace.workspace_id;
+    _ = priv.workspace_explicit_save_jobs.removeIfCurrent(workspace_id, job);
+    defer resumeWorkspaceAutosaveAfterExplicitSave(self);
+
+    if (job.outcome.err) |err| {
+        job.callback(self, null, err, job.userdata);
+        return 0;
+    }
+    const path = job.outcome.path orelse {
+        job.callback(self, null, error.WorkspaceSaveFailed, job.userdata);
+        return 0;
+    };
+    const current_save_epoch = priv.workspace_save_epochs.get(
+        job.capture.page_key,
+    ) orelse 0;
+    if (current_save_epoch != job.capture.save_epoch) {
+        job.callback(self, null, error.WorkspaceSaveSuperseded, job.userdata);
+        return 0;
+    }
+    const runtime = priv.runtime_registry.findWorkspace(
+        job.capture.snapshot.workspace.workspace_id,
+    ) orelse {
+        job.callback(self, null, error.WorkspaceNotFound, job.userdata);
+        return 0;
+    };
+    const workspace_key = job.capture.snapshot.workspace.workspace_key orelse {
+        job.callback(self, null, error.MissingWorkspaceKey, job.userdata);
+        return 0;
+    };
+    if (!std.mem.eql(u8, runtime.workspace.slug, workspace_key)) {
+        job.callback(self, null, error.WorkspaceNotFound, job.userdata);
+        return 0;
+    }
+
+    Application.default().runtimeIds().observe(job.capture.snapshot.snapshot_id);
+    updateWorkspaceSnapshotRefAlloc(
+        job.alloc,
+        runtime,
+        job.capture.snapshot.snapshot_id,
+        job.capture.snapshot.saved_at,
+        path,
+    ) catch |err| {
+        job.callback(self, null, err, job.userdata);
+        return 0;
+    };
+    syncSnapshotScrollbackGenerations(
+        self,
+        job.capture.snapshot,
+        job.outcome.scrollback_generations.items,
+    );
+    if (priv.workspace_dirty_generations.get(job.capture.page_key)) |generation| {
+        if (generation == job.capture.dirty_generation) {
+            _ = priv.workspace_dirty_generations.remove(job.capture.page_key);
+        }
+    }
+
+    job.callback(self, .{
+        .workspace_id = job.capture.snapshot.workspace.workspace_id,
+        .snapshot_id = job.capture.snapshot.snapshot_id,
+        .saved_at = job.capture.snapshot.saved_at,
+        .path = path,
+    }, null, job.userdata);
+    return 0;
+}
+
+fn resumeWorkspaceAutosaveAfterExplicitSave(self: *Window) void {
+    const priv = self.private();
+    if (priv.disposing_runtime) return;
+    if (priv.workspace_autosave_in_flight) {
+        priv.workspace_autosave_rerun_requested = true;
+        return;
+    }
+
+    priv.workspace_autosave_rerun_requested = false;
+    self.startWorkspaceAutosavePass(null) catch |err| {
+        log.warn("failed to resume workspace autosave after explicit save error={}", .{err});
+    };
+}
+
+fn workspaceAutosaveCompleted(ud: ?*anyopaque) callconv(.c) c_int {
+    const job: *WorkspaceAutosaveJob = @ptrCast(@alignCast(ud orelse return 0));
+    const self = job.window;
+    const priv = self.private();
+    if (priv.disposing_runtime) {
+        if (priv.workspace_autosave_job == job) priv.workspace_autosave_job = null;
+        job.deinitOnMain();
+        return 0;
+    }
+    priv.workspace_autosave_in_flight = false;
+    if (priv.workspace_autosave_job == job) priv.workspace_autosave_job = null;
+
+    for (job.captures, job.outcomes) |*capture, *outcome| {
+        if (outcome.err) |err| {
+            if (autosaveErrorNeedsRetry(err)) {
+                self.scheduleWorkspaceAutosaveRetry();
+                continue;
+            }
+            if (err != error.SelectionRequired) {
+                log.warn("failed to autosave workspace error={}", .{err});
+            }
+            continue;
+        }
+        const path = outcome.path orelse continue;
+        const current_save_epoch = priv.workspace_save_epochs.get(
+            capture.page_key,
+        ) orelse 0;
+        if (current_save_epoch != capture.save_epoch) continue;
+        const runtime = priv.runtime_registry.findWorkspace(
+            capture.snapshot.workspace.workspace_id,
+        ) orelse continue;
+        const workspace_key = capture.snapshot.workspace.workspace_key orelse continue;
+        if (!std.mem.eql(u8, runtime.workspace.slug, workspace_key)) continue;
+
+        Application.default().runtimeIds().observe(capture.snapshot.snapshot_id);
+        updateWorkspaceSnapshotRefAlloc(
+            job.alloc,
+            runtime,
+            capture.snapshot.snapshot_id,
+            capture.snapshot.saved_at,
+            path,
+        ) catch |err| {
+            log.warn("failed to associate autosaved workspace snapshot error={}", .{err});
+            self.scheduleWorkspaceAutosaveRetry();
+            continue;
+        };
+        syncSnapshotScrollbackGenerations(
+            self,
+            capture.snapshot,
+            outcome.scrollback_generations.items,
+        );
+        if (priv.workspace_dirty_generations.get(capture.page_key)) |generation| {
+            if (generation == capture.dirty_generation) {
+                _ = priv.workspace_dirty_generations.remove(capture.page_key);
+            } else {
+                priv.workspace_autosave_rerun_requested = true;
+            }
+        }
+    }
+
+    const rerun = priv.workspace_autosave_rerun_requested;
+    priv.workspace_autosave_rerun_requested = false;
+    if (rerun and !priv.disposing_runtime) {
+        self.startWorkspaceAutosavePass(null) catch |err| {
+            log.warn("failed to rerun workspace autosave pass error={}", .{err});
+        };
+    }
+    job.deinitOnMain();
+    return 0;
+}
+
+fn autosaveErrorNeedsRetry(err: anyerror) bool {
+    return err == error.WorkspaceStorageBusy;
+}
+
+fn persistCapturedWorkspaceAutosave(
+    alloc: std.mem.Allocator,
+    capture: *AutosaveWorkspaceCapture,
+    mode: WorkspaceSaveMode,
+    budget: *AutosaveScrollbackBudget,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+) ![]u8 {
+    var dir = try workspace_storage.createDefaultStorageDirAlloc(alloc);
+    defer dir.close(global.io());
+    const storage = workspace_storage.Storage.init(alloc, dir);
+    const workspace_key = capture.snapshot.workspace.workspace_key orelse
+        return error.MissingWorkspaceKey;
+    const checkpoint_path = try storage.checkpointFilenameAlloc(workspace_key);
+    defer alloc.free(checkpoint_path);
+
+    var transaction = try storage.beginTransaction(switch (mode) {
+        .autosave => .nonblocking,
+        .explicit, .shutdown => .blocking,
+    });
+    defer transaction.deinit();
+    if (capture.cancelled.load(.acquire)) return error.WorkspaceSaveSuperseded;
+    try storage.ensureScrollbackDir(checkpoint_path);
+    try storage.checkScrollbackPruneBudgetAssumeLocked(checkpoint_path);
+
+    while (true) {
+        storage.createScrollbackDirForSnapshotExclusive(
+            checkpoint_path,
+            capture.snapshot.snapshot_id,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                capture.snapshot.snapshot_id = workspace_ids.SnapshotId.init(
+                    capture.snapshot.snapshot_id.raw() +% 1,
+                );
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+    var snapshot_sidecar_committed = false;
+    errdefer if (!snapshot_sidecar_committed) {
+        storage.deleteScrollbackSnapshotDir(
+            checkpoint_path,
+            capture.snapshot.snapshot_id,
+        ) catch |err| {
+            log.warn("failed to clean aborted workspace autosave sidecars error={}", .{err});
+        };
+    };
+
+    try writeCapturedWorkspaceScrollbackAlloc(
+        alloc,
+        storage,
+        checkpoint_path,
+        capture,
+        mode,
+        budget,
+        scrollback_generations,
+    );
+
+    var commit_state: workspace_storage.Storage.CheckpointCommitState = .uncommitted;
+    const path = storage.writeCheckpointTrackedReplacingPathAssumeLocked(
+        capture.snapshot,
+        capture.previous_checkpoint_path,
+        &commit_state,
+    ) catch |err| {
+        snapshot_sidecar_committed = commit_state == .committed;
+        return err;
+    };
+    snapshot_sidecar_committed = true;
+    storage.pruneScrollbackDirForSnapshotAssumeLocked(
+        checkpoint_path,
+        capture.snapshot,
+    ) catch |err| {
+        log.warn("failed to prune workspace autosave sidecars path={s} error={}", .{
+            checkpoint_path,
+            err,
+        });
+    };
+
+    return path;
+}
+
+fn writeCapturedWorkspaceScrollbackAlloc(
+    alloc: std.mem.Allocator,
+    storage: workspace_storage.Storage,
+    checkpoint_path: []const u8,
+    capture: *AutosaveWorkspaceCapture,
+    mode: WorkspaceSaveMode,
+    budget: *AutosaveScrollbackBudget,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+) !void {
+    var scrollback_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        capture.snapshot.snapshot_id,
+    );
+    defer scrollback_dir.close(global.io());
+
+    for (capture.surfaces) |*surface| {
+        const persisted_scrollback_limit = surface.persisted_scrollback_limit;
+        if (persisted_scrollback_limit == 0) continue;
+        const current_generation = surface.core.scrollbackGeneration();
+        const saved_path_exists = if (surface.saved_state) |state|
+            try scrollbackFileUsable(
+                storage,
+                state.path,
+                persisted_scrollback_limit,
+            )
+        else
+            false;
+        if (!shouldWriteScrollbackForSave(
+            mode,
+            surface.saved_state,
+            saved_path_exists,
+            surface.session_id,
+            checkpoint_path,
+            current_generation,
+        )) {
+            const state = surface.saved_state.?;
+            try workspace_snapshot.setSessionScrollbackPathAlloc(
+                &capture.snapshot,
+                alloc,
+                surface.session_id,
+                state.path,
+            );
+            try scrollback_generations.append(alloc, .{
+                .session_id = surface.session_id,
+                .generation = current_generation,
+            });
+            continue;
+        }
+
+        const relative_path = try storage.scrollbackFilenameAlloc(
+            checkpoint_path,
+            capture.snapshot.snapshot_id,
+            surface.session_id,
+        );
+        defer alloc.free(relative_path);
+        const filename = std.fs.path.basename(relative_path);
+        const write_limit = @min(
+            @min(budget.per_session, budget.remaining),
+            persisted_scrollback_limit,
+        );
+        if (write_limit == 0) {
+            _ = try preserveExistingScrollbackForDeferredSave(
+                &capture.snapshot,
+                alloc,
+                scrollback_generations,
+                surface.saved_state,
+                saved_path_exists,
+                checkpoint_path,
+                surface.session_id,
+            );
+            continue;
+        }
+
+        if (try copyUnchangedScrollbackSidecarForSave(
+            storage,
+            surface.saved_state,
+            saved_path_exists,
+            checkpoint_path,
+            current_generation,
+            scrollback_dir,
+            filename,
+            @intCast(write_limit),
+        )) |copied_bytes| {
+            budget.remaining -= copied_bytes;
+            try workspace_snapshot.setSessionScrollbackPathAlloc(
+                &capture.snapshot,
+                alloc,
+                surface.session_id,
+                relative_path,
+            );
+            try scrollback_generations.append(alloc, .{
+                .session_id = surface.session_id,
+                .generation = current_generation,
+            });
+            continue;
+        }
+
+        const write_result = surface.core.writeScrollbackFileWithLimit(
+            scrollback_dir,
+            filename,
+            write_limit,
+            persisted_scrollback_limit,
+        ) catch |err| switch (err) {
+            error.NoScrollback => continue,
+            error.SavedScrollbackTooLarge => {
+                budget.remaining -|= write_limit;
+                _ = try preserveExistingScrollbackForDeferredSave(
+                    &capture.snapshot,
+                    alloc,
+                    scrollback_generations,
+                    surface.saved_state,
+                    saved_path_exists,
+                    checkpoint_path,
+                    surface.session_id,
+                );
+                continue;
+            },
+            else => return err,
+        };
+        budget.remaining -= write_result.bytes;
+        try workspace_snapshot.setSessionScrollbackPathAlloc(
+            &capture.snapshot,
+            alloc,
+            surface.session_id,
+            relative_path,
+        );
+        try scrollback_generations.append(alloc, .{
+            .session_id = surface.session_id,
+            .generation = write_result.generation,
+        });
+    }
+}
+
+fn writeWorkspaceScrollbackAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    storage: workspace_storage.Storage,
+    checkpoint_path: []const u8,
+    workspace_page: *WorkspacePage,
+    snapshot_value: *workspace_snapshot.Snapshot,
+    mode: WorkspaceSaveMode,
+    autosave_scrollback_budget: ?*AutosaveScrollbackBudget,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+) !void {
+    const tree = workspace_page.getSurfaceTree() orelse return;
+    var unbounded_bytes_remaining: usize = std.math.maxInt(usize);
+    const autosave_budget = if (mode == .autosave)
+        autosave_scrollback_budget orelse return error.AutosaveScrollbackBudgetRequired
+    else
+        null;
+    const bytes_remaining = if (autosave_budget) |budget|
+        &budget.remaining
+    else
+        &unbounded_bytes_remaining;
+    var scrollback_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        snapshot_value.snapshot_id,
+    );
+    defer scrollback_dir.close(global.io());
+
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const leaf = entry.view;
+        const surface_count = leaf.getSurfaceCount();
+        for (0..@intCast(surface_count)) |surface_index| {
+            const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse {
+                log.warn("skipping optional scrollback: surface not found index={}", .{surface_index});
+                continue;
+            };
+            const session_id = self.private().session_identity_index.sessionForAttachment(@intFromPtr(surface)) orelse {
+                log.warn("skipping optional scrollback: session identity not found", .{});
+                continue;
+            };
+            const core_surface = surface.core() orelse {
+                log.warn("skipping optional scrollback: surface not initialized session={}", .{session_id.raw()});
+                continue;
+            };
+            const persisted_scrollback_limit =
+                core_surface.persistedScrollbackLimit();
+            if (persisted_scrollback_limit == 0) continue;
+
+            const current_generation = core_surface.scrollbackGeneration();
+            const saved_state = self.private().scrollback_saved_states.get(session_id);
+            const saved_path_exists = if (saved_state) |state|
+                try scrollbackFileUsable(
+                    storage,
+                    state.path,
+                    persisted_scrollback_limit,
+                )
+            else
+                false;
+            const should_write = shouldWriteScrollbackForSave(
+                mode,
+                saved_state,
+                saved_path_exists,
+                session_id,
+                checkpoint_path,
+                current_generation,
+            );
+            if (!should_write) {
+                const state = saved_state.?;
+                try workspace_snapshot.setSessionScrollbackPathAlloc(
+                    snapshot_value,
+                    alloc,
+                    session_id,
+                    state.path,
+                );
+                try scrollback_generations.append(alloc, .{
+                    .session_id = session_id,
+                    .generation = current_generation,
+                });
+                continue;
+            }
+
+            const relative_path = try storage.scrollbackFilenameAlloc(
+                checkpoint_path,
+                snapshot_value.snapshot_id,
+                session_id,
+            );
+            defer alloc.free(relative_path);
+
+            const filename = std.fs.path.basename(relative_path);
+            const operation_limit: usize = if (autosave_budget) |budget|
+                @min(
+                    budget.per_session,
+                    bytes_remaining.*,
+                )
+            else
+                termio.Termio.max_saved_scrollback_replay_bytes;
+            const write_limit = @min(
+                operation_limit,
+                persisted_scrollback_limit,
+            );
+
+            if (write_limit == 0) {
+                _ = try preserveExistingScrollbackForDeferredSave(
+                    snapshot_value,
+                    alloc,
+                    scrollback_generations,
+                    saved_state,
+                    saved_path_exists,
+                    checkpoint_path,
+                    session_id,
+                );
+                continue;
+            }
+
+            if (try copyUnchangedScrollbackSidecarForSave(
+                storage,
+                saved_state,
+                saved_path_exists,
+                checkpoint_path,
+                current_generation,
+                scrollback_dir,
+                filename,
+                @intCast(write_limit),
+            )) |copied_bytes| {
+                if (mode == .autosave) {
+                    bytes_remaining.* -= copied_bytes;
+                }
+                try workspace_snapshot.setSessionScrollbackPathAlloc(
+                    snapshot_value,
+                    alloc,
+                    session_id,
+                    relative_path,
+                );
+                try scrollback_generations.append(alloc, .{
+                    .session_id = session_id,
+                    .generation = current_generation,
+                });
+                continue;
+            }
+
+            const write_result = core_surface.writeScrollbackFile(
+                scrollback_dir,
+                filename,
+                write_limit,
+            ) catch |err| switch (err) {
+                error.NoScrollback => continue,
+                error.SavedScrollbackTooLarge => {
+                    if (mode == .autosave) {
+                        bytes_remaining.* -|= write_limit;
+                    }
+                    _ = try preserveExistingScrollbackForDeferredSave(
+                        snapshot_value,
+                        alloc,
+                        scrollback_generations,
+                        saved_state,
+                        saved_path_exists,
+                        checkpoint_path,
+                        session_id,
+                    );
+                    log.warn("saved scrollback exceeded save budget session={} mode={}", .{
+                        session_id.raw(),
+                        mode,
+                    });
+                    continue;
+                },
+                else => return err,
+            };
+            if (mode == .autosave) {
+                bytes_remaining.* -= write_result.bytes;
+            }
+            try workspace_snapshot.setSessionScrollbackPathAlloc(
+                snapshot_value,
+                alloc,
+                session_id,
+                relative_path,
+            );
+            try scrollback_generations.append(alloc, .{
+                .session_id = session_id,
+                .generation = write_result.generation,
+            });
+        }
+    }
+}
+
+fn preserveExistingScrollbackForDeferredSave(
+    snapshot_value: *workspace_snapshot.Snapshot,
+    alloc: std.mem.Allocator,
+    scrollback_generations: *std.ArrayList(SavedScrollbackGeneration),
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    checkpoint_path: []const u8,
+    session_id: workspace_ids.SessionId,
+) !bool {
+    const state = saved_state orelse return false;
+    if (!saved_path_exists) return false;
+    if (!savedScrollbackPathMatchesCheckpoint(
+        state.path,
+        checkpoint_path,
+        session_id,
+    )) return false;
+
+    try workspace_snapshot.setSessionScrollbackPathAlloc(
+        snapshot_value,
+        alloc,
+        session_id,
+        state.path,
+    );
+    try scrollback_generations.append(alloc, .{
+        .session_id = session_id,
+        .generation = state.generation,
+    });
+    return true;
+}
+
+fn shouldWriteScrollbackForSave(
+    mode: WorkspaceSaveMode,
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    session_id: workspace_ids.SessionId,
+    checkpoint_path: []const u8,
+    current_generation: u64,
+) bool {
+    const saved_path_matches_checkpoint = if (saved_state) |state|
+        savedScrollbackPathMatchesCheckpoint(state.path, checkpoint_path, session_id)
+    else
+        false;
+    _ = mode;
+    return !saved_path_exists or
+        !saved_path_matches_checkpoint or
+        shouldWriteScrollbackGeneration(saved_state, current_generation);
+}
+
+fn savedScrollbackPathMatchesCheckpoint(
+    path: []const u8,
+    checkpoint_path: []const u8,
+    session_id: workspace_ids.SessionId,
+) bool {
+    return workspace_storage.Storage.validScrollbackSidecarPathForCheckpointAndSession(
+        path,
+        checkpoint_path,
+        session_id,
+    );
+}
+
+fn shouldWriteScrollbackGeneration(
+    saved_state: ?SavedScrollbackState,
+    current_generation: u64,
+) bool {
+    if (saved_state) |state| {
+        return state.generation != current_generation;
+    }
+
+    // Restored sessions start at generation zero with an existing sidecar.
+    // Preserve that sidecar until the terminal actually receives new output.
+    return current_generation != 0;
+}
+
+fn copyUnchangedScrollbackSidecarForSave(
+    storage: workspace_storage.Storage,
+    saved_state: ?SavedScrollbackState,
+    saved_path_exists: bool,
+    checkpoint_path: []const u8,
+    current_generation: u64,
+    dest_dir: std.Io.Dir,
+    dest_filename: []const u8,
+    max_bytes: u64,
+) !?usize {
+    const state = saved_state orelse return null;
+    if (!saved_path_exists) return null;
+    if (shouldWriteScrollbackGeneration(state, current_generation)) return null;
+    if (!workspace_storage.Storage.validScrollbackSidecarPathForCheckpoint(
+        state.path,
+        checkpoint_path,
+    )) return null;
+
+    const copied = storage.copyScrollbackFileToDir(
+        state.path,
+        dest_dir,
+        dest_filename,
+        max_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.Unsupported,
+        error.InvalidWorkspaceScrollbackPath,
+        error.InvalidWorkspaceScrollbackFile,
+        error.SavedScrollbackTooLarge,
+        => return null,
+        else => return err,
+    };
+    return @intCast(copied);
+}
+
+fn scrollbackFileUsable(
+    storage: workspace_storage.Storage,
+    relative_path: []const u8,
+    max_bytes: usize,
+) !bool {
+    const file = storage.openScrollbackFileRead(relative_path) catch |err| switch (err) {
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.Unsupported,
+        error.InvalidWorkspaceScrollbackPath,
+        => return false,
+        else => return err,
+    };
+    defer file.close(global.io());
+
+    const stat = file.stat(global.io()) catch return false;
+    return stat.kind == .file and
+        stat.size <= max_bytes;
+}
+
+fn syncSnapshotScrollbackGenerations(
+    self: *Window,
+    snapshot_value: workspace_snapshot.Snapshot,
+    scrollback_generations: []const SavedScrollbackGeneration,
+) void {
+    for (snapshot_value.sessions) |session| {
+        if (session.scrollback_path == null) {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        }
+
+        const generation = for (scrollback_generations) |entry| {
+            if (entry.session_id == session.session_id) break entry.generation;
+        } else {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        };
+        setSavedScrollbackStateAlloc(
+            self,
+            Application.default().allocator(),
+            session.session_id,
+            generation,
+            session.scrollback_path.?,
+        ) catch |err| {
+            log.warn("failed to record scrollback state session={} error={}", .{
+                session.session_id.raw(),
+                err,
+            });
+        };
+    }
+}
+
+fn syncRestoredScrollbackStates(
+    self: *Window,
+    sessions: []const workspace_restore.SessionPlan,
+    opened_snapshot: ?*const workspace_storage.Storage.OpenedSnapshot,
+) void {
+    const alloc = Application.default().allocator();
+    for (sessions) |session| {
+        const path = session.scrollback_path orelse {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        };
+        if (opened_snapshot == null or !opened_snapshot.?.hasScrollbackPath(path)) {
+            removeSavedScrollbackState(self, session.session_id);
+            continue;
+        }
+        setSavedScrollbackStateAlloc(
+            self,
+            alloc,
+            session.session_id,
+            0,
+            path,
+        ) catch |err| {
+            log.warn("failed to record restored scrollback state session={} error={}", .{
+                session.session_id.raw(),
+                err,
+            });
+        };
+    }
+}
+
+fn setSavedScrollbackStateAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    session_id: workspace_ids.SessionId,
+    generation: u64,
+    path: []const u8,
+) !void {
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+
+    const next: SavedScrollbackState = .{
+        .generation = generation,
+        .path = owned_path,
+    };
+    if (try self.private().scrollback_saved_states.fetchPut(session_id, next)) |old| {
+        alloc.free(old.value.path);
+    }
+}
+
+fn removeSavedScrollbackState(self: *Window, session_id: workspace_ids.SessionId) void {
+    if (self.private().scrollback_saved_states.fetchRemove(session_id)) |removed| {
+        Application.default().allocator().free(removed.value.path);
+    }
+}
+
+fn pruneSavedScrollbackStates(
+    alloc: std.mem.Allocator,
+    states: *std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState),
+    live_session_ids: *const std.AutoHashMap(workspace_ids.SessionId, void),
+) void {
+    var stale_session_ids: std.ArrayList(workspace_ids.SessionId) = .empty;
+    defer stale_session_ids.deinit(alloc);
+
+    var it = states.keyIterator();
+    while (it.next()) |session_id| {
+        if (live_session_ids.contains(session_id.*)) continue;
+        stale_session_ids.append(alloc, session_id.*) catch continue;
+    }
+
+    for (stale_session_ids.items) |session_id| {
+        if (states.fetchRemove(session_id)) |removed| {
+            alloc.free(removed.value.path);
+        }
+    }
+}
+
+fn deinitSavedScrollbackStates(self: *Window) void {
+    const alloc = Application.default().allocator();
+    var it = self.private().scrollback_saved_states.valueIterator();
+    while (it.next()) |state| {
+        alloc.free(state.path);
+    }
+}
+
 pub fn workspaceControlRestoreAlloc(
     self: *Window,
     alloc: std.mem.Allocator,
     value: workspace_snapshot.Snapshot,
     plan: *const workspace_restore.Plan,
+    opened_snapshot: ?*workspace_storage.Storage.OpenedSnapshot,
 ) !workspace_model.RestoreResults {
     var live_plan = try remapRestorePlanForLiveRuntimeAlloc(alloc, plan);
     defer live_plan.deinit(alloc);
@@ -4345,7 +6395,13 @@ pub fn workspaceControlRestoreAlloc(
         workspace_page.setTitleOverride(title_override);
     }
 
-    var built_tree = try buildWorkspaceRestoreTreeAlloc(self, alloc, value, &live_plan);
+    var built_tree = try buildWorkspaceRestoreTreeAlloc(
+        self,
+        alloc,
+        value,
+        &live_plan,
+        opened_snapshot,
+    );
     defer built_tree.deinit();
     workspace_page.getSplitTree().setTree(&built_tree);
     if (previously_selected_page) |selected_page| tab_view.setSelectedPage(selected_page);
@@ -4372,11 +6428,44 @@ pub fn workspaceControlRestoreAlloc(
     const finalized = try workspace_restore.finalizeAlloc(alloc, &live_plan, outcomes);
     defer finalized.deinit(alloc);
 
+    try selectRestoredWorkspaceSession(
+        self,
+        workspace_page,
+        finalized.selection.session_id orelse return error.WorkspaceLayoutInvalid,
+    );
     self.refreshWorkspaceRegistrySafe();
     const restored_runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return error.WorkspaceNotFound;
     var results = try cloneRestoreResultsAlloc(alloc, finalized.results);
     results.restored_workspace_id = restored_runtime.workspace.workspace_id;
+    syncRestoredScrollbackStates(self, live_plan.sessions, opened_snapshot);
     return results;
+}
+
+fn selectRestoredWorkspaceSession(
+    self: *Window,
+    workspace_page: *WorkspacePage,
+    session_id: workspace_ids.SessionId,
+) !void {
+    const split_tree = workspace_page.getSplitTree();
+    const tree = split_tree.getTree() orelse return error.WorkspaceLayoutInvalid;
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        const leaf = entry.view;
+        const surface_count = leaf.getSurfaceCount();
+        for (0..@intCast(surface_count)) |surface_index| {
+            const surface = leaf.getSurfaceAt(@intCast(surface_index)) orelse continue;
+            const candidate_session = self.private().session_identity_index.sessionForAttachment(
+                @intFromPtr(surface),
+            ) orelse continue;
+            if (candidate_session != session_id) continue;
+            if (!split_tree.selectSurfaceWithoutFocus(surface)) {
+                return error.WorkspaceLayoutInvalid;
+            }
+            return;
+        }
+    }
+
+    return error.WorkspaceLayoutInvalid;
 }
 
 fn remapRestorePlanForLiveRuntimeAlloc(
@@ -4469,6 +6558,7 @@ fn buildWorkspaceRestoreTreeAlloc(
     alloc: std.mem.Allocator,
     value: workspace_snapshot.Snapshot,
     plan: *const workspace_restore.Plan,
+    opened_snapshot: ?*workspace_storage.Storage.OpenedSnapshot,
 ) !SplitTabs.Tree {
     var split_map = std.AutoHashMap(workspace_ids.SplitId, workspace_restore.SplitPlan).init(alloc);
     defer split_map.deinit();
@@ -4496,6 +6586,7 @@ fn buildWorkspaceRestoreTreeAlloc(
         &layout_map,
         root_layout_node_id,
         plan.workspace_id,
+        opened_snapshot,
     );
 }
 
@@ -4508,13 +6599,21 @@ fn buildWorkspaceRestoreTreeFromNodeAlloc(
     layout_map: *const std.StringHashMap(workspace_snapshot.LayoutNodeRecord),
     layout_node_id: []const u8,
     workspace_id: workspace_ids.WorkspaceId,
+    opened_snapshot: ?*workspace_storage.Storage.OpenedSnapshot,
 ) !SplitTabs.Tree {
     const entry = layout_map.get(layout_node_id) orelse return error.WorkspaceLayoutInvalid;
     return switch (entry.node_type) {
         .split_root => blk: {
             const split_id = split_root_map.get(layout_node_id) orelse return error.WorkspaceLayoutInvalid;
             const split = split_map.get(split_id) orelse return error.WorkspaceLayoutInvalid;
-            break :blk try buildWorkspaceRestoreLeafTreeAlloc(self, alloc, plan, split, workspace_id);
+            break :blk try buildWorkspaceRestoreLeafTreeAlloc(
+                self,
+                alloc,
+                plan,
+                split,
+                workspace_id,
+                opened_snapshot,
+            );
         },
         .split => blk: {
             if (entry.tab_id != null) return error.TabMultiSessionUnsupported;
@@ -4530,6 +6629,7 @@ fn buildWorkspaceRestoreTreeFromNodeAlloc(
                 layout_map,
                 child_ids[0],
                 workspace_id,
+                opened_snapshot,
             );
             defer left.deinit();
             var right = try buildWorkspaceRestoreTreeFromNodeAlloc(
@@ -4541,6 +6641,7 @@ fn buildWorkspaceRestoreTreeFromNodeAlloc(
                 layout_map,
                 child_ids[1],
                 workspace_id,
+                opened_snapshot,
             );
             defer right.deinit();
 
@@ -4562,12 +6663,17 @@ fn buildWorkspaceRestoreLeafTreeAlloc(
     plan: *const workspace_restore.Plan,
     split_plan: workspace_restore.SplitPlan,
     workspace_id: workspace_ids.WorkspaceId,
+    opened_snapshot: ?*workspace_storage.Storage.OpenedSnapshot,
 ) !SplitTabs.Tree {
     if (split_plan.tab_len == 0) return error.WorkspaceLayoutInvalid;
 
     const first_tab_plan = plan.tabs[split_plan.tab_start];
     const first_session_plan = plan.sessions[first_tab_plan.session_start];
-    var first_surface = try createRestoreSurfaceAlloc(alloc, first_session_plan);
+    var first_surface = try createRestoreSurfaceAlloc(
+        alloc,
+        first_session_plan,
+        opened_snapshot,
+    );
     defer first_surface.unref();
     _ = first_surface.refSink();
 
@@ -4591,7 +6697,11 @@ fn buildWorkspaceRestoreLeafTreeAlloc(
     while (tab_offset < split_plan.tab_len) : (tab_offset += 1) {
         const tab_plan = plan.tabs[split_plan.tab_start + tab_offset];
         const session_plan = plan.sessions[tab_plan.session_start];
-        var surface = try createRestoreSurfaceAlloc(alloc, session_plan);
+        var surface = try createRestoreSurfaceAlloc(
+            alloc,
+            session_plan,
+            opened_snapshot,
+        );
         defer surface.unref();
         _ = surface.refSink();
 
@@ -4617,6 +6727,7 @@ fn buildWorkspaceRestoreLeafTreeAlloc(
 fn createRestoreSurfaceAlloc(
     alloc: std.mem.Allocator,
     session: workspace_restore.SessionPlan,
+    opened_snapshot: ?*workspace_storage.Storage.OpenedSnapshot,
 ) !*Surface {
     var command = try allocRestoreCommand(alloc, session.command);
     defer if (command) |*value| deinitRestoreCommand(alloc, value);
@@ -4627,12 +6738,21 @@ fn createRestoreSurfaceAlloc(
     else
         null;
     defer if (title_override) |value| alloc.free(value);
+    var initial_scrollback_file = if (session.scrollback_path) |path|
+        if (opened_snapshot) |opened| opened.takeScrollbackFile(path) else null
+    else
+        null;
+    errdefer if (initial_scrollback_file) |file| file.close(global.io());
 
     const surface = Surface.new(.{
         .command = command,
         .working_directory = cwd,
+        .initial_scrollback_file = initial_scrollback_file,
         .title = title_override,
     });
+    var surface_owned = true;
+    errdefer if (surface_owned) surface.unref();
+    initial_scrollback_file = null;
     if (session.cwd.len > 0) {
         surface.setPwd(cwd);
         if (title_override == null) {
@@ -4643,7 +6763,12 @@ fn createRestoreSurfaceAlloc(
             surface.setTitle(display_cwd_z);
         }
     }
+    surface_owned = false;
     return surface;
+}
+
+fn validWorkspaceScrollbackPath(path: []const u8) bool {
+    return workspace_storage.Storage.validScrollbackSidecarPath(path);
 }
 
 fn allocRestoreDisplayPath(
@@ -4651,7 +6776,9 @@ fn allocRestoreDisplayPath(
     path: []const u8,
 ) ![]u8 {
     var home_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const home = internal_os.home(&home_buf) catch null;
+    var env = try global.environMap();
+    defer env.deinit();
+    const home = internal_os.home(&env, &home_buf) catch null;
     if (home) |home_path| {
         if (std.mem.eql(u8, path, home_path)) {
             return try alloc.dupe(u8, "~");
@@ -4811,10 +6938,10 @@ fn updateWorkspaceSnapshotRefAlloc(
     snapshot_id: workspace_ids.SnapshotId,
     saved_at: []const u8,
     path: []const u8,
-) void {
-    const next_saved_at = alloc.dupe(u8, saved_at) catch return;
+) !void {
+    const next_saved_at = try alloc.dupe(u8, saved_at);
     errdefer alloc.free(next_saved_at);
-    const next_path = alloc.dupe(u8, path) catch return;
+    const next_path = try alloc.dupe(u8, path);
     errdefer alloc.free(next_path);
 
     const next_snapshot_ref: workspace_model.WorkspaceSnapshotRef = .{
@@ -4844,17 +6971,27 @@ fn clearWorkspaceSnapshotRefAlloc(
 fn allocFreshWorkspaceKey(
     workspace_id: workspace_ids.WorkspaceId,
 ) ![]u8 {
-    return std.fmt.allocPrint(
+    return try allocFreshWorkspaceKeyWithAllocator(
         Application.default().allocator(),
+        workspace_id,
+    );
+}
+
+fn allocFreshWorkspaceKeyWithAllocator(
+    alloc: std.mem.Allocator,
+    workspace_id: workspace_ids.WorkspaceId,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
         "workspace-{d}-{d}",
         .{
-            @as(u64, @intCast(std.time.microTimestamp())),
+            @as(u64, @intCast(std.Io.Timestamp.now(global.io(), .real).toMicroseconds())),
             workspace_id.raw(),
         },
     );
 }
 
-fn workspaceRestoreShouldFork(
+fn windowHasRestoredWorkspaceOwner(
     self: *Window,
     workspace_key: []const u8,
     workspace_name: []const u8,
@@ -4869,33 +7006,164 @@ fn workspaceRestoreShouldFork(
     return false;
 }
 
-fn findWorkspacePageByRuntimeId(
-    self: *Window,
-    workspace_id: workspace_ids.WorkspaceId,
-) ?*WorkspacePage {
-    const tab_view = self.getTabView();
-    const n = tab_view.getNPages();
-    for (0..@intCast(n)) |i| {
-        const page = tab_view.getNthPage(@intCast(i));
-        const workspace_page = gobject.ext.cast(WorkspacePage, page.getChild()) orelse continue;
-        const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse continue;
-        if (runtime.workspace.workspace_id == workspace_id) return workspace_page;
+fn workspaceRestoreShouldFork(
+    workspace_key: []const u8,
+    workspace_name: []const u8,
+) bool {
+    const list = gtk.Window.listToplevels();
+    defer list.free();
+
+    var current: ?*glib.List = list;
+    while (current) |node| : (current = node.f_next) {
+        const top_level: *gtk.Window = @ptrCast(@alignCast(node.f_data orelse continue));
+        const window = gobject.ext.cast(Window, top_level) orelse continue;
+        if (windowHasRestoredWorkspaceOwner(window, workspace_key, workspace_name)) {
+            return true;
+        }
     }
 
-    return null;
+    return false;
 }
 
-fn restoredWorkspacePage(self: *Window) ?*WorkspacePage {
-    const selected_page = self.getTabView().getSelectedPage() orelse return null;
-    return gobject.ext.cast(WorkspacePage, selected_page.getChild());
+pub fn workspaceControlRestoreShouldFork(
+    workspace_key: []const u8,
+    workspace_name: []const u8,
+) bool {
+    return workspaceRestoreShouldFork(workspace_key, workspace_name);
+}
+
+pub fn workspaceControlPrepareRestoredWorkspaceAssociationAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    entry: workspace_snapshot.CatalogEntry,
+    fork_restore: bool,
+) !PreparedWorkspaceRestoreAssociation {
+    return try prepareRestoredWorkspaceAssociationAlloc(
+        self,
+        alloc,
+        entry,
+        fork_restore,
+    );
+}
+
+pub fn workspaceControlAssociateRestoredWorkspace(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    restored_workspace_id: workspace_ids.WorkspaceId,
+    association: *PreparedWorkspaceRestoreAssociation,
+) !void {
+    const workspace_page = self.findWorkspacePageByRuntimeId(restored_workspace_id) orelse
+        return error.WorkspaceNotFound;
+    const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse
+        return error.WorkspaceNotFound;
+    associateRestoredWorkspace(
+        self,
+        alloc,
+        workspace_page,
+        runtime,
+        association,
+    );
+}
+
+pub fn workspaceControlRollbackRestoredWorkspace(
+    self: *Window,
+    restored_workspace_id: workspace_ids.WorkspaceId,
+) void {
+    const workspace_page = self.findWorkspacePageByRuntimeId(restored_workspace_id) orelse return;
+    const priv = self.private();
+    const page = priv.tab_view.getPage(workspace_page.as(gtk.Widget));
+    _ = page.ref();
+    defer page.unref();
+
+    priv.force_close_uncommitted_workspace_page = page;
+    defer priv.force_close_uncommitted_workspace_page = null;
+    workspace_page.getSplitTree().setTree(null);
+    if (priv.tab_view.getPagePosition(page) >= 0) {
+        priv.tab_view.closePage(page);
+    }
+}
+
+fn prepareRestoredWorkspaceAssociationAlloc(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    entry: workspace_snapshot.CatalogEntry,
+    fork_restore: bool,
+) !PreparedWorkspaceRestoreAssociation {
+    if (!fork_restore) {
+        try self.private().workspace_checkpoint_possible.ensureUnusedCapacity(1);
+        const saved_at = try alloc.dupe(u8, entry.saved_at);
+        errdefer alloc.free(saved_at);
+        const path = try alloc.dupe(u8, entry.path);
+        errdefer alloc.free(path);
+        return .{ .checkpoint = .{
+            .snapshot_id = entry.snapshot_id,
+            .saved_at = saved_at,
+            .path = path,
+        } };
+    }
+
+    const fork_name = try allocForkWorkspaceDisplayName(
+        self,
+        alloc,
+        null,
+        entry.workspace_name,
+    );
+    defer alloc.free(fork_name);
+    const fork_name_z = try alloc.dupeZ(u8, fork_name);
+    errdefer alloc.free(fork_name_z);
+    const fresh_key = try allocFreshWorkspaceKeyWithAllocator(alloc, entry.workspace_id);
+    defer alloc.free(fresh_key);
+    const next_name = try alloc.dupe(u8, fork_name);
+    errdefer alloc.free(next_name);
+    const next_slug = try alloc.dupe(u8, fresh_key);
+    errdefer alloc.free(next_slug);
+
+    return .{ .fork = .{
+        .name = next_name,
+        .name_z = fork_name_z,
+        .slug = next_slug,
+    } };
+}
+
+fn associateRestoredWorkspace(
+    self: *Window,
+    alloc: std.mem.Allocator,
+    workspace_page: *WorkspacePage,
+    runtime: *workspace_registry.WorkspaceRuntime,
+    association: *PreparedWorkspaceRestoreAssociation,
+) void {
+    switch (association.*) {
+        .checkpoint => |snapshot_ref| {
+            self.private().workspace_checkpoint_possible.putAssumeCapacity(
+                @intFromPtr(workspace_page),
+                {},
+            );
+            clearWorkspaceSnapshotRefAlloc(alloc, runtime);
+            runtime.workspace.snapshot_ref = snapshot_ref;
+        },
+        .fork => |value| {
+            workspace_page.setSidebarTitle(value.name_z);
+            alloc.free(runtime.workspace.name);
+            runtime.workspace.name = value.name;
+            alloc.free(runtime.workspace.slug);
+            runtime.workspace.slug = value.slug;
+            clearWorkspaceSnapshotRefAlloc(alloc, runtime);
+            alloc.free(value.name_z);
+            self.syncWorkspaceListDescriptors();
+        },
+        .consumed => unreachable,
+    }
+    association.* = .consumed;
+    self.bumpWorkspaceSaveEpoch(workspace_page);
+    _ = self.private().workspace_dirty_generations.remove(@intFromPtr(workspace_page));
 }
 
 fn allocForkWorkspaceDisplayName(
     self: *Window,
-    restored_workspace_id: workspace_ids.WorkspaceId,
+    alloc: std.mem.Allocator,
+    restored_workspace_id: ?workspace_ids.WorkspaceId,
     base_name: []const u8,
 ) ![]u8 {
-    const alloc = Application.default().allocator();
     if (!workspaceNameExists(self, restored_workspace_id, base_name)) {
         return try alloc.dupe(u8, base_name);
     }
@@ -4913,11 +7181,13 @@ fn allocForkWorkspaceDisplayName(
 
 fn workspaceNameExists(
     self: *Window,
-    excluded_workspace_id: workspace_ids.WorkspaceId,
+    excluded_workspace_id: ?workspace_ids.WorkspaceId,
     name: []const u8,
 ) bool {
     for (self.private().runtime_registry.workspaces.items) |*runtime| {
-        if (runtime.workspace.workspace_id == excluded_workspace_id) continue;
+        if (excluded_workspace_id) |excluded| {
+            if (runtime.workspace.workspace_id == excluded) continue;
+        }
         if (std.mem.eql(u8, runtime.workspace.name, name)) return true;
     }
     return false;
@@ -4975,7 +7245,9 @@ fn workspaceSnapshotPathAlloc(
     const runtime = self.getWorkspaceRuntimeForPage(workspace_page) orelse return null;
     const snapshot_ref = runtime.workspace.snapshot_ref orelse return null;
 
-    const storage_path = try internal_os.xdg.state(alloc, .{
+    var env = try global.environMap();
+    defer env.deinit();
+    const storage_path = try internal_os.xdg.state(alloc, &env, .{
         .subdir = "ghostty/workspaces",
     });
     defer alloc.free(storage_path);
@@ -5174,7 +7446,11 @@ fn allocWorkspaceControlCommand(
             }
 
             for (argv) |item| {
-                try owned.append(alloc, try alloc.dupeZ(u8, item));
+                const copy = try alloc.dupeZ(u8, item);
+                owned.append(alloc, copy) catch |err| {
+                    alloc.free(copy);
+                    return err;
+                };
             }
 
             break :blk .{ .direct = try owned.toOwnedSlice(alloc) };
@@ -5196,16 +7472,22 @@ fn workspaceModelCommandFromSurfaceAlloc(
                     copied.deinit(alloc);
                 }
                 for (argv) |item| {
-                    try copied.append(alloc, try alloc.dupe(u8, item));
+                    const copy = try alloc.dupe(u8, item);
+                    copied.append(alloc, copy) catch |err| {
+                        alloc.free(copy);
+                        return err;
+                    };
                 }
                 break :blk .{ .argv = try copied.toOwnedSlice(alloc) };
             },
         };
     }
 
-    if (std.process.getEnvVarOwned(alloc, "SHELL")) |shell| {
-        return .{ .shell = shell };
-    } else |_| {}
+    var env = try global.environMap();
+    defer env.deinit();
+    if (env.get("SHELL")) |shell| {
+        return .{ .shell = try alloc.dupe(u8, shell) };
+    }
 
     if (@import("builtin").os.tag == .windows) {
         return .{ .shell = try alloc.dupe(u8, "cmd.exe") };
@@ -5394,4 +7676,428 @@ test "saved workspace catalog lookup for runtime matches checkpoint path first" 
 
     try testing.expectEqualStrings("work-restored.json", matched.path);
     try testing.expectEqualStrings("work", matched.workspace_name);
+}
+
+test "saved scrollback restore path is validated" {
+    const testing = std.testing;
+    const valid_path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-404.vt";
+
+    try testing.expect(validWorkspaceScrollbackPath(valid_path));
+    try testing.expect(!validWorkspaceScrollbackPath(""));
+    try testing.expect(!validWorkspaceScrollbackPath("catalog.json"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json"));
+    try testing.expect(!validWorkspaceScrollbackPath("/tmp/session-1.vt"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json.scrollback/../session-1.vt"));
+    try testing.expect(!validWorkspaceScrollbackPath("ghostty-deadbeef.json.scrollback/snapshot-1/session-404.vt\x00truncated"));
+}
+
+test "saved scrollback autosave rewrites after restored generation changes" {
+    const testing = std.testing;
+    const restored_state: SavedScrollbackState = .{
+        .generation = 0,
+        .path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt",
+    };
+
+    try testing.expect(!shouldWriteScrollbackGeneration(restored_state, 0));
+    try testing.expect(shouldWriteScrollbackGeneration(restored_state, 1));
+}
+
+test "saved scrollback budget deferral preserves the prior generation" {
+    const testing = std.testing;
+
+    var fixture = try testWorkspaceRuntime(testing.allocator);
+    defer fixture.registry.deinit();
+    var snapshot_value = try workspace_snapshot.fromRuntimeAlloc(
+        testing.allocator,
+        workspace_ids.SnapshotId.init(2),
+        "2026-07-10T00:00:00Z",
+        fixture.workspace,
+    );
+    defer snapshot_value.deinit(testing.allocator);
+
+    var generations: std.ArrayList(SavedScrollbackGeneration) = .empty;
+    defer generations.deinit(testing.allocator);
+    const checkpoint_path = "ghostty-deadbeef.json";
+    const session_id = workspace_ids.SessionId.init(31);
+    const prior_path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-31.vt";
+
+    try testing.expect(try preserveExistingScrollbackForDeferredSave(
+        &snapshot_value,
+        testing.allocator,
+        &generations,
+        .{
+            .generation = 7,
+            .path = prior_path,
+        },
+        true,
+        checkpoint_path,
+        session_id,
+    ));
+    try testing.expectEqualStrings(
+        prior_path,
+        snapshot_value.sessions[0].scrollback_path.?,
+    );
+    try testing.expectEqual(@as(usize, 1), generations.items.len);
+    try testing.expectEqual(@as(u64, 7), generations.items[0].generation);
+}
+
+test "saved scrollback explicit save preserves unchanged existing sidecar" {
+    const testing = std.testing;
+    const checkpoint_path = "ghostty-deadbeef.json";
+    const session_id = workspace_ids.SessionId.init(1);
+    const restored_state: SavedScrollbackState = .{
+        .generation = 0,
+        .path = "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt",
+    };
+
+    try testing.expect(!shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        checkpoint_path,
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        checkpoint_path,
+        1,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        false,
+        session_id,
+        checkpoint_path,
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .explicit,
+        restored_state,
+        true,
+        session_id,
+        "fork-deadbeef.json",
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        restored_state,
+        true,
+        session_id,
+        "fork-deadbeef.json",
+        0,
+    ));
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        restored_state,
+        true,
+        workspace_ids.SessionId.init(2),
+        checkpoint_path,
+        0,
+    ));
+}
+
+test "saved scrollback save copies unchanged restored sidecar for remapped session" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = workspace_storage.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("ghostty");
+    defer testing.allocator.free(checkpoint_path);
+    const restored_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(1),
+        workspace_ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(restored_path);
+    const live_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(2),
+        workspace_ids.SessionId.init(99),
+    );
+    defer testing.allocator.free(live_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(1));
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(2));
+    {
+        const file = try tmp.dir.createFile(std.testing.io, restored_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "saved restored bytes");
+    }
+
+    var dest_dir = try storage.openScrollbackDirForSnapshot(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(2),
+    );
+    defer dest_dir.close(std.testing.io);
+
+    const copied = try copyUnchangedScrollbackSidecarForSave(
+        storage,
+        .{
+            .generation = 0,
+            .path = restored_path,
+        },
+        true,
+        checkpoint_path,
+        0,
+        dest_dir,
+        std.fs.path.basename(live_path),
+        termio.Termio.max_saved_scrollback_replay_bytes,
+    );
+    try testing.expectEqual(
+        @as(?usize, "saved restored bytes".len),
+        copied,
+    );
+
+    const data = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        live_path,
+        testing.allocator,
+        .limited(1024),
+    );
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("saved restored bytes", data);
+}
+
+test "saved scrollback fast path rejects oversized existing sidecar" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const storage = workspace_storage.Storage.init(testing.allocator, tmp.dir);
+    const checkpoint_path = try storage.checkpointFilenameAlloc("ghostty");
+    defer testing.allocator.free(checkpoint_path);
+    const restored_path = try storage.scrollbackFilenameAlloc(
+        checkpoint_path,
+        workspace_ids.SnapshotId.init(1),
+        workspace_ids.SessionId.init(43),
+    );
+    defer testing.allocator.free(restored_path);
+
+    try storage.ensureScrollbackDirForSnapshot(checkpoint_path, workspace_ids.SnapshotId.init(1));
+    {
+        const file = try tmp.dir.createFile(std.testing.io, restored_path, .{});
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, termio.Termio.max_saved_scrollback_replay_bytes + 1);
+    }
+
+    const usable = try scrollbackFileUsable(
+        storage,
+        restored_path,
+        termio.Termio.max_saved_scrollback_replay_bytes,
+    );
+    try testing.expect(!usable);
+    try testing.expect(shouldWriteScrollbackForSave(
+        .autosave,
+        .{
+            .generation = 0,
+            .path = restored_path,
+        },
+        false,
+        workspace_ids.SessionId.init(43),
+        checkpoint_path,
+        0,
+    ));
+}
+
+test "saved scrollback state prune drops sessions missing from live runtime" {
+    const testing = std.testing;
+
+    var states = std.AutoHashMap(workspace_ids.SessionId, SavedScrollbackState).init(testing.allocator);
+    defer states.deinit();
+    defer {
+        var it = states.valueIterator();
+        while (it.next()) |state| testing.allocator.free(state.path);
+    }
+
+    const live_session = workspace_ids.SessionId.init(1);
+    const stale_session = workspace_ids.SessionId.init(2);
+    try states.put(live_session, .{
+        .generation = 1,
+        .path = try testing.allocator.dupe(u8, "ghostty-deadbeef.json.scrollback/snapshot-1/session-1.vt"),
+    });
+    try states.put(stale_session, .{
+        .generation = 1,
+        .path = try testing.allocator.dupe(u8, "ghostty-deadbeef.json.scrollback/snapshot-1/session-2.vt"),
+    });
+
+    var live_sessions = std.AutoHashMap(workspace_ids.SessionId, void).init(testing.allocator);
+    defer live_sessions.deinit();
+    try live_sessions.put(live_session, {});
+    pruneSavedScrollbackStates(testing.allocator, &states, &live_sessions);
+
+    try testing.expect(states.contains(live_session));
+    try testing.expect(!states.contains(stale_session));
+}
+
+test "autosave scrollback budget divides the pass fairly" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        workspace_autosave_scrollback_session_bytes,
+        AutosaveScrollbackBudget.init(1).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_session_bytes,
+        AutosaveScrollbackBudget.init(2).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_total_bytes / 3,
+        AutosaveScrollbackBudget.init(3).per_session,
+    );
+    try testing.expectEqual(
+        workspace_autosave_scrollback_total_bytes,
+        AutosaveScrollbackBudget.init(3).remaining,
+    );
+}
+
+test "workspace autosave retries storage lock contention" {
+    try std.testing.expect(autosaveErrorNeedsRetry(error.WorkspaceStorageBusy));
+    try std.testing.expect(!autosaveErrorNeedsRetry(error.SelectionRequired));
+}
+
+test "workspace explicit saves serialize per workspace" {
+    const testing = std.testing;
+
+    var jobs = WorkspaceExplicitSaveJobs.init(testing.allocator);
+    defer jobs.deinit();
+    var first_job: WorkspaceExplicitSaveJob = undefined;
+    var second_job: WorkspaceExplicitSaveJob = undefined;
+    first_job.capture.cancelled = .init(false);
+    second_job.capture.cancelled = .init(false);
+    const workspace_id = workspace_ids.WorkspaceId.init(1);
+
+    try testing.expect(try jobs.register(workspace_id, &first_job));
+    try testing.expect(jobs.contains(workspace_id));
+    try testing.expect(!try jobs.register(workspace_id, &second_job));
+    try testing.expect(!jobs.removeIfCurrent(workspace_id, &second_job));
+    try testing.expect(jobs.contains(workspace_id));
+    try testing.expect(jobs.cancel(workspace_id));
+    try testing.expect(first_job.capture.cancelled.load(.acquire));
+    try testing.expect(jobs.removeIfCurrent(workspace_id, &first_job));
+    try testing.expect(!jobs.contains(workspace_id));
+    try testing.expect(try jobs.register(workspace_id, &second_job));
+}
+
+test "workspace close confirmation retains one originating page" {
+    const testing = std.testing;
+
+    var pending: PendingWorkspaceClose = .{};
+    const first_page: *adw.TabPage = @ptrFromInt(0x1000);
+    const second_page: *adw.TabPage = @ptrFromInt(0x2000);
+
+    try testing.expect(pending.begin(first_page));
+    try testing.expect(!pending.begin(second_page));
+    try testing.expect(pending.takeIf(second_page) == null);
+    try testing.expect(pending.takeIf(first_page) == first_page);
+    try testing.expect(pending.take() == null);
+    try testing.expect(pending.begin(second_page));
+    try testing.expect(pending.take() == second_page);
+}
+
+fn testReplaceWorkspaceMetadataAllocation(alloc: std.mem.Allocator) !void {
+    var name: []const u8 = try alloc.dupe(u8, "old-name");
+    defer alloc.free(name);
+    var updated_at: []const u8 = try alloc.dupe(u8, "old-time");
+    defer alloc.free(updated_at);
+
+    Window.replaceWorkspaceMetadataTextAlloc(
+        alloc,
+        &name,
+        &updated_at,
+        "new-name",
+    ) catch |err| {
+        try std.testing.expectEqualStrings("old-name", name);
+        try std.testing.expectEqualStrings("old-time", updated_at);
+        return err;
+    };
+    try std.testing.expectEqualStrings("new-name", name);
+    try std.testing.expect(!std.mem.eql(u8, "old-time", updated_at));
+}
+
+test "workspace metadata replacement preserves prior values on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testReplaceWorkspaceMetadataAllocation,
+        .{},
+    );
+}
+
+fn testWorkspaceSnapshotRefUpdateAllocation(alloc: std.mem.Allocator) !void {
+    const TestRuntime = struct {
+        workspace: struct {
+            snapshot_ref: ?workspace_model.WorkspaceSnapshotRef,
+        },
+    };
+    const old_saved_at = try alloc.dupe(u8, "old-time");
+    var free_old_saved_at = true;
+    defer if (free_old_saved_at) alloc.free(old_saved_at);
+    const old_path = try alloc.dupe(u8, "old-path");
+    var free_old_path = true;
+    defer if (free_old_path) alloc.free(old_path);
+    var runtime: TestRuntime = .{ .workspace = .{ .snapshot_ref = .{
+        .snapshot_id = workspace_ids.SnapshotId.init(1),
+        .saved_at = old_saved_at,
+        .path = old_path,
+    } } };
+    free_old_saved_at = false;
+    free_old_path = false;
+    defer clearWorkspaceSnapshotRefAlloc(alloc, &runtime);
+
+    updateWorkspaceSnapshotRefAlloc(
+        alloc,
+        &runtime,
+        workspace_ids.SnapshotId.init(2),
+        "new-time",
+        "new-path",
+    ) catch |err| {
+        const snapshot_ref = runtime.workspace.snapshot_ref.?;
+        try std.testing.expectEqual(workspace_ids.SnapshotId.init(1), snapshot_ref.snapshot_id);
+        try std.testing.expectEqualStrings("old-time", snapshot_ref.saved_at);
+        try std.testing.expectEqualStrings("old-path", snapshot_ref.path);
+        return err;
+    };
+
+    const snapshot_ref = runtime.workspace.snapshot_ref.?;
+    try std.testing.expectEqual(workspace_ids.SnapshotId.init(2), snapshot_ref.snapshot_id);
+    try std.testing.expectEqualStrings("new-time", snapshot_ref.saved_at);
+    try std.testing.expectEqualStrings("new-path", snapshot_ref.path);
+}
+
+test "workspace snapshot reference update preserves prior value on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testWorkspaceSnapshotRefUpdateAllocation,
+        .{},
+    );
+}
+
+fn testWorkspaceCommandCloneAllocation(alloc: std.mem.Allocator) !void {
+    const command = try allocWorkspaceControlCommand(alloc, .{
+        .argv = &.{ "printf", "%s", "workspace" },
+    });
+    defer deinitWorkspaceControlCommand(alloc, &command);
+
+    const model_command = try workspaceModelCommandFromSurfaceAlloc(alloc, command);
+    defer switch (model_command) {
+        .shell => |value| alloc.free(value),
+        .argv => |argv| {
+            for (argv) |value| alloc.free(value);
+            alloc.free(argv);
+        },
+    };
+}
+
+test "workspace command clones clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testWorkspaceCommandCloneAllocation,
+        .{},
+    );
 }

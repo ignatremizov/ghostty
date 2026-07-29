@@ -882,6 +882,7 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
+            initial_scrollback_file: ?std.Io.File = null,
 
             pub const none: @This() = .{};
         } = .none,
@@ -892,6 +893,7 @@ pub const Surface = extern struct {
     pub fn new(overrides: struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
+        initial_scrollback_file: ?std.Io.File = null,
         title: ?[:0]const u8 = null,
 
         pub const none: @This() = .{};
@@ -904,6 +906,7 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+            .initial_scrollback_file = overrides.initial_scrollback_file,
         };
         self.refreshWorkspaceLabels();
         return self;
@@ -980,7 +983,7 @@ pub const Surface = extern struct {
 
     fn resizeTickSchedule(self: *Self) void {
         const priv = self.private();
-        priv.resize_tick_last_ms = std.time.milliTimestamp();
+        priv.resize_tick_last_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
         if (priv.resize_tick_callback_id != 0) return;
 
         priv.resize_tick_callback_id = self.as(gtk.Widget).addTickCallback(
@@ -998,7 +1001,7 @@ pub const Surface = extern struct {
         const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
         const priv = self.private();
 
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
         if (now - priv.resize_tick_last_ms > 120) {
             priv.resize_tick_callback_id = 0;
             return 0;
@@ -2228,6 +2231,10 @@ pub const Surface = extern struct {
             alloc.free(wd);
             priv.overrides.working_directory = null;
         }
+        if (priv.overrides.initial_scrollback_file) |file| {
+            file.close(global.io());
+            priv.overrides.initial_scrollback_file = null;
+        }
 
         // Clean up key sequence and key table state
         for (priv.key_sequence.items) |s| alloc.free(s);
@@ -2461,7 +2468,9 @@ pub const Surface = extern struct {
 
     fn allocDisplayPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
         var home_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const home = internal_os.home(&home_buf) catch null;
+        var env = try global.environMap();
+        defer env.deinit();
+        const home = internal_os.home(&env, &home_buf) catch null;
         if (home) |home_path| {
             if (std.mem.eql(u8, path, home_path)) {
                 return try alloc.dupe(u8, "~");
@@ -4037,6 +4046,9 @@ pub const Surface = extern struct {
             config.@"working-directory" = wd_val;
         }
 
+        const initial_scrollback_file = priv.overrides.initial_scrollback_file;
+        priv.overrides.initial_scrollback_file = null;
+
         // Initialize the surface
         surface.init(
             alloc,
@@ -4044,6 +4056,9 @@ pub const Surface = extern struct {
             app.core(),
             app.rt(),
             &priv.rt_surface,
+            .{
+                .initial_scrollback_file = initial_scrollback_file,
+            },
         ) catch |err| {
             log.warn("failed to initialize surface err={}", .{err});
             return error.SurfaceError;

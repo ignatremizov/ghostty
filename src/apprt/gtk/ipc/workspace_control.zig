@@ -10,6 +10,7 @@ const workspace_control = @import("../workspace_control.zig");
 
 const stderr_buffer_size = 4096;
 const response_timeout: std.Io.Duration = .fromSeconds(5);
+const save_response_timeout: std.Io.Duration = .fromSeconds(60);
 const poll_interval: std.Io.Duration = .fromMilliseconds(10);
 const timeout_message = "Timed out waiting for workspace-control response from Ghostty\n";
 
@@ -71,7 +72,12 @@ fn waitForMatchingResponse(
     const request_id = workspace_control.envelopeIdAlloc(alloc, request_json) catch null;
     defer if (request_id) |id| alloc.free(id);
 
-    const deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(response_timeout);
+    const method = workspace_control.requestMethod(alloc, request_json) catch null;
+    const timeout = if (method == .workspace_save)
+        save_response_timeout
+    else
+        response_timeout;
+    const deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(timeout);
     while (std.Io.Timestamp.now(global.io(), .awake).nanoseconds < deadline.nanoseconds) {
         while (glib.MainContext.pending(ctx) != 0) {
             _ = glib.MainContext.iteration(ctx, 0);

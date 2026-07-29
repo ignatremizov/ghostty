@@ -68,11 +68,11 @@ fn errorResult(
 
 const LoadedWorkspaceSnapshot = struct {
     catalog: workspace_snapshot.CatalogEntry,
-    snapshot: workspace_snapshot.Snapshot,
+    opened: workspace_storage.Storage.OpenedSnapshot,
 
     fn deinit(self: *LoadedWorkspaceSnapshot, alloc: std.mem.Allocator) void {
         self.catalog.deinit(alloc);
-        self.snapshot.deinit(alloc);
+        self.opened.deinit(alloc);
     }
 };
 
@@ -354,7 +354,15 @@ pub fn updateActionStateAlloc(
 ) !DispatchResult {
     const result = try dispatchActionParameterAlloc(alloc, parameter);
     errdefer alloc.free(result.response_json);
+    try appendActionResponseStateAlloc(alloc, action, result.response_json);
+    return result;
+}
 
+fn appendActionResponseStateAlloc(
+    alloc: std.mem.Allocator,
+    action: *gio.SimpleAction,
+    response_json: []const u8,
+) !void {
     const existing_state = action.as(gio.Action).getState();
     defer if (existing_state) |state| state.unref();
 
@@ -373,10 +381,9 @@ pub fn updateActionStateAlloc(
     for (0..preserved_count) |index| {
         queue[index] = existing_responses[start_index + index];
     }
-    queue[next_len - 1] = result.response_json;
+    queue[next_len - 1] = response_json;
 
     action.setState(try encodeActionStateQueue(queue));
-    return result;
 }
 
 pub fn requestIdMatchesResponse(
@@ -396,6 +403,18 @@ pub fn requestIdMatchesResponse(
 
 pub fn envelopeIdAlloc(alloc: std.mem.Allocator, json: []const u8) !?[]u8 {
     return parseEnvelopeIdAlloc(alloc, json);
+}
+
+pub fn requestMethod(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+) !?Method {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("method") orelse return null;
+    if (value != .string) return null;
+    return Method.parse(value.string);
 }
 
 pub fn encodeSuccessResponseAlloc(
@@ -594,14 +613,31 @@ fn dispatchWorkspaceRestore(
     };
     defer loaded.deinit(alloc);
 
-    var plan = workspace_restore.planAlloc(alloc, loaded.snapshot) catch {
+    var plan = workspace_restore.planAlloc(alloc, loaded.opened.snapshot) catch {
         return errorResult(alloc, id, method, "restore_invalid", "workspace snapshot is invalid or cannot be planned for restore");
     };
     defer plan.deinit(alloc);
 
     const window = preferredWorkspaceControlWindow() orelse return errorResult(alloc, id, method, "not_ready", "no Ghostty window is available for workspace restore");
+    const fork_restore = gtk_window.workspaceControlRestoreShouldFork(
+        loaded.catalog.workspace_key orelse workspace,
+        loaded.opened.snapshot.workspace.name,
+    );
+    var association = try gtk_window.workspaceControlPrepareRestoredWorkspaceAssociationAlloc(
+        window,
+        alloc,
+        loaded.catalog,
+        fork_restore,
+    );
+    defer association.deinit(alloc);
 
-    const results = gtk_window.workspaceControlRestoreAlloc(window, alloc, loaded.snapshot, &plan) catch |err| switch (err) {
+    const results = gtk_window.workspaceControlRestoreAlloc(
+        window,
+        alloc,
+        loaded.opened.snapshot,
+        &plan,
+        &loaded.opened,
+    ) catch |err| switch (err) {
         error.TabMultiSessionUnsupported => return errorResult(alloc, id, method, "not_supported", "workspace restore does not yet support multiple sessions inside a single split-local tab"),
         error.WorkspaceSessionEnvUnsupported => return errorResult(alloc, id, method, "not_supported", "workspace restore does not yet support per-session environment overrides"),
         error.WorkspaceLayoutMissing,
@@ -618,10 +654,30 @@ fn dispatchWorkspaceRestore(
         alloc.free(results.restored_session_ids);
         if (results.selection_fallback) |selection_fallback| alloc.free(selection_fallback.reason);
     }
+    var keep_restored_workspace = false;
+    defer if (!keep_restored_workspace) {
+        gtk_window.workspaceControlRollbackRestoredWorkspace(
+            window,
+            results.restored_workspace_id,
+        );
+    };
 
     const result_json = try encodeWorkspaceRestoreResultAlloc(alloc, results);
     defer alloc.free(result_json);
-    return successResult(alloc, id, method, result_json);
+    const response = try successResult(alloc, id, method, result_json);
+
+    gtk_window.workspaceControlAssociateRestoredWorkspace(
+        window,
+        alloc,
+        results.restored_workspace_id,
+        &association,
+    ) catch {
+        alloc.free(response.response_json);
+        return errorResult(alloc, id, method, "restore_invalid", "restored workspace runtime could not be resolved");
+    };
+
+    keep_restored_workspace = true;
+    return response;
 }
 
 fn dispatchSessionFocus(
@@ -777,16 +833,6 @@ fn readWorkspaceCatalogAlloc(
     };
 }
 
-fn readWorkspaceSnapshotAlloc(
-    alloc: std.mem.Allocator,
-    filename: []const u8,
-) !workspace_snapshot.Snapshot {
-    var dir = try workspace_storage.openDefaultStorageDirAlloc(alloc) orelse return error.FileNotFound;
-    defer dir.close();
-    const storage = workspace_storage.Storage.init(alloc, dir);
-    return storage.readSnapshotAlloc(alloc, filename);
-}
-
 fn findCatalogEntryForControlTarget(
     entries: []const workspace_snapshot.CatalogEntry,
     target: []const u8,
@@ -835,17 +881,36 @@ fn loadWorkspaceSnapshotForControlAlloc(
     alloc: std.mem.Allocator,
     target: []const u8,
 ) !LoadedWorkspaceSnapshot {
-    var catalog = try readWorkspaceCatalogAlloc(alloc);
+    var dir = try workspace_storage.openDefaultStorageDirAlloc(alloc) orelse {
+        if (try workspaceExistsForControlTarget(alloc, target)) return error.NotRestorable;
+        return error.WorkspaceNotFound;
+    };
+    defer dir.close(global.io());
+    const storage = workspace_storage.Storage.init(alloc, dir);
+    var transaction = try storage.beginTransaction(.blocking);
+    defer transaction.deinit();
+
+    var catalog = storage.readCatalogAlloc(
+        alloc,
+        workspace_storage.Storage.catalog_filename,
+    ) catch |err| switch (err) {
+        error.FileNotFound => workspace_snapshot.Catalog{},
+        else => return err,
+    };
     defer catalog.deinit(alloc);
 
     const match = findCatalogEntryForControlTarget(catalog.entries, target);
     if (match) |entry| {
         const catalog_entry = try entry.cloneAlloc(alloc);
         errdefer catalog_entry.deinit(alloc);
-        const snapshot_value = try readWorkspaceSnapshotAlloc(alloc, entry.path);
+        const opened = try storage.readSnapshotWithScrollbackAllocAssumeLocked(
+            alloc,
+            entry.path,
+            gtk_window.max_saved_scrollback_replay_bytes,
+        );
         return .{
             .catalog = catalog_entry,
-            .snapshot = snapshot_value,
+            .opened = opened,
         };
     }
 
@@ -856,12 +921,202 @@ fn loadWorkspaceSnapshotForControlAlloc(
     return error.WorkspaceNotFound;
 }
 
+const AsyncWorkspaceSaveContext = struct {
+    alloc: std.mem.Allocator,
+    action: *gio.SimpleAction,
+    id: ?[]u8,
+
+    fn deinit(self: *AsyncWorkspaceSaveContext) void {
+        if (self.id) |id| self.alloc.free(id);
+        self.action.unref();
+        self.alloc.destroy(self);
+    }
+};
+
+fn appendWorkspaceSaveError(
+    alloc: std.mem.Allocator,
+    action: *gio.SimpleAction,
+    id: ?[]const u8,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const response = try encodeErrorResponseAlloc(alloc, id, code, message);
+    defer alloc.free(response);
+    try appendActionResponseStateAlloc(alloc, action, response);
+}
+
+fn asyncWorkspaceSaveCompleted(
+    _: *gtk_window.Window,
+    result_: ?gtk_window.WorkspaceSaveAsyncResult,
+    err: ?anyerror,
+    userdata: ?*anyopaque,
+) void {
+    const ctx: *AsyncWorkspaceSaveContext = @ptrCast(@alignCast(userdata orelse return));
+    defer ctx.deinit();
+
+    const response = response: {
+        if (err) |save_err| {
+            const fields: struct { code: []const u8, message: []const u8 } = switch (save_err) {
+                error.WorkspaceNotFound => .{
+                    .code = "not_found",
+                    .message = "workspace target could not be resolved",
+                },
+                error.WorkspaceSaveSuperseded => .{
+                    .code = "superseded",
+                    .message = "workspace save was superseded by a newer save",
+                },
+                error.WorkspaceSaveInProgress => .{
+                    .code = "save_in_progress",
+                    .message = "workspace already has an explicit save in progress",
+                },
+                error.WindowClosed => .{
+                    .code = "not_ready",
+                    .message = "the workspace window closed before the save completed",
+                },
+                else => .{
+                    .code = "save_failed",
+                    .message = "workspace snapshot could not be saved",
+                },
+            };
+            break :response encodeErrorResponseAlloc(
+                ctx.alloc,
+                ctx.id,
+                fields.code,
+                fields.message,
+            ) catch return;
+        }
+
+        const result = result_ orelse return;
+        const result_json = encodeWorkspaceSaveResultAlloc(ctx.alloc, .{
+            .workspace_id = result.workspace_id,
+            .snapshot_id = result.snapshot_id,
+            .saved_at = result.saved_at,
+            .path = result.path,
+        }) catch return;
+        defer ctx.alloc.free(result_json);
+        break :response encodeSuccessResponseAlloc(
+            ctx.alloc,
+            ctx.id,
+            result_json,
+        ) catch return;
+    };
+    defer ctx.alloc.free(response);
+
+    appendActionResponseStateAlloc(ctx.alloc, ctx.action, response) catch |append_err| {
+        log.warn("failed to publish asynchronous workspace save response err={}", .{append_err});
+    };
+}
+
+fn tryStartAsyncWorkspaceSave(
+    alloc: std.mem.Allocator,
+    action: *gio.SimpleAction,
+    parameter: ?*glib.Variant,
+) !bool {
+    const variant = parameter orelse return false;
+    const string_type = glib.VariantType.new("s");
+    defer string_type.free();
+    if (glib.Variant.isOfType(variant, string_type) == 0) return false;
+
+    var len: usize = undefined;
+    const request_json = variant.getString(&len)[0..len];
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, request_json, .{}) catch
+        return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const object = parsed.value.object;
+    const method_name = parseRequiredString(object, "method") catch return false;
+    if (Method.parse(method_name) != .workspace_save) return false;
+    const id = parseOptionalId(object) catch return false;
+    const params = parseRequiredObject(object, "params") catch return false;
+    const workspace = parseOptionalString(params, "workspace") catch return false;
+
+    const windows = try workspaceControlWindowsAlloc(alloc);
+    defer alloc.free(windows);
+    if (windows.len == 0) {
+        try appendWorkspaceSaveError(
+            alloc,
+            action,
+            id,
+            "not_ready",
+            "no Ghostty window is available for workspace control",
+        );
+        return true;
+    }
+
+    const resolved = resolved: {
+        for (windows) |window| {
+            if (gtk_window.resolveWorkspaceControlWorkspace(window, workspace)) |candidate| {
+                break :resolved candidate;
+            }
+        }
+
+        try appendWorkspaceSaveError(
+            alloc,
+            action,
+            id,
+            "not_found",
+            "workspace target could not be resolved",
+        );
+        return true;
+    };
+
+    const ctx = try alloc.create(AsyncWorkspaceSaveContext);
+    const owned_id = if (id) |value|
+        alloc.dupe(u8, value) catch |err| {
+            alloc.destroy(ctx);
+            return err;
+        }
+    else
+        null;
+    action.ref();
+    ctx.* = .{
+        .alloc = alloc,
+        .action = action,
+        .id = owned_id,
+    };
+
+    gtk_window.saveWorkspaceAsync(
+        resolved.window,
+        resolved.workspace_page,
+        asyncWorkspaceSaveCompleted,
+        ctx,
+    ) catch |err| {
+        ctx.deinit();
+        appendWorkspaceSaveError(
+            alloc,
+            action,
+            id,
+            if (err == error.WorkspaceNotFound)
+                "not_found"
+            else if (err == error.WorkspaceSaveInProgress)
+                "save_in_progress"
+            else
+                "save_failed",
+            if (err == error.WorkspaceNotFound)
+                "workspace target could not be resolved"
+            else if (err == error.WorkspaceSaveInProgress)
+                "workspace already has an explicit save in progress"
+            else
+                "workspace snapshot could not be saved",
+        ) catch |append_err| {
+            log.warn("failed to publish workspace save start error err={}", .{append_err});
+        };
+    };
+    return true;
+}
+
 fn handleActionActivation(
     action: *gio.SimpleAction,
     parameter: ?*glib.Variant,
     _: *gio.SimpleAction,
 ) callconv(.c) void {
     const alloc = Application.default().allocator();
+    if (tryStartAsyncWorkspaceSave(alloc, action, parameter) catch |err| failed: {
+        log.warn("failed to start asynchronous workspace save err={}", .{err});
+        break :failed false;
+    }) return;
+
     const result = updateActionStateAlloc(alloc, action, parameter) catch |err| {
         log.warn("workspace-control action dispatch failed err={}", .{err});
         return;
@@ -955,12 +1210,24 @@ fn parseOptionalWorkspaceControlCommandAlloc(
 
             for (items.items) |item| {
                 if (item != .string) return error.InvalidParamCommand;
-                try argv.append(alloc, try alloc.dupe(u8, item.string));
+                try appendOwnedWorkspaceControlArg(alloc, &argv, item.string);
             }
 
             return .{ .argv = try argv.toOwnedSlice(alloc) };
         },
         else => error.InvalidParamCommand,
+    };
+}
+
+fn appendOwnedWorkspaceControlArg(
+    alloc: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    value: []const u8,
+) !void {
+    const copy = try alloc.dupe(u8, value);
+    argv.append(alloc, copy) catch |err| {
+        alloc.free(copy);
+        return err;
     };
 }
 
@@ -1359,6 +1626,25 @@ fn expectJsonObject(json: []const u8) !void {
 fn expectJsonValue(json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.smp_allocator, json, .{});
     defer parsed.deinit();
+}
+
+fn testWorkspaceControlArgAllocation(alloc: std.mem.Allocator) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (argv.items) |item| alloc.free(item);
+        argv.deinit(alloc);
+    }
+    try appendOwnedWorkspaceControlArg(alloc, &argv, "printf");
+    try appendOwnedWorkspaceControlArg(alloc, &argv, "%s");
+    try appendOwnedWorkspaceControlArg(alloc, &argv, "workspace");
+}
+
+test "workspace control argument clones clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testWorkspaceControlArgAllocation,
+        .{},
+    );
 }
 
 test {

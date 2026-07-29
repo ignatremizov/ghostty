@@ -2,7 +2,6 @@ const std = @import("std");
 const gio = @import("gio");
 const glib = @import("glib");
 
-const internal_os = @import("../../os/main.zig");
 const workspace_control = @import("workspace_control.zig");
 const workspace_ids = @import("workspace_ids.zig");
 const workspace_snapshot = @import("workspace_snapshot.zig");
@@ -83,22 +82,19 @@ fn withStateHome(
     dir: []const u8,
     body: *const fn () anyerror!void,
 ) !void {
-    const saved = blk: {
-        const value = std.posix.getenv("XDG_STATE_HOME") orelse break :blk null;
-        break :blk try alloc.dupeZ(u8, value);
+    const saved_environ = std.testing.environ;
+    var env = try saved_environ.createMap(alloc);
+    defer env.deinit();
+    try env.put("XDG_STATE_HOME", dir);
+
+    std.testing.environ = .{
+        .block = try env.createPosixBlock(alloc, .{}),
     };
-    defer env_restore: {
-        const value = saved orelse {
-            _ = internal_os.unsetenv("XDG_STATE_HOME");
-            break :env_restore;
-        };
-        _ = internal_os.setenv("XDG_STATE_HOME", value);
-        alloc.free(value);
+    defer {
+        std.testing.environ.block.deinit(alloc);
+        std.testing.environ = saved_environ;
     }
 
-    const dir_z = try alloc.dupeZ(u8, dir);
-    defer alloc.free(dir_z);
-    _ = internal_os.setenv("XDG_STATE_HOME", dir_z);
     try body();
 }
 
@@ -150,6 +146,29 @@ test "ipc workspace control rejects unsupported methods with request id" {
     try testing.expectEqual(@as(?workspace_control.Method, null), result.metadata.method);
     try testing.expect(std.mem.indexOf(u8, result.response_json, "\"id\":\"req-3\"") != null);
     try testing.expect(std.mem.indexOf(u8, result.response_json, "\"code\":\"invalid_method\"") != null);
+}
+
+test "ipc workspace control identifies request methods for transport policy" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        workspace_control.Method.workspace_save,
+        (try workspace_control.requestMethod(
+            testing.allocator,
+            "{\"method\":\"workspace.save\",\"params\":{}}",
+        )).?,
+    );
+    try testing.expectEqual(
+        @as(?workspace_control.Method, null),
+        try workspace_control.requestMethod(
+            testing.allocator,
+            "{\"method\":\"workspace.unknown\",\"params\":{}}",
+        ),
+    );
+    try testing.expectEqual(
+        @as(?workspace_control.Method, null),
+        try workspace_control.requestMethod(testing.allocator, "{}"),
+    );
 }
 
 test "ipc workspace control validates session split params before dispatch" {
@@ -281,12 +300,12 @@ test "ipc workspace control restore validates stored snapshots before replay" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_home);
 
-    try tmp.dir.makePath("ghostty/workspaces");
-    var workspace_dir = try tmp.dir.openDir("ghostty/workspaces", .{});
-    defer workspace_dir.close();
+    try tmp.dir.createDirPath(std.testing.io, "ghostty/workspaces");
+    var workspace_dir = try tmp.dir.openDir(std.testing.io, "ghostty/workspaces", .{});
+    defer workspace_dir.close(std.testing.io);
 
     const storage = workspace_storage.Storage.init(testing.allocator, workspace_dir);
     const filename = try storage.writeCheckpoint(buildSnapshot());
@@ -311,12 +330,12 @@ test "ipc workspace control restore resolves saved snapshots by workspace name" 
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_home);
 
-    try tmp.dir.makePath("ghostty/workspaces");
-    var workspace_dir = try tmp.dir.openDir("ghostty/workspaces", .{});
-    defer workspace_dir.close();
+    try tmp.dir.createDirPath(std.testing.io, "ghostty/workspaces");
+    var workspace_dir = try tmp.dir.openDir(std.testing.io, "ghostty/workspaces", .{});
+    defer workspace_dir.close(std.testing.io);
 
     const storage = workspace_storage.Storage.init(testing.allocator, workspace_dir);
     const filename = try storage.writeCheckpoint(buildSnapshot());
@@ -388,12 +407,12 @@ test "ipc workspace control restore rejects invalid stored snapshots" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_home);
 
-    try tmp.dir.makePath("ghostty/workspaces");
-    var workspace_dir = try tmp.dir.openDir("ghostty/workspaces", .{});
-    defer workspace_dir.close();
+    try tmp.dir.createDirPath(std.testing.io, "ghostty/workspaces");
+    var workspace_dir = try tmp.dir.openDir(std.testing.io, "ghostty/workspaces", .{});
+    defer workspace_dir.close(std.testing.io);
 
     const invalid_snapshot_json =
         \\{
@@ -432,14 +451,14 @@ test "ipc workspace control restore rejects invalid stored snapshots" {
     ;
 
     {
-        const file = try workspace_dir.createFile("snapshot-1.json", .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(invalid_snapshot_json);
+        const file = try workspace_dir.createFile(std.testing.io, "snapshot-1.json", .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, invalid_snapshot_json);
     }
     {
-        const file = try workspace_dir.createFile(workspace_storage.Storage.catalog_filename, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(catalog_json);
+        const file = try workspace_dir.createFile(std.testing.io, workspace_storage.Storage.catalog_filename, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, catalog_json);
     }
 
     try withStateHome(testing.allocator, state_home, &struct {
@@ -553,16 +572,16 @@ test "workspace storage creates nested default state path on first run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const state_home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const state_home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(state_home);
 
     try withStateHome(testing.allocator, state_home, &struct {
         fn run() !void {
             var dir = try workspace_storage.createDefaultStorageDirAlloc(std.testing.allocator);
-            defer dir.close();
+            defer dir.close(std.testing.io);
 
-            const file = try dir.createFile(workspace_storage.Storage.catalog_filename, .{ .truncate = true });
-            file.close();
+            const file = try dir.createFile(std.testing.io, workspace_storage.Storage.catalog_filename, .{ .truncate = true });
+            file.close(std.testing.io);
         }
     }.run);
 }

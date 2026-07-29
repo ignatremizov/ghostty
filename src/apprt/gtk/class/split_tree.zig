@@ -686,6 +686,19 @@ pub const SplitTree = extern struct {
         return surface;
     }
 
+    /// Select a surface and make it the active surface without moving GTK
+    /// focus. This is used when restoring a background workspace.
+    pub fn selectSurfaceWithoutFocus(self: *Self, surface: *Surface) bool {
+        const handle = self.findSurfaceHandle(surface) orelse return false;
+        const tree = self.getTree() orelse return false;
+        const leaf = tree.nodes[handle.idx()].leaf;
+        if (!leaf.selectSurfaceWithoutFocus(surface)) return false;
+
+        self.private().last_focused.set(surface);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+        return true;
+    }
+
     pub fn getHasSurfaces(self: *Self) bool {
         const tree: *const SplitTabs.Tree = self.private().tree orelse &.empty;
         return !tree.isEmpty();

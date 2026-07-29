@@ -234,6 +234,18 @@ pub const SessionIdentityIndex = struct {
         return self.attachment_to_session.get(attachment_key);
     }
 
+    pub fn resolveAttachmentPath(
+        self: *SessionIdentityIndex,
+        generator: *ids.Generator,
+        attachment_key: usize,
+        path: []const u8,
+    ) !ids.SessionId {
+        const session_id = self.sessionForAttachment(attachment_key) orelse
+            try self.resolvePath(generator, path);
+        try self.bindSession(session_id, attachment_key, path);
+        return session_id;
+    }
+
     pub fn bindSession(
         self: *SessionIdentityIndex,
         session_id: ids.SessionId,
@@ -281,6 +293,25 @@ pub const SessionIdentityIndex = struct {
         var it = self.attachment_to_session.iterator();
         while (it.next()) |entry| {
             if (!containsUsize(live_attachment_keys, entry.key_ptr.*)) {
+                try stale_keys.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (stale_keys.items) |key| {
+            _ = self.attachment_to_session.remove(key);
+        }
+    }
+
+    pub fn pruneAttachmentsSet(
+        self: *SessionIdentityIndex,
+        live_attachment_keys: *const std.AutoHashMap(usize, void),
+    ) !void {
+        var stale_keys: std.ArrayList(usize) = .empty;
+        defer stale_keys.deinit(self.allocator);
+
+        var it = self.attachment_to_session.iterator();
+        while (it.next()) |entry| {
+            if (!live_attachment_keys.contains(entry.key_ptr.*)) {
                 try stale_keys.append(self.allocator, entry.key_ptr.*);
             }
         }
@@ -758,8 +789,7 @@ test "session identity index preserves session ids across attachment replacement
     const replacement = try index.resolvePath(&generator, "tab-1:root/L");
     try testing.expectEqual(first, replacement);
 
-    const moved = index.sessionForAttachment(1001).?;
-    try index.bindSession(moved, 1001, "tab-1:root/R");
+    const moved = try index.resolveAttachmentPath(&generator, 1001, "tab-1:root/R");
     try testing.expectEqual(first, moved);
 
     const new_at_old_path = try index.resolvePath(&generator, "tab-1:root/L");

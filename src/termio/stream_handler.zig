@@ -73,6 +73,10 @@ pub const StreamHandler = struct {
     /// to wake up the termio thread.
     termio_messaged: bool = false,
 
+    /// True when the latest parsed PTY output changed terminal state that
+    /// affects saved scrollback formatting.
+    scrollback_dirty: bool = false,
+
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
@@ -358,6 +362,56 @@ pub const StreamHandler = struct {
             .title_pop,
             => {},
         }
+
+        if (!self.scrollback_dirty and
+            comptime actionMayAffectSavedScrollback(action))
+        {
+            self.scrollback_dirty = true;
+        }
+    }
+
+    inline fn actionMayAffectSavedScrollback(comptime action: Stream.Action.Tag) bool {
+        return switch (action) {
+            .print,
+            .print_slice,
+            .print_repeat,
+            .linefeed,
+            .erase_display_below,
+            .erase_display_above,
+            .erase_display_complete,
+            .erase_display_scrollback,
+            .erase_display_scroll_complete,
+            .erase_line_right,
+            .erase_line_left,
+            .erase_line_complete,
+            .erase_line_right_unless_pending_wrap,
+            .delete_chars,
+            .erase_chars,
+            .insert_lines,
+            .insert_blanks,
+            .delete_lines,
+            .scroll_up,
+            .scroll_down,
+            .index,
+            .next_line,
+            .reverse_index,
+            .full_reset,
+            .decaln,
+            => true,
+
+            else => false,
+        };
+    }
+
+    fn modeMayAffectSavedScrollback(mode: terminal.Mode) bool {
+        return switch (mode) {
+            .reverse_colors,
+            .enable_mode_3,
+            .@"132_column",
+            => true,
+
+            else => false,
+        };
     }
 
     pub inline fn dcsHook(self: *StreamHandler, dcs: terminal.DCS) !void {
@@ -619,6 +673,9 @@ pub const StreamHandler = struct {
             self.terminal.cursor.default_blink != null)
         {
             return;
+        }
+        if (modeMayAffectSavedScrollback(mode)) {
+            self.scrollback_dirty = true;
         }
 
         // We first always set the raw mode on our mode state.
@@ -1140,6 +1197,7 @@ pub const StreamHandler = struct {
         while (it.next()) |req| {
             switch (req.*) {
                 .set => |set| {
+                    self.scrollback_dirty = true;
                     switch (set.target) {
                         .palette => |i| {
                             self.terminal.flags.dirty.palette = true;
@@ -1172,6 +1230,7 @@ pub const StreamHandler = struct {
 
                 .reset => |target| switch (target) {
                     .palette => |i| {
+                        self.scrollback_dirty = true;
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(i);
 
@@ -1184,6 +1243,7 @@ pub const StreamHandler = struct {
                     },
                     .dynamic => |dynamic| switch (dynamic) {
                         .foreground => {
+                            self.scrollback_dirty = true;
                             self.terminal.colors.foreground.reset();
 
                             if (self.terminal.colors.foreground.default) |c| {
@@ -1194,6 +1254,7 @@ pub const StreamHandler = struct {
                             }
                         },
                         .background => {
+                            self.scrollback_dirty = true;
                             self.terminal.colors.background.reset();
 
                             if (self.terminal.colors.background.default) |c| {
@@ -1231,6 +1292,7 @@ pub const StreamHandler = struct {
                     const mask = &self.terminal.colors.palette.mask;
                     var mask_it = mask.iterator(.{});
                     while (mask_it.next()) |i| {
+                        self.scrollback_dirty = true;
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(@intCast(i));
                         self.surfaceMessageWriter(.{
@@ -1405,13 +1467,20 @@ pub const StreamHandler = struct {
                 },
                 .set => |v| switch (v.key) {
                     .palette => |palette| {
+                        self.scrollback_dirty = true;
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.set(palette, v.color);
                     },
 
                     .special => |special| switch (special) {
-                        .foreground => self.terminal.colors.foreground.set(v.color),
-                        .background => self.terminal.colors.background.set(v.color),
+                        .foreground => {
+                            self.scrollback_dirty = true;
+                            self.terminal.colors.foreground.set(v.color);
+                        },
+                        .background => {
+                            self.scrollback_dirty = true;
+                            self.terminal.colors.background.set(v.color);
+                        },
                         .cursor => self.terminal.colors.cursor.set(v.color),
                         else => {
                             log.warn(
@@ -1424,13 +1493,20 @@ pub const StreamHandler = struct {
                 },
                 .reset => |key| switch (key) {
                     .palette => |palette| {
+                        self.scrollback_dirty = true;
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(palette);
                     },
 
                     .special => |special| switch (special) {
-                        .foreground => self.terminal.colors.foreground.reset(),
-                        .background => self.terminal.colors.background.reset(),
+                        .foreground => {
+                            self.scrollback_dirty = true;
+                            self.terminal.colors.foreground.reset();
+                        },
+                        .background => {
+                            self.scrollback_dirty = true;
+                            self.terminal.colors.background.reset();
+                        },
                         .cursor => self.terminal.colors.cursor.reset(),
                         else => {
                             log.warn(
@@ -1465,3 +1541,18 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+test "stream handler saved scrollback dirty action classification" {
+    const testing = std.testing;
+
+    try testing.expect(StreamHandler.actionMayAffectSavedScrollback(.print));
+    try testing.expect(StreamHandler.actionMayAffectSavedScrollback(.print_slice));
+    try testing.expect(StreamHandler.actionMayAffectSavedScrollback(.linefeed));
+    try testing.expect(StreamHandler.actionMayAffectSavedScrollback(.erase_display_complete));
+    try testing.expect(!StreamHandler.actionMayAffectSavedScrollback(.bell));
+    try testing.expect(!StreamHandler.actionMayAffectSavedScrollback(.device_status));
+    try testing.expect(!StreamHandler.actionMayAffectSavedScrollback(.window_title));
+    try testing.expect(StreamHandler.modeMayAffectSavedScrollback(.reverse_colors));
+    try testing.expect(StreamHandler.modeMayAffectSavedScrollback(.@"132_column"));
+    try testing.expect(!StreamHandler.modeMayAffectSavedScrollback(.mouse_event_any));
+}
