@@ -818,6 +818,8 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.nextSlice(buf);
     }
 
+    self.terminal_stream.handler.flushSynchronizedOutputWatchdog();
+
     if (self.terminal_stream.handler.scrollback_dirty) {
         self.terminal_stream.handler.scrollback_dirty = false;
         _ = self.surface_mailbox.surface.markScrollbackChanged();

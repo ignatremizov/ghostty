@@ -306,11 +306,13 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
+    var sync_watchdog_requested: bool = false;
     while (mailbox.pop(global.io())) |message| {
-        // If we have a message we always redraw
-        redraw = true;
-
-        log.debug("mailbox message={s}", .{@tagName(message)});
+        const needs_redraw = messageNeedsRedraw(message);
+        redraw = redraw or needs_redraw;
+        if (messageNeedsDebugLog(message)) {
+            log.debug("mailbox message={s}", .{@tagName(message)});
+        }
         switch (message) {
             .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
             .visibility_report => |v| try io.visibilityReport(
@@ -336,7 +338,7 @@ fn drainMailbox(
                 }
             },
             .jump_to_prompt => |v| try io.jumpToPrompt(v),
-            .start_synchronized_output => self.startSynchronizedOutput(cb),
+            .start_synchronized_output => sync_watchdog_requested = true,
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),
             .write_small => |v| try io.queueWrite(
@@ -360,11 +362,38 @@ fn drainMailbox(
         }
     }
 
+    if (sync_watchdog_requested) self.startSynchronizedOutput(cb);
+
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
         try io.renderer_wakeup.notify();
     }
+}
+
+fn messageNeedsRedraw(message: termio.Message) bool {
+    return switch (message) {
+        // These messages only write to the PTY, update writer-thread state,
+        // or maintain a watchdog. Any resulting terminal output wakes the
+        // renderer through the normal PTY read path.
+        .color_scheme_report,
+        .visibility_report,
+        .size_report,
+        .start_synchronized_output,
+        .linefeed_mode,
+        .write_small,
+        .write_stable,
+        .write_alloc,
+        => false,
+        else => true,
+    };
+}
+
+fn messageNeedsDebugLog(message: termio.Message) bool {
+    return switch (message) {
+        .start_synchronized_output => false,
+        else => true,
+    };
 }
 
 fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
@@ -534,4 +563,22 @@ fn selectionScrollCallback(
     );
 
     return .disarm;
+}
+
+test "synchronized output watchdog messages do not request redraws" {
+    try std.testing.expect(!messageNeedsRedraw(.{
+        .start_synchronized_output = {},
+    }));
+    try std.testing.expect(!messageNeedsRedraw(.{
+        .linefeed_mode = true,
+    }));
+    try std.testing.expect(!messageNeedsRedraw(.{
+        .size_report = .mode_2048,
+    }));
+    try std.testing.expect(messageNeedsRedraw(.{
+        .clear_screen = .{ .history = false },
+    }));
+    try std.testing.expect(!messageNeedsDebugLog(.{
+        .start_synchronized_output = {},
+    }));
 }

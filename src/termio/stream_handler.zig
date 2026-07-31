@@ -77,6 +77,9 @@ pub const StreamHandler = struct {
     /// affects saved scrollback formatting.
     scrollback_dirty: bool = false,
 
+    /// Coalesces synchronized-output watchdog requests within one PTY read.
+    synchronized_output_watchdog_requested: bool = false,
+
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
@@ -102,6 +105,12 @@ pub const StreamHandler = struct {
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
         try self.renderer_wakeup.notify();
+    }
+
+    pub inline fn flushSynchronizedOutputWatchdog(self: *StreamHandler) void {
+        if (!self.synchronized_output_watchdog_requested) return;
+        self.synchronized_output_watchdog_requested = false;
+        self.messageWriter(.{ .start_synchronized_output = {} });
     }
 
     /// Change the configuration for this handler.
@@ -750,7 +759,9 @@ pub const StreamHandler = struct {
             // We need to start a timer to prevent the emulator being hung
             // forever.
             .synchronized_output => {
-                if (enabled) self.messageWriter(.{ .start_synchronized_output = {} });
+                if (enabled) {
+                    self.synchronized_output_watchdog_requested = true;
+                }
             },
 
             .linefeed => {
