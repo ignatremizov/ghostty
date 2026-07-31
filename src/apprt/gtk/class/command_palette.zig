@@ -88,6 +88,10 @@ pub const CommandPalette = extern struct {
         /// The window this palette is currently operating on.
         window: WeakRef(Window) = .empty,
 
+        /// Workspace to close after a successful restore initiated from its
+        /// context menu. Null keeps command-palette restore additive.
+        restore_close_target: WeakRef(WorkspacePage) = .empty,
+
         pub var offset: c_int = 0;
     };
 
@@ -131,6 +135,7 @@ pub const CommandPalette = extern struct {
             config.unref();
             priv.config = null;
         }
+        priv.restore_close_target.set(null);
 
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
@@ -635,6 +640,7 @@ pub const CommandPalette = extern struct {
     }
 
     fn dialogClosed(_: *adw.Dialog, self: *CommandPalette) callconv(.c) void {
+        self.private().restore_close_target.set(null);
         self.unref();
     }
 
@@ -678,8 +684,30 @@ pub const CommandPalette = extern struct {
     }
 
     pub fn presentQuery(self: *CommandPalette, window: *Window, query: []const u8) void {
+        self.presentQueryWithCloseTarget(window, query, null);
+    }
+
+    pub fn presentRestoreQuery(
+        self: *CommandPalette,
+        window: *Window,
+        close_after_restore: ?*WorkspacePage,
+    ) void {
+        self.presentQueryWithCloseTarget(
+            window,
+            "Restore Workspace",
+            close_after_restore,
+        );
+    }
+
+    fn presentQueryWithCloseTarget(
+        self: *CommandPalette,
+        window: *Window,
+        query: []const u8,
+        close_after_restore: ?*WorkspacePage,
+    ) void {
         const priv = self.private();
         priv.window.set(window);
+        priv.restore_close_target.set(close_after_restore);
 
         self.rebuildCommands();
         const alloc = Application.default().allocator();
@@ -695,6 +723,8 @@ pub const CommandPalette = extern struct {
     /// performed.
     fn activated(self: *CommandPalette, pos: c_uint) void {
         const priv = self.private();
+        const restore_close_target = priv.restore_close_target.get();
+        defer if (restore_close_target) |workspace_page| workspace_page.unref();
 
         // Use priv.model and not priv.source here to use the list of *visible* results
         const object_ = priv.model.as(gio.ListModel).getObject(pos);
@@ -721,7 +751,10 @@ pub const CommandPalette = extern struct {
             defer window.unref();
 
             const workspace_target = cmd.getRestoreTarget() orelse return;
-            window.restoreSavedWorkspace(workspace_target);
+            window.restoreSavedWorkspaceThenClose(
+                workspace_target,
+                restore_close_target,
+            );
             return;
         }
 

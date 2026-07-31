@@ -54,6 +54,36 @@ const log = std.log.scoped(.gtk_ghostty_application);
 
 extern "c" fn setenv(name: ?[*]const u8, value: ?[*]const u8, overwrite: c_int) c_int;
 
+const QuitReason = enum {
+    timer_expired,
+    no_app_windows,
+};
+
+const QuitState = struct {
+    enabled: bool,
+    timer_expired: bool,
+    requested_window: bool,
+    has_windows: bool,
+    delay_configured: bool,
+};
+
+fn quitReason(state: QuitState) ?QuitReason {
+    if (!state.enabled) return null;
+
+    // The timer is driven by initialized core surfaces, which can briefly
+    // reach zero while a GTK window is realizing replacement surfaces.
+    if (state.timer_expired and !state.has_windows) return .timer_expired;
+
+    if (!state.delay_configured and
+        state.requested_window and
+        !state.has_windows)
+    {
+        return .no_app_windows;
+    }
+
+    return null;
+}
+
 /// Function used to funnel GLib/GObject/GTK log messages into Zig's logging
 /// system rather than just getting dumped directly to stderr.
 fn glibLogWriterFunction(
@@ -571,32 +601,22 @@ pub const Application = extern struct {
             try priv.core_app.tick(priv.rt_app);
 
             // Check if we must quit based on the current state.
-            const must_quit = q: {
-                // If we are configured to always stay running, don't quit.
-                const config = priv.config.get();
-                if (!config.@"quit-after-last-window-closed") break :q false;
-
-                // If the quit timer has expired, quit.
-                if (priv.quit_timer == .expired) {
-                    log.debug("must_quit due to quit timer expired", .{});
-                    break :q true;
-                }
-
-                // If we have no windows attached to our app, also quit.
-                // We only do this if we don't have the closed delay set,
-                // because with the closed delay set we'll exit eventually.
-                if (config.@"quit-after-last-window-closed-delay" == null) {
-                    if (priv.requested_window and @as(
-                        ?*glib.List,
-                        self.as(gtk.Application).getWindows(),
-                    ) == null) {
-                        log.debug("must_quit due to no app windows", .{});
-                        break :q true;
-                    }
-                }
-
-                // No quit conditions met
-                break :q false;
+            const config = priv.config.get();
+            const has_windows = @as(
+                ?*glib.List,
+                self.as(gtk.Application).getWindows(),
+            ) != null;
+            const reason = quitReason(.{
+                .enabled = config.@"quit-after-last-window-closed",
+                .timer_expired = priv.quit_timer == .expired,
+                .requested_window = priv.requested_window,
+                .has_windows = has_windows,
+                .delay_configured = config.@"quit-after-last-window-closed-delay" != null,
+            });
+            const must_quit = reason != null;
+            if (reason) |value| switch (value) {
+                .timer_expired => log.debug("must_quit due to quit timer expired", .{}),
+                .no_app_windows => log.debug("must_quit due to no app windows", .{}),
             };
 
             if (must_quit) {
@@ -3059,4 +3079,39 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+test "expired surface quit timer waits for the last GTK window" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        null,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = true,
+            .requested_window = true,
+            .has_windows = true,
+            .delay_configured = false,
+        }),
+    );
+    try testing.expectEqual(
+        QuitReason.timer_expired,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = true,
+            .requested_window = true,
+            .has_windows = false,
+            .delay_configured = false,
+        }),
+    );
+    try testing.expectEqual(
+        QuitReason.no_app_windows,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = false,
+            .requested_window = true,
+            .has_windows = false,
+            .delay_configured = false,
+        }),
+    );
 }

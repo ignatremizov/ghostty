@@ -19,6 +19,7 @@ const log = std.log.scoped(.gtk_workspace_sidebar);
 const WorkspaceContextAction = enum {
     rename,
     save,
+    restore,
     delete_saved,
     open_file,
     reveal,
@@ -96,6 +97,12 @@ pub const WorkspaceSidebar = extern struct {
             pub const name = "restore-workspace";
             pub const connect = impl.connect;
             const impl = gobject.ext.defineSignal(name, Self, &.{}, void);
+        };
+
+        pub const @"restore-workspace-and-close" = struct {
+            pub const name = "restore-workspace-and-close";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(name, Self, &.{*WorkspacePage}, void);
         };
     };
 
@@ -360,6 +367,7 @@ pub const WorkspaceSidebar = extern struct {
         const descriptors = [_]WorkspaceContextActionDescriptor{
             .{ .label = i18n._("Change Workspace Title…"), .action = .rename },
             .{ .label = i18n._("Save Workspace"), .action = .save },
+            .{ .label = i18n._("Restore Workspace Here…"), .action = .restore },
             .{ .label = i18n._("Reveal Snapshot"), .action = .reveal },
             .{ .label = i18n._("Open Snapshot File…"), .action = .open_file },
             .{ .label = i18n._("Delete Saved Workspace"), .action = .delete_saved, .destructive = true },
@@ -543,6 +551,7 @@ pub const WorkspaceSidebar = extern struct {
         switch (ctx.action) {
             .rename => signals.@"prompt-workspace-title".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .save => signals.@"save-workspace".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
+            .restore => signals.@"restore-workspace-and-close".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .delete_saved => signals.@"delete-workspace".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .open_file => signals.@"open-workspace-snapshot".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
             .reveal => signals.@"reveal-workspace-snapshot".impl.emit(ctx.sidebar, null, .{ctx.workspace_page}, null),
@@ -656,6 +665,7 @@ pub const WorkspaceSidebar = extern struct {
             signals.@"open-workspace-snapshot".impl.register(.{});
             signals.@"close-workspace".impl.register(.{});
             signals.@"restore-workspace".impl.register(.{});
+            signals.@"restore-workspace-and-close".impl.register(.{});
 
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
         }
@@ -730,4 +740,51 @@ test "workspace sidebar dispose cancels pending deferred actions" {
 
     try testing.expectEqual(@as(usize, 0), delete_count);
     try testing.expectEqual(@as(usize, 0), restore_count);
+}
+
+test "workspace row restore emits close-after-restore target" {
+    const testing = std.testing;
+
+    if (gtk.initCheck() == 0) return error.SkipZigTest;
+
+    gobject.ext.ensureType(WorkspaceSidebar);
+    gobject.ext.ensureType(WorkspacePage);
+
+    const sidebar = gobject.ext.newInstance(WorkspaceSidebar, .{});
+    _ = sidebar.refSink();
+    defer sidebar.unref();
+
+    const workspace_page = gobject.ext.newInstance(WorkspacePage, .{});
+    _ = workspace_page.refSink();
+    defer workspace_page.unref();
+
+    var capture: struct {
+        restored_page: ?*WorkspacePage = null,
+    } = .{};
+    _ = WorkspaceSidebar.signals.@"restore-workspace-and-close".connect(
+        sidebar,
+        @TypeOf(&capture),
+        struct {
+            fn handler(
+                _: *WorkspaceSidebar,
+                close_after_restore: *WorkspacePage,
+                result: @TypeOf(&capture),
+            ) callconv(.c) void {
+                result.restored_page = close_after_restore;
+            }
+        }.handler,
+        &capture,
+        .{},
+    );
+
+    const priv = sidebar.private();
+    priv.pending_context_workspace_page = workspace_page.ref();
+    priv.pending_context_workspace_action = .restore;
+    WorkspaceSidebar.workspaceRowContextMenuClosed(undefined, sidebar);
+
+    while (priv.pending_context_action_source != null) {
+        _ = glib.MainContext.iteration(null, 1);
+    }
+
+    try testing.expectEqual(workspace_page, capture.restored_page.?);
 }

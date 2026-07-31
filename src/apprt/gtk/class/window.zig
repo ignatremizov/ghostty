@@ -610,6 +610,13 @@ pub const Window = extern struct {
             self,
             .{},
         );
+        _ = WorkspaceSidebar.signals.@"restore-workspace-and-close".connect(
+            priv.workspace_sidebar,
+            *Self,
+            workspaceSidebarRestoreWorkspaceAndClose,
+            self,
+            .{},
+        );
         self.syncWorkspaceSidebarSelection();
         self.refreshWorkspaceRegistry() catch |err| {
             log.warn("failed to build initial workspace registry error={}", .{err});
@@ -1134,8 +1141,15 @@ pub const Window = extern struct {
     }
 
     fn workspaceSidebarRestoreWorkspace(_: *WorkspaceSidebar, self: *Self) callconv(.c) void {
-        _ = self.ref();
-        _ = glib.idleAdd(idleShowRestoreWorkspaceCommands, self);
+        queueRestoreWorkspaceCommands(self, null);
+    }
+
+    fn workspaceSidebarRestoreWorkspaceAndClose(
+        _: *WorkspaceSidebar,
+        workspace_page: *WorkspacePage,
+        self: *Self,
+    ) callconv(.c) void {
+        queueRestoreWorkspaceCommands(self, workspace_page);
     }
 
     fn syncWorkspaceSidebarSelection(self: *Self) void {
@@ -4104,11 +4118,42 @@ pub const Window = extern struct {
     }
 
     fn idleShowRestoreWorkspaceCommands(ud: ?*anyopaque) callconv(.c) c_int {
-        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
-        defer self.unref();
-        self.showRestoreWorkspaceCommands();
+        const ctx: *RestoreWorkspaceContext = @ptrCast(@alignCast(ud orelse return 0));
+        defer ctx.deinit();
+        ctx.window.showRestoreWorkspaceCommands(ctx.close_after_restore);
         return 0;
     }
+
+    fn queueRestoreWorkspaceCommands(
+        self: *Self,
+        close_after_restore: ?*WorkspacePage,
+    ) void {
+        const ctx = RestoreWorkspaceContext.new(self, close_after_restore);
+        if (glib.idleAdd(idleShowRestoreWorkspaceCommands, ctx) == 0) {
+            ctx.deinit();
+            log.warn("failed to schedule workspace restore picker", .{});
+        }
+    }
+
+    const RestoreWorkspaceContext = struct {
+        window: *Self,
+        close_after_restore: ?*WorkspacePage,
+
+        fn new(window: *Self, close_after_restore: ?*WorkspacePage) *RestoreWorkspaceContext {
+            const ctx = std.heap.c_allocator.create(RestoreWorkspaceContext) catch @panic("oom");
+            ctx.* = .{
+                .window = window.ref(),
+                .close_after_restore = if (close_after_restore) |page| page.ref() else null,
+            };
+            return ctx;
+        }
+
+        fn deinit(self: *RestoreWorkspaceContext) void {
+            if (self.close_after_restore) |workspace_page| workspace_page.unref();
+            self.window.unref();
+            std.heap.c_allocator.destroy(self);
+        }
+    };
 
     fn promptContextWorkspaceTitle(self: *Self) void {
         const workspace_page = self.getContextMenuWorkspacePage() orelse return;
@@ -4425,7 +4470,10 @@ pub const Window = extern struct {
         return true;
     }
 
-    pub fn showRestoreWorkspaceCommands(self: *Window) void {
+    pub fn showRestoreWorkspaceCommands(
+        self: *Window,
+        close_after_restore: ?*WorkspacePage,
+    ) void {
         const alloc = Application.default().allocator();
         var catalog = workspace_storage.readDefaultCatalogAlloc(alloc) catch |err| {
             log.warn("failed to read restore workspace catalog error={}", .{err});
@@ -4441,10 +4489,18 @@ pub const Window = extern struct {
 
         const command_palette = self.getOrCreateCommandPalette();
         defer command_palette.unref();
-        command_palette.presentQuery(self, "Restore Workspace");
+        command_palette.presentRestoreQuery(self, close_after_restore);
     }
 
     pub fn restoreSavedWorkspace(self: *Window, target: []const u8) void {
+        self.restoreSavedWorkspaceThenClose(target, null);
+    }
+
+    pub fn restoreSavedWorkspaceThenClose(
+        self: *Window,
+        target: []const u8,
+        close_after_restore: ?*WorkspacePage,
+    ) void {
         self.refreshWorkspaceRegistrySafe();
         const alloc = Application.default().allocator();
         var dir = workspace_storage.openDefaultStorageDirAlloc(alloc) catch |err| {
@@ -4580,6 +4636,15 @@ pub const Window = extern struct {
             self.private().tab_view.getPage(restored_workspace_page.as(gtk.Widget)),
         );
         self.focusWorkspaceSelection(restored_workspace_page);
+        if (close_after_restore) |workspace_page| {
+            const target_window = ext.getAncestor(
+                Self,
+                workspace_page.as(gtk.Widget),
+            );
+            if (target_window == self and workspace_page != restored_workspace_page) {
+                self.closeWorkspacePage(workspace_page);
+            }
+        }
 
         self.as(gtk.Window).present();
         self.addToast(i18n._("Workspace restored"));
