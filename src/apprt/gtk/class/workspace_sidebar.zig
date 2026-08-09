@@ -365,7 +365,7 @@ pub const WorkspaceSidebar = extern struct {
         if (priv.context_menu_popover != null) return;
         const content = gtk.Box.new(.vertical, 0);
         const descriptors = [_]WorkspaceContextActionDescriptor{
-            .{ .label = i18n._("Change Workspace Title…"), .action = .rename },
+            .{ .label = i18n._("Rename Workspace…"), .action = .rename },
             .{ .label = i18n._("Save Workspace"), .action = .save },
             .{ .label = i18n._("Restore Workspace Here…"), .action = .restore },
             .{ .label = i18n._("Reveal Snapshot"), .action = .reveal },
