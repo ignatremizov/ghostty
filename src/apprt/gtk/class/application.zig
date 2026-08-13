@@ -38,17 +38,51 @@ const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
+const SplitTabs = @import("split_tabs.zig").SplitTabs;
 const SplitTree = @import("split_tree.zig").SplitTree;
-const Window = @import("window.zig").Window;
 const Tab = @import("tab.zig").Tab;
+const Window = @import("window.zig").Window;
+const WorkspacePage = @import("workspace_page.zig").WorkspacePage;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
+const workspace_control = @import("../workspace_control.zig");
+const workspace_ids = @import("../workspace_ids.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
 extern "c" fn setenv(name: ?[*]const u8, value: ?[*]const u8, overwrite: c_int) c_int;
+
+const QuitReason = enum {
+    timer_expired,
+    no_app_windows,
+};
+
+const QuitState = struct {
+    enabled: bool,
+    timer_expired: bool,
+    requested_window: bool,
+    has_windows: bool,
+    delay_configured: bool,
+};
+
+fn quitReason(state: QuitState) ?QuitReason {
+    if (!state.enabled) return null;
+
+    // The timer is driven by initialized core surfaces, which can briefly
+    // reach zero while a GTK window is realizing replacement surfaces.
+    if (state.timer_expired and !state.has_windows) return .timer_expired;
+
+    if (!state.delay_configured and
+        state.requested_window and
+        !state.has_windows)
+    {
+        return .no_app_windows;
+    }
+
+    return null;
+}
 
 /// Function used to funnel GLib/GObject/GTK log messages into Zig's logging
 /// system rather than just getting dumped directly to stderr.
@@ -182,6 +216,10 @@ pub const Application = extern struct {
 
         /// The global shortcut logic.
         global_shortcuts: *GlobalShortcuts,
+
+        /// Global runtime id generator shared by every GTK window. Workspace
+        /// control needs these ids to remain unique across the whole app.
+        runtime_ids: workspace_ids.Generator = .{},
 
         /// This is set to true so long as we request a window exactly
         /// once. This prevents quitting the app before we've shown one
@@ -472,6 +510,10 @@ pub const Application = extern struct {
         return self.private().core_app.alloc;
     }
 
+    pub fn runtimeIds(self: *Self) *workspace_ids.Generator {
+        return &self.private().runtime_ids;
+    }
+
     /// Get the original language that Ghostty was launched with. This returns a
     /// pointer to internal memory so it must be copied by callers.
     pub fn savedLanguage(self: *Self) ?[:0]const u8 {
@@ -559,32 +601,22 @@ pub const Application = extern struct {
             try priv.core_app.tick(priv.rt_app);
 
             // Check if we must quit based on the current state.
-            const must_quit = q: {
-                // If we are configured to always stay running, don't quit.
-                const config = priv.config.get();
-                if (!config.@"quit-after-last-window-closed") break :q false;
-
-                // If the quit timer has expired, quit.
-                if (priv.quit_timer == .expired) {
-                    log.debug("must_quit due to quit timer expired", .{});
-                    break :q true;
-                }
-
-                // If we have no windows attached to our app, also quit.
-                // We only do this if we don't have the closed delay set,
-                // because with the closed delay set we'll exit eventually.
-                if (config.@"quit-after-last-window-closed-delay" == null) {
-                    if (priv.requested_window and @as(
-                        ?*glib.List,
-                        self.as(gtk.Application).getWindows(),
-                    ) == null) {
-                        log.debug("must_quit due to no app windows", .{});
-                        break :q true;
-                    }
-                }
-
-                // No quit conditions met
-                break :q false;
+            const config = priv.config.get();
+            const has_windows = @as(
+                ?*glib.List,
+                self.as(gtk.Application).getWindows(),
+            ) != null;
+            const reason = quitReason(.{
+                .enabled = config.@"quit-after-last-window-closed",
+                .timer_expired = priv.quit_timer == .expired,
+                .requested_window = priv.requested_window,
+                .has_windows = has_windows,
+                .delay_configured = config.@"quit-after-last-window-closed-delay" != null,
+            });
+            const must_quit = reason != null;
+            if (reason) |value| switch (value) {
+                .timer_expired => log.debug("must_quit due to quit timer expired", .{}),
+                .no_app_windows => log.debug("must_quit due to no app windows", .{}),
             };
 
             if (must_quit) {
@@ -644,6 +676,10 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // Stop the runloop first so teardown can't get stuck waiting for a
+        // later state transition after window destruction has already begun.
+        self.private().running = false;
+
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -662,13 +698,12 @@ pub const Application = extern struct {
                 // tries to free on its own. I think this is probably a bug in
                 // the fcitx ime widget but still, we don't want a double free!
                 if (gobject.ext.isA(window, Window)) {
+                    const ghostty_window = gobject.ext.cast(Window, window).?;
+                    ghostty_window.autosaveAllWorkspacesOnShutdown();
                     window.destroy();
                 }
             }
         }.callback, null);
-
-        // Trigger our runloop exit.
-        self.private().running = false;
     }
 
     /// apprt API to perform an action.
@@ -1024,10 +1059,6 @@ pub const Application = extern struct {
             \\  );
             \\}
             \\
-            \\/*
-            \\ * Splits
-            \\ */
-            \\
             \\.window .split paned > separator {
             \\  background-color: color-mix(
             \\    in srgb,
@@ -1170,7 +1201,7 @@ pub const Application = extern struct {
         self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
         self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
         self.syncActionAccelerator("win.close-tab::this", .{ .close_tab = .this });
-        self.syncActionAccelerator("tab.close::this", .{ .close_tab = .this });
+        self.syncActionAccelerator("workspace.close::this", .{ .close_tab = .this });
         self.syncActionAccelerator("win.split-right", .{ .new_split = .right });
         self.syncActionAccelerator("win.split-down", .{ .new_split = .down });
         self.syncActionAccelerator("win.split-left", .{ .new_split = .left });
@@ -1446,6 +1477,7 @@ pub const Application = extern struct {
         };
 
         ext.actions.add(Self, self, &actions);
+        workspace_control.registerAction(self.as(gio.ActionMap));
     }
 
     /// Setup our global shortcuts.
@@ -1973,10 +2005,9 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                return surface.as(gtk.Widget).activateAction(
-                    "tab.close",
-                    glib.ext.VariantType.stringFor([:0]const u8),
-                    @as([*:0]const u8, @tagName(value)),
+                return surface.as(gtk.Widget).activateActionVariant(
+                    "workspace.close",
+                    glib.Variant.newString(@tagName(value)),
                 ) != 0;
             },
         }
@@ -2106,15 +2137,15 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
+                const split_tabs = ext.getAncestor(
+                    SplitTabs,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    log.warn("surface is not in split-local tabs, ignoring goto_tab", .{});
                     return false;
                 };
 
-                return window.selectTab(switch (tab) {
+                return split_tabs.selectTab(switch (tab) {
                     .previous => .previous,
                     .next => .next,
                     .last => .last,
@@ -2247,15 +2278,15 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
+                const split_tabs = ext.getAncestor(
+                    SplitTabs,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    log.warn("surface is not in split-local tabs, ignoring move_tab", .{});
                     return false;
                 };
 
-                return window.moveTab(
+                return split_tabs.moveSurface(
                     surface,
                     @intCast(value.amount),
                 );
@@ -2516,10 +2547,10 @@ const Action = struct {
                             Tab,
                             surface.as(gtk.Widget),
                         ) orelse {
-                            log.warn("surface is not in a tab, ignoring prompt_tab_title", .{});
+                            log.warn("surface is not in a split-local tab, ignoring prompt_tab_title", .{});
                             return false;
                         };
-                        tab.promptTabTitle();
+                        tab.promptTitle();
                         return true;
                     },
                 }
@@ -2571,7 +2602,7 @@ const Action = struct {
     pub fn render(target: apprt.Target) void {
         switch (target) {
             .app => {},
-            .surface => |v| v.rt_surface.surface.redraw(),
+            .surface => |v| v.rt_surface.surface.queueRender(),
         }
     }
 
@@ -2686,7 +2717,7 @@ const Action = struct {
                     Tab,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a tab, ignoring set_tab_title", .{});
+                    log.warn("surface is not in a split-local tab, ignoring set_tab_title", .{});
                     return false;
                 };
                 tab.setTitleOverride(if (value.title.len == 0) null else value.title);
@@ -2836,7 +2867,7 @@ const Action = struct {
                     Window,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    log.warn("surface is not in a window, ignoring toggle_workspace_sidebar", .{});
                     return false;
                 };
 
@@ -3048,4 +3079,39 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+test "expired surface quit timer waits for the last GTK window" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        null,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = true,
+            .requested_window = true,
+            .has_windows = true,
+            .delay_configured = false,
+        }),
+    );
+    try testing.expectEqual(
+        QuitReason.timer_expired,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = true,
+            .requested_window = true,
+            .has_windows = false,
+            .delay_configured = false,
+        }),
+    );
+    try testing.expectEqual(
+        QuitReason.no_app_windows,
+        quitReason(.{
+            .enabled = true,
+            .timer_expired = false,
+            .requested_window = true,
+            .has_windows = false,
+            .delay_configured = false,
+        }),
+    );
 }

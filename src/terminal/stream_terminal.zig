@@ -9,8 +9,8 @@ const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
 const stream = @import("stream.zig");
 const Action = stream.Action;
-const Screen = @import("Screen.zig");
 const color = @import("color.zig");
+const Screen = @import("Screen.zig");
 const modes = @import("modes.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
@@ -63,6 +63,15 @@ pub const Handler = struct {
 
     /// The DCS command handler maintains state for DCS queries.
     dcs_handler: dcs.Handler = .{},
+
+    /// True when replay may process resource-heavy protocols such as APC
+    /// kitty graphics/glyph commands. Saved scrollback restore disables this
+    /// so a sidecar can only rebuild terminal text/color state.
+    allow_resource_protocols: bool = true,
+
+    /// Restrict processing to the VT action subset emitted by the saved
+    /// scrollback formatter.
+    saved_scrollback_replay: bool = false,
 
     pub const Effects = struct {
         /// Called when the terminal needs to write data back to the pty,
@@ -199,10 +208,55 @@ pub const Handler = struct {
         comptime action: Action.Tag,
         value: Action.Value(action),
     ) void {
+        if (self.saved_scrollback_replay and
+            !actionAllowedForSavedScrollback(action, value))
+        {
+            return;
+        }
         self.vtFallible(action, value) catch |err| {
             self.semantic_failure = true;
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
+    }
+
+    inline fn actionAllowedForSavedScrollback(
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) bool {
+        return switch (action) {
+            .print,
+            .print_slice,
+            .carriage_return,
+            .linefeed,
+            .set_attribute,
+            => true,
+
+            .color_operation => colorOperationAllowedForSavedScrollback(value),
+
+            else => false,
+        };
+    }
+
+    fn colorOperationAllowedForSavedScrollback(
+        value: Action.Value(.color_operation),
+    ) bool {
+        switch (value.op) {
+            .osc_10, .osc_11 => {},
+            else => return false,
+        }
+
+        var requests = value.requests.constIterator(0);
+        while (requests.next()) |request| switch (request.*) {
+            .set => |set| switch (set.target) {
+                .dynamic => |target| switch (target) {
+                    .foreground, .background => {},
+                    else => return false,
+                },
+                else => return false,
+            },
+            else => return false,
+        };
+        return value.requests.count() > 0;
     }
 
     inline fn vtFallible(
@@ -317,10 +371,10 @@ pub const Handler = struct {
             },
 
             // APC
-            .apc_start => self.apc_handler.start(),
-            .apc_put => self.apc_handler.feed(self.terminal.gpa(), value),
-            .apc_put_slice => self.apc_handler.feedSlice(self.terminal.gpa(), value.bytes),
-            .apc_end => self.apcEnd(),
+            .apc_start => if (self.allow_resource_protocols) self.apc_handler.start(),
+            .apc_put => if (self.allow_resource_protocols) self.apc_handler.feed(self.terminal.gpa(), value),
+            .apc_put_slice => if (self.allow_resource_protocols) self.apc_handler.feedSlice(self.terminal.gpa(), value.bytes),
+            .apc_end => if (self.allow_resource_protocols) self.apcEnd(),
 
             // Effect-based handlers
             .bell => self.bell(),
@@ -1530,6 +1584,119 @@ test "full reset" {
     try testing.expectEqual(@as(usize, 23), t.scrolling_region.bottom);
     try testing.expect(t.modes.get(.wraparound));
     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+}
+
+test "resource protocol APC can be disabled" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .{
+        .terminal = &t,
+        .allow_resource_protocols = false,
+    });
+    defer s.deinit();
+
+    s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+    try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+}
+
+test "saved scrollback replay only applies formatter actions" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .{
+        .terminal = &t,
+        .allow_resource_protocols = false,
+        .saved_scrollback_replay = true,
+    });
+    defer s.deinit();
+
+    const palette_before = t.colors.palette.current[1];
+    const cursor_before = t.colors.cursor.get();
+    s.nextSlice(
+        "saved text" ++
+            "\x1B[65535b" ++
+            "\x1B[?1049h" ++
+            "\x1B[5;20r" ++
+            "\x1B]2;spoofed title\x1B\\" ++
+            "\x1B]7;file:///tmp/spoofed\x1B\\" ++
+            "\x1B]4;1;rgb:ff/00/00\x1B\\" ++
+            "\x1B]12;rgb:00/ff/00\x1B\\" ++
+            "\x1B]10;rgb:12/34/56\x1B\\" ++
+            "\x1B]11;rgb:65/43/21\x1B\\",
+    );
+
+    try testing.expectEqual(.primary, t.screens.active_key);
+    try testing.expectEqual(@as(usize, 0), t.scrolling_region.top);
+    try testing.expectEqual(@as(usize, 23), t.scrolling_region.bottom);
+    try testing.expect(t.getTitle() == null);
+    try testing.expect(t.getPwd() == null);
+    try testing.expectEqual(palette_before, t.colors.palette.current[1]);
+    try testing.expectEqual(cursor_before, t.colors.cursor.get());
+    try testing.expectEqual(
+        color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        t.colors.foreground.get().?,
+    );
+    try testing.expectEqual(
+        color.RGB{ .r = 0x65, .g = 0x43, .b = 0x21 },
+        t.colors.background.get().?,
+    );
+
+    const text = try t.plainString(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("saved text", text);
+}
+
+test "saved scrollback parser state can be discarded before trusted input" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    {
+        var replay: Stream = .initAlloc(testing.allocator, .{
+            .terminal = &t,
+            .allow_resource_protocols = false,
+            .saved_scrollback_replay = true,
+        });
+        defer replay.deinit();
+        replay.nextSlice("\x1B]2;unterminated");
+    }
+
+    {
+        var trusted: Stream = .initAlloc(testing.allocator, .init(&t));
+        defer trusted.deinit();
+        trusted.nextSlice("trusted text");
+    }
+
+    try testing.expect(t.getTitle() == null);
+    const text = try t.plainString(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("trusted text", text);
+}
+
+test "saved scrollback previous character is cleared before trusted input" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    {
+        var replay: Stream = .initAlloc(testing.allocator, .{
+            .terminal = &t,
+            .allow_resource_protocols = false,
+            .saved_scrollback_replay = true,
+        });
+        defer replay.deinit();
+        replay.nextSlice("A");
+    }
+
+    t.clearPreviousChar();
+    {
+        var trusted: Stream = .initAlloc(testing.allocator, .init(&t));
+        defer trusted.deinit();
+        trusted.nextSlice("\x1B[3b");
+    }
+
+    const text = try t.plainString(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("A", text);
 }
 
 test "glyph protocol APC with write_pty callback" {

@@ -26,6 +26,7 @@ const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
+const workspace_snapshot = @import("../workspace_snapshot.zig");
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
@@ -188,6 +189,42 @@ pub const Surface = extern struct {
             );
         };
 
+        pub const @"unread-pending" = struct {
+            pub const name = "unread-pending";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "unread_pending",
+                    ),
+                },
+            );
+        };
+
+        pub const @"split-attention" = struct {
+            pub const name = "split-attention";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "split_attention",
+                    ),
+                },
+            );
+        };
+
         pub const @"min-size" = struct {
             pub const name = "min-size";
             const impl = gobject.ext.defineProperty(
@@ -288,6 +325,63 @@ pub const Surface = extern struct {
                 .{
                     .default = null,
                     .accessor = C.privateStringFieldAccessor("title_override"),
+                },
+            );
+        };
+
+        pub const @"effective-title" = struct {
+            pub const name = "effective-title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getEffectiveTitle,
+                        },
+                    ),
+                },
+            );
+        };
+
+        pub const @"workspace-title" = struct {
+            pub const name = "workspace-title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getWorkspaceTitle,
+                        },
+                    ),
+                },
+            );
+        };
+
+        pub const @"workspace-subtitle" = struct {
+            pub const name = "workspace-subtitle";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        ?[:0]const u8,
+                        .{
+                            .getter = Self.getWorkspaceSubtitle,
+                        },
+                    ),
                 },
             );
         };
@@ -604,16 +698,32 @@ pub const Surface = extern struct {
         /// The title of this surface, if any has been set.
         title: ?[:0]const u8 = null,
 
+        /// The unmodified title reported by the terminal. The displayed title
+        /// may abbreviate a matching working directory.
+        title_source: ?[:0]const u8 = null,
+
         /// The manually overridden title of this surface from `promptTitle`.
         title_override: ?[:0]const u8 = null,
 
+        /// Cached workspace labels derived from pwd/title state. These avoid
+        /// recomputing path display values for unrelated title updates.
+        workspace_title: ?[:0]const u8 = null,
+        workspace_subtitle: ?[:0]const u8 = null,
+
         /// The current focus state of the terminal based on the
         /// focus events.
-        focused: bool = true,
+        focused: bool = false,
 
         /// Whether the GLArea widget is mapped. Some operations like grabbing
         /// focus only work if a widget is mapped.
         mapped: bool = false,
+
+        /// Background attention only starts after the surface has lost focus
+        /// at least once after an actual user interaction. This avoids
+        /// counting initial startup activity on newly created or restored
+        /// background tabs as unread.
+        attention_armed: bool = false,
+        attention_ready: bool = false,
 
         /// Whether this surface is "zoomed" or not. A zoomed surface
         /// shows up taking the full bounds of a split view.
@@ -667,6 +777,28 @@ pub const Surface = extern struct {
         /// True when the child has exited.
         child_exited: bool = false,
 
+        /// True when background activity occurred since this surface last had
+        /// focus. This is cleared when the surface regains focus or when the
+        /// owning session closes.
+        unread_pending: bool = false,
+
+        /// Last background output timestamp in UTC, if we recorded one.
+        last_output_at: ?[:0]const u8 = null,
+        last_output_second: ?i64 = null,
+
+        /// Last bell timestamp in UTC, if we recorded one.
+        last_bell_at: ?[:0]const u8 = null,
+        last_bell_second: ?i64 = null,
+
+        /// The first terminal-driven pwd/command updates are startup bootstrap,
+        /// not missed background activity.
+        suppress_next_pwd_attention: bool = true,
+        suppress_next_command_finish_attention: bool = true,
+
+        /// True when another non-selected tab in the same split leaf needs
+        /// attention, so the currently visible pane can show a border.
+        split_attention: bool = false,
+
         // Progress bar
         progress_bar_timer: ?c_uint = null,
 
@@ -705,6 +837,17 @@ pub const Surface = extern struct {
         vadj: ?*gtk.Adjustment = null,
         hscroll_policy: gtk.ScrollablePolicy = .natural,
         vscroll_policy: gtk.ScrollablePolicy = .natural,
+
+        /// Pending idle focus source. This is tracked so disposal can cancel
+        /// it before GTK starts tearing down widget-owned state.
+        idle_focus_source: ?c_uint = null,
+
+        /// Tick callback used to continuously request redraws while an
+        /// interactive resize is in progress.
+        resize_tick_callback_id: c_uint = 0,
+        resize_tick_last_ms: i64 = 0,
+
+        disposing: bool = false,
         vadj_signal_group: ?*gobject.SignalGroup = null,
 
         // Key state tracking for key sequences and tables
@@ -739,6 +882,7 @@ pub const Surface = extern struct {
         overrides: struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
+            initial_scrollback_file: ?std.Io.File = null,
 
             pub const none: @This() = .{};
         } = .none,
@@ -749,6 +893,7 @@ pub const Surface = extern struct {
     pub fn new(overrides: struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
+        initial_scrollback_file: ?std.Io.File = null,
         title: ?[:0]const u8 = null,
 
         pub const none: @This() = .{};
@@ -761,7 +906,9 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+            .initial_scrollback_file = overrides.initial_scrollback_file,
         };
+        self.refreshWorkspaceLabels();
         return self;
     }
 
@@ -823,14 +970,55 @@ pub const Surface = extern struct {
     /// then we should force a redraw.
     pub fn redraw(self: *Self) void {
         const priv = self.private();
+        if (priv.disposing) return;
+        self.as(gtk.Widget).queueDraw();
         priv.gl_area.queueRender();
+    }
+
+    pub fn queueRender(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+        priv.gl_area.queueRender();
+    }
+
+    fn resizeTickSchedule(self: *Self) void {
+        const priv = self.private();
+        priv.resize_tick_last_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
+        if (priv.resize_tick_callback_id != 0) return;
+
+        priv.resize_tick_callback_id = self.as(gtk.Widget).addTickCallback(
+            resizeTickCallback,
+            null,
+            null,
+        );
+    }
+
+    fn resizeTickCallback(
+        widget: *gtk.Widget,
+        _: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+
+        const now = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
+        if (now - priv.resize_tick_last_ms > 120) {
+            priv.resize_tick_callback_id = 0;
+            return 0;
+        }
+
+        self.redraw();
+        return 1;
     }
 
     pub fn setSplitBinding(self: *Self, binding: ?*gobject.Binding) void {
         const priv = self.private();
         if (priv.split_binding) |old| {
-            old.as(gobject.Object).unref();
+            // Mirror the other binding holders in the GTK runtime: dropping our
+            // reference is enough, and avoids calling unbind() during teardown
+            // after GTK has already started dismantling the binding graph.
             priv.split_binding = null;
+            old.as(gobject.Object).unref();
         }
         priv.split_binding = binding;
     }
@@ -841,15 +1029,17 @@ pub const Surface = extern struct {
         _: *Self,
         config_: ?*Config,
         bell_ringing_: c_int,
+        split_attention_: c_int,
     ) callconv(.c) c_int {
         const bell_ringing = bell_ringing_ != 0;
+        const split_attention = split_attention_ != 0;
 
         // If the bell isn't ringing exit early because when the surface is
         // first created there's a race between this code being run and the
         // config being set on the surface. That way we don't overwhelm people
         // with the warning that we issue if the config isn't set and overwhelm
         // ourselves with large numbers of bug reports.
-        if (!bell_ringing) return @intFromBool(false);
+        if (!bell_ringing and !split_attention) return @intFromBool(false);
 
         const config = if (config_) |v| v.get() else {
             log.warn("config unavailable for computing whether border should be shown, likely bug", .{});
@@ -1147,6 +1337,12 @@ pub const Surface = extern struct {
         const app = Application.default();
         const alloc = app.allocator();
         const priv: *Private = self.private();
+
+        if (priv.suppress_next_command_finish_attention) {
+            priv.suppress_next_command_finish_attention = false;
+        } else {
+            self.markBackgroundOutput();
+        }
 
         const notify_next_command_finish = notify: {
             const simple_action_group = priv.action_group orelse break :notify false;
@@ -1809,7 +2005,7 @@ pub const Surface = extern struct {
         priv.cursor_pos = .{ .x = 0, .y = 0 };
         priv.mouse_shape = .text;
         priv.mouse_hidden = false;
-        priv.focused = true;
+        priv.focused = false;
         priv.mapped = false;
         priv.size = .{ .width = 0, .height = 0 };
         priv.vadj_signal_group = null;
@@ -1868,6 +2064,7 @@ pub const Surface = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.disposing = true;
 
         if (priv.config) |v| {
             v.unref();
@@ -1902,10 +2099,16 @@ pub const Surface = extern struct {
             priv.progress_bar_timer = null;
         }
 
-        if (priv.split_binding) |binding| {
-            binding.as(gobject.Object).unref();
-            priv.split_binding = null;
+        if (priv.resize_tick_callback_id != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.resize_tick_callback_id);
+            priv.resize_tick_callback_id = 0;
         }
+
+        // split_binding is cleared structurally when the surface leaves a split
+        // tree via setSplitBinding(null). By dispose time the binding may
+        // already be invalid or finalized by GTK teardown, so don't touch it
+        // here.
+        priv.split_binding = null;
 
         if (priv.idle_rechild) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -1919,6 +2122,21 @@ pub const Surface = extern struct {
                 log.warn("unable to remove pending horizontal scroll reset source", .{});
             }
             priv.pending_horizontal_scroll_reset = null;
+        }
+
+        if (priv.idle_focus_source) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove idle focus source", .{});
+            } else {
+                self.as(gobject.Object).unref();
+            }
+            priv.idle_focus_source = null;
+        }
+
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("surface", null);
+            group.unref();
+            priv.action_group = null;
         }
 
         // This works around a GTK double-free bug where if you bind
@@ -1977,13 +2195,33 @@ pub const Surface = extern struct {
             glib.free(@ptrCast(@constCast(v)));
             priv.pwd = null;
         }
+        if (priv.last_output_at) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.last_output_at = null;
+        }
+        if (priv.last_bell_at) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.last_bell_at = null;
+        }
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
         }
+        if (priv.title_source) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.title_source = null;
+        }
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
+        }
+        if (priv.workspace_title) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.workspace_title = null;
+        }
+        if (priv.workspace_subtitle) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.workspace_subtitle = null;
         }
         if (priv.overrides.command) |c| {
             c.deinit(alloc);
@@ -1992,6 +2230,10 @@ pub const Surface = extern struct {
         if (priv.overrides.working_directory) |wd| {
             alloc.free(wd);
             priv.overrides.working_directory = null;
+        }
+        if (priv.overrides.initial_scrollback_file) |file| {
+            file.close(global.io());
+            priv.overrides.initial_scrollback_file = null;
         }
 
         // Clean up key sequence and key table state
@@ -2037,20 +2279,103 @@ pub const Surface = extern struct {
     /// title. For manually set titles see `setTitleOverride`.
     pub fn setTitle(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
+        const source: ?[]const u8 = if (title) |value| value else null;
+        if (priv.title_source) |cached_source| {
+            if (optionalStringEql(cached_source, source)) {
+                if (source) |value| {
+                    if (priv.pwd) |pwd| {
+                        if (std.mem.eql(u8, value, pwd)) return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        } else if (optionalStringEql(priv.title, source)) {
+            return;
+        }
+
+        var display_path: ?[]u8 = null;
+        defer if (display_path) |value| Application.default().allocator().free(value);
+        const next_title: ?[]const u8 = if (title) |value| title: {
+            if (priv.pwd) |pwd| {
+                if (std.mem.eql(u8, value, pwd)) {
+                    display_path = allocDisplayPath(
+                        Application.default().allocator(),
+                        pwd,
+                    ) catch null;
+                    if (display_path) |display| break :title display;
+                }
+            }
+            break :title value;
+        } else null;
+
+        const source_is_normalized = if (source) |source_value|
+            if (next_title) |display_value|
+                !std.mem.eql(u8, source_value, display_value)
+            else
+                false
+        else
+            false;
+        if (priv.title_source) |value| {
+            glib.free(@ptrCast(@constCast(value)));
+            priv.title_source = null;
+        }
+        if (source_is_normalized) {
+            priv.title_source = glib.ext.dupeZ(u8, source.?);
+        }
+        if (optionalStringEql(priv.title, next_title)) return;
+
         if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title = null;
-        if (title) |v| priv.title = glib.ext.dupeZ(u8, v);
+        if (next_title) |value| priv.title = glib.ext.dupeZ(u8, value);
+        // OSC titles are presentation metadata and may animate frequently.
+        // They do not imply unread terminal content.
+        if (priv.pwd == null and priv.title_override == null) {
+            self.refreshWorkspaceLabels();
+        }
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
+        if (priv.title_override == null) {
+            self.as(gobject.Object).notifyByPspec(
+                properties.@"effective-title".impl.param_spec,
+            );
+        }
     }
 
     /// Overridden title. This will be generally be shown over the title
     /// unless this is unset (null).
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
+        if (optionalStringEql(
+            priv.title_override,
+            if (title) |value| value else null,
+        )) return;
+        const effective_changed = !optionalStringEql(
+            self.getEffectiveTitle(),
+            if (title) |value| value else priv.title,
+        );
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title_override = null;
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
+        if (priv.pwd == null) self.refreshWorkspaceLabels();
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
+        if (effective_changed) {
+            self.as(gobject.Object).notifyByPspec(
+                properties.@"effective-title".impl.param_spec,
+            );
+        }
+    }
+
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
+    pub fn cloneLaunchCommand(self: *Self, alloc: std.mem.Allocator) !?configpkg.Command {
+        const priv = self.private();
+        if (priv.overrides.command) |command| return try command.clone(alloc);
+        if (priv.config) |config_obj| {
+            if (config_obj.get().command) |command| return try command.clone(alloc);
+        }
+        return null;
     }
 
     /// Returns the pwd property without a copy.
@@ -2061,10 +2386,105 @@ pub const Surface = extern struct {
     /// Set the pwd for this surface, copies the value.
     pub fn setPwd(self: *Self, pwd: ?[:0]const u8) void {
         const priv = self.private();
+        if (optionalStringEql(priv.pwd, if (pwd) |value| value else null)) return;
+
         if (priv.pwd) |v| glib.free(@ptrCast(@constCast(v)));
         priv.pwd = null;
         if (pwd) |v| priv.pwd = glib.ext.dupeZ(u8, v);
+        if (priv.suppress_next_pwd_attention) {
+            priv.suppress_next_pwd_attention = false;
+        } else {
+            self.markBackgroundOutput();
+        }
+        self.refreshWorkspaceLabels();
         self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
+    }
+
+    fn optionalStringEql(current: ?[:0]const u8, next: ?[]const u8) bool {
+        if (current) |current_value| {
+            const next_value = next orelse return false;
+            return std.mem.eql(u8, current_value, next_value);
+        }
+        return next == null;
+    }
+
+    pub fn getWorkspaceTitle(self: *Self) ?[:0]const u8 {
+        return self.private().workspace_title;
+    }
+
+    pub fn getWorkspaceSubtitle(self: *Self) ?[:0]const u8 {
+        return self.private().workspace_subtitle;
+    }
+
+    fn refreshWorkspaceLabels(self: *Self) void {
+        const priv = self.private();
+        const workspace_title: ?[]const u8 = if (priv.pwd) |pwd| title: {
+            const base = std.fs.path.basename(pwd);
+            break :title if (base.len > 0) base else pwd;
+        } else if (priv.title_override) |title|
+            title
+        else if (priv.title) |title|
+            title
+        else
+            "Workspace";
+        self.replaceWorkspaceLabel(
+            &priv.workspace_title,
+            workspace_title,
+            properties.@"workspace-title".impl.param_spec,
+        );
+
+        var display_path: ?[]u8 = null;
+        defer if (display_path) |value| Application.default().allocator().free(value);
+        const workspace_subtitle: ?[]const u8 = if (priv.pwd) |pwd| subtitle: {
+            display_path = allocDisplayPath(
+                Application.default().allocator(),
+                pwd,
+            ) catch null;
+            break :subtitle display_path orelse pwd;
+        } else if (priv.title_override) |title|
+            title
+        else if (priv.title) |title|
+            title
+        else
+            null;
+        self.replaceWorkspaceLabel(
+            &priv.workspace_subtitle,
+            workspace_subtitle,
+            properties.@"workspace-subtitle".impl.param_spec,
+        );
+    }
+
+    fn replaceWorkspaceLabel(
+        self: *Self,
+        field: *?[:0]const u8,
+        value: ?[]const u8,
+        param_spec: *gobject.ParamSpec,
+    ) void {
+        if (optionalStringEql(field.*, value)) return;
+        if (field.*) |current| glib.free(@ptrCast(@constCast(current)));
+        field.* = if (value) |next| glib.ext.dupeZ(u8, next) else null;
+        self.as(gobject.Object).notifyByPspec(param_spec);
+    }
+
+    fn allocDisplayPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var env = try global.environMap();
+        defer env.deinit();
+        const home = internal_os.home(&env, &home_buf) catch null;
+        if (home) |home_path| {
+            if (std.mem.eql(u8, path, home_path)) {
+                return try alloc.dupe(u8, "~");
+            }
+
+            if (path.len > home_path.len and
+                std.mem.startsWith(u8, path, home_path) and
+                path[home_path.len] == std.fs.path.sep)
+            {
+                return try std.fmt.allocPrint(alloc, "~{s}", .{path[home_path.len..]});
+            }
+        }
+
+        return try alloc.dupe(u8, path);
     }
 
     /// Returns the focus state of this surface.
@@ -2224,6 +2644,33 @@ pub const Surface = extern struct {
         return self.private().bell_ringing;
     }
 
+    pub fn getUnreadPending(self: *Self) bool {
+        return self.private().unread_pending;
+    }
+
+    pub fn getSplitAttention(self: *Self) bool {
+        return self.private().split_attention;
+    }
+
+    pub fn getChildExited(self: *Self) bool {
+        return self.private().child_exited;
+    }
+
+    pub fn getLastOutputAt(self: *Self) ?[:0]const u8 {
+        return self.private().last_output_at;
+    }
+
+    pub fn getLastBellAt(self: *Self) ?[:0]const u8 {
+        return self.private().last_bell_at;
+    }
+
+    pub fn setSplitAttention(self: *Self, attention: bool) void {
+        const priv = self.private();
+        if (priv.split_attention == attention) return;
+        priv.split_attention = attention;
+        self.as(gobject.Object).notifyByPspec(properties.@"split-attention".impl.param_spec);
+    }
+
     pub fn setBellRinging(self: *Self, ringing: bool) void {
         // Prevent duplicate change notifications if the signals we emit
         // in this function cause this state to change again.
@@ -2232,13 +2679,77 @@ pub const Surface = extern struct {
 
         // Logic around bell reaction happens on every event even if we're
         // already in the ringing state.
-        if (ringing) self.ringBell();
+        if (ringing) {
+            self.recordBellActivity();
+            self.ringBell();
+        }
 
         // Property change only happens on actual state change
         const priv = self.private();
         if (priv.bell_ringing == ringing) return;
         priv.bell_ringing = ringing;
         self.as(gobject.Object).notifyByPspec(properties.@"bell-ringing".impl.param_spec);
+    }
+
+    fn markBackgroundOutput(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+        if (priv.focused) return;
+        if (!priv.attention_armed) return;
+        if (priv.core_surface == null) return;
+        if (priv.child_exited) return;
+
+        self.updateTimestampField(
+            &priv.last_output_at,
+            &priv.last_output_second,
+        );
+
+        if (priv.unread_pending) return;
+        priv.unread_pending = true;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn recordBellActivity(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+        if (priv.core_surface == null) return;
+        if (!priv.attention_armed) return;
+
+        self.updateTimestampField(
+            &priv.last_bell_at,
+            &priv.last_bell_second,
+        );
+
+        if (priv.focused or priv.child_exited) return;
+        if (priv.unread_pending) return;
+        priv.unread_pending = true;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn clearUnreadPending(self: *Self) void {
+        const priv = self.private();
+        if (!priv.unread_pending) return;
+        priv.unread_pending = false;
+        self.as(gobject.Object).notifyByPspec(properties.@"unread-pending".impl.param_spec);
+    }
+
+    fn updateTimestampField(
+        _: *Self,
+        field: *?[:0]const u8,
+        recorded_second: *?i64,
+    ) void {
+        const now = std.Io.Timestamp.now(global.io(), .real).toSeconds();
+        if (recorded_second.* != null and recorded_second.*.? == now) return;
+
+        const alloc = Application.default().allocator();
+        const fresh = workspace_snapshot.formatUtcTimestampAlloc(
+            alloc,
+            now,
+        ) catch return;
+        defer alloc.free(fresh);
+        if (field.*) |value| glib.free(@ptrCast(@constCast(value)));
+        field.* = glib.ext.dupeZ(u8, fresh);
+        recorded_second.* = now;
     }
 
     pub fn setError(self: *Self, v: bool) void {
@@ -2737,6 +3248,7 @@ pub const Surface = extern struct {
         gtk_mods: gdk.ModifierType,
         self: *Self,
     ) callconv(.c) c_int {
+        self.noteUserInteraction();
         return @intFromBool(self.keyEvent(
             .press,
             ec_key,
@@ -2777,11 +3289,17 @@ pub const Surface = extern struct {
         const ctx = priv.im_context.as(gtk.IMContext);
         if (focused) ctx.focusIn() else ctx.focusOut();
 
-        _ = glib.idleAddOnce(idleFocus, self.ref());
+        self.scheduleIdleFocus();
         self.as(gobject.Object).notifyByPspec(properties.focused.impl.param_spec);
 
-        // Bell stops ringing as soon as we gain focus
-        if (focused) self.setBellRinging(false);
+        if (focused) {
+            self.clearUnreadPending();
+
+            // Bell stops ringing as soon as we gain focus
+            self.setBellRinging(false);
+        } else {
+            priv.attention_armed = priv.attention_ready;
+        }
     }
 
     /// The focus callback must be triggered on an idle loop source because
@@ -2789,16 +3307,38 @@ pub const Surface = extern struct {
     /// confirmation dialogs) that can trigger focus loss and cause a deadlock
     /// because the lock may be held during the callback.
     ///
-    /// Userdata should be a `*Surface`. This will unref once.
-    fn idleFocus(ud: ?*anyopaque) callconv(.c) void {
-        const self: *Self = @ptrCast(@alignCast(ud orelse return));
-        defer self.unref();
+    fn scheduleIdleFocus(self: *Self) void {
+        const priv = self.private();
+        if (priv.disposing) return;
+
+        if (priv.idle_focus_source) |source| {
+            if (glib.Source.remove(source) == 0) {
+                log.warn("unable to replace idle focus source", .{});
+            } else {
+                self.as(gobject.Object).unref();
+            }
+            priv.idle_focus_source = null;
+        }
+
+        _ = self.as(gobject.Object).ref();
+        priv.idle_focus_source = glib.idleAdd(idleFocus, self);
+    }
+
+    /// Userdata should be a `*Surface`.
+    fn idleFocus(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.as(gobject.Object).unref();
 
         const priv = self.private();
-        const surface = priv.core_surface orelse return;
+        priv.idle_focus_source = null;
+        if (priv.disposing) return 0;
+
+        const surface = priv.core_surface orelse return 0;
         surface.focusCallback(priv.focused) catch |err| {
             log.warn("error in focus callback err={}", .{err});
         };
+
+        return 0;
     }
 
     fn gcMouseDown(
@@ -2808,6 +3348,7 @@ pub const Surface = extern struct {
         y: f64,
         self: *Self,
     ) callconv(.c) void {
+        self.noteUserInteraction();
         const event = gesture.as(gtk.EventController).getCurrentEvent() orelse return;
 
         // Bell stops ringing if any mouse button is pressed.
@@ -3072,9 +3613,9 @@ pub const Surface = extern struct {
 
             _ = self.as(gtk.Widget).activateAction(
                 if (priv.pending_horizontal_scroll < 0.0)
-                    "tab.next-page"
+                    "workspace.next-page"
                 else
-                    "tab.previous-page",
+                    "workspace.previous-page",
                 null,
             );
 
@@ -3185,6 +3726,7 @@ pub const Surface = extern struct {
         bytes: [*:0]u8,
         self: *Self,
     ) callconv(.c) void {
+        self.noteUserInteraction();
         const priv = self.private();
         const str = std.mem.sliceTo(bytes, 0);
 
@@ -3263,6 +3805,10 @@ pub const Surface = extern struct {
         }
     }
 
+    fn noteUserInteraction(self: *Self) void {
+        self.private().attention_ready = true;
+    }
+
     fn glareaRealize(
         _: *gtk.GLArea,
         self: *Self,
@@ -3308,6 +3854,10 @@ pub const Surface = extern struct {
 
         // Notify our core surface
         const priv = self.private();
+        if (priv.resize_tick_callback_id != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.resize_tick_callback_id);
+            priv.resize_tick_callback_id = 0;
+        }
         if (priv.core_surface) |surface| {
             // There is no guarantee that our GLArea context is current
             // when unrealize is emitted, so we need to make it current.
@@ -3392,30 +3942,11 @@ pub const Surface = extern struct {
     }
 
     fn glareaResize(
-        gl_area: *gtk.GLArea,
+        _: *gtk.GLArea,
         width: c_int,
         height: c_int,
         self: *Self,
     ) callconv(.c) void {
-        // Some debug output to help understand what GTK is telling us.
-        {
-            const widget = gl_area.as(gtk.Widget);
-            const scale_factor = widget.getScaleFactor();
-            const window_scale_factor = scale: {
-                const root = widget.getRoot() orelse break :scale 0;
-                const gtk_native = root.as(gtk.Native);
-                const gdk_surface = gtk_native.getSurface() orelse break :scale 0;
-                break :scale gdk_surface.getScaleFactor();
-            };
-
-            log.debug("gl resize width={} height={} scale={} window_scale={}", .{
-                width,
-                height,
-                scale_factor,
-                window_scale_factor,
-            });
-        }
-
         // Store our cached size
         const priv = self.private();
 
@@ -3438,8 +3969,14 @@ pub const Surface = extern struct {
                 surface.sizeCallback(new_size) catch |err| {
                     log.warn("error in size callback err={}", .{err});
                 };
+
                 // Setup our resize overlay if configured
                 self.resizeOverlaySchedule();
+                self.resizeTickSchedule();
+
+                // Explicitly invalidate the GLArea so the new frame is requested
+                // once the renderer state catches up.
+                self.redraw();
             }
 
             return;
@@ -3509,6 +4046,9 @@ pub const Surface = extern struct {
             config.@"working-directory" = wd_val;
         }
 
+        const initial_scrollback_file = priv.overrides.initial_scrollback_file;
+        priv.overrides.initial_scrollback_file = null;
+
         // Initialize the surface
         surface.init(
             alloc,
@@ -3516,6 +4056,9 @@ pub const Surface = extern struct {
             app.core(),
             app.rt(),
             &priv.rt_surface,
+            .{
+                .initial_scrollback_file = initial_scrollback_file,
+            },
         ) catch |err| {
             log.warn("failed to initialize surface err={}", .{err});
             return error.SurfaceError;
@@ -3524,6 +4067,10 @@ pub const Surface = extern struct {
 
         // Store it!
         priv.core_surface = surface;
+
+        surface.focusCallback(priv.focused) catch |err| {
+            log.warn("failed to apply initial focus state err={}", .{err});
+        };
 
         // Emit the signal that we initialized the surface.
         Surface.signals.init.impl.emit(
@@ -3718,6 +4265,8 @@ pub const Surface = extern struct {
                 properties.@"font-size-request".impl,
                 properties.focused.impl,
                 properties.mapped.impl,
+                properties.@"split-attention".impl,
+                properties.@"unread-pending".impl,
                 properties.@"key-sequence".impl,
                 properties.@"key-table".impl,
                 properties.@"min-size".impl,
@@ -3727,6 +4276,9 @@ pub const Surface = extern struct {
                 properties.pwd.impl,
                 properties.title.impl,
                 properties.@"title-override".impl,
+                properties.@"effective-title".impl,
+                properties.@"workspace-title".impl,
+                properties.@"workspace-subtitle".impl,
                 properties.zoom.impl,
                 properties.@"is-split".impl,
                 properties.readonly.impl,
@@ -4172,4 +4724,12 @@ test "computeFraction" {
     try std.testing.expectEqual(1.0, computeFraction(255));
     try std.testing.expectEqual(0.0, computeFraction(0));
     try std.testing.expectEqual(0.5, computeFraction(50));
+}
+
+test "surface optional string equality" {
+    const value: [:0]const u8 = "value";
+    try std.testing.expect(Surface.optionalStringEql(value, "value"));
+    try std.testing.expect(!Surface.optionalStringEql(value, "other"));
+    try std.testing.expect(!Surface.optionalStringEql(value, null));
+    try std.testing.expect(Surface.optionalStringEql(null, null));
 }

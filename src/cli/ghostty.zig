@@ -23,6 +23,7 @@ const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const toggle_quick_terminal = @import("toggle_quick_terminal.zig");
 const global = @import("../global.zig");
+const workspace = @import("workspace.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -81,6 +82,30 @@ pub const Action = enum {
 
     // Use IPC to tell the running Ghostty to toggle the quick terminal.
     @"toggle-quick-terminal",
+
+    // Query workspaces from a running Ghostty instance.
+    @"workspace-list",
+
+    // Open or create a workspace in a running Ghostty instance.
+    @"workspace-open",
+
+    // Save the current snapshot for a workspace in a running Ghostty instance.
+    @"workspace-save",
+
+    // Restore a workspace in a running Ghostty instance.
+    @"workspace-restore",
+
+    // List sessions from a workspace in a running Ghostty instance.
+    @"workspace-list-sessions",
+
+    // Focus a session in a running Ghostty instance.
+    @"workspace-focus-session",
+
+    // Create a split from a session in a running Ghostty instance.
+    @"workspace-split",
+
+    // Close a session in a running Ghostty instance.
+    @"workspace-close-session",
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -166,6 +191,15 @@ pub const Action = enum {
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
             .@"toggle-quick-terminal" => try toggle_quick_terminal.run(alloc),
+            .@"workspace-list",
+            .@"workspace-open",
+            .@"workspace-save",
+            .@"workspace-restore",
+            .@"workspace-list-sessions",
+            .@"workspace-focus-session",
+            .@"workspace-split",
+            .@"workspace-close-session",
+            => try workspace.runAction(self, alloc),
         };
     }
 
@@ -173,6 +207,20 @@ pub const Action = enum {
     /// path from the root src/ directory.
     pub fn file(comptime self: Action) []const u8 {
         comptime {
+            switch (self) {
+                .@"workspace-list",
+                .@"workspace-open",
+                .@"workspace-save",
+                .@"workspace-restore",
+                .@"workspace-list-sessions",
+                .@"workspace-focus-session",
+                .@"workspace-split",
+                .@"workspace-close-session",
+                => return "cli/workspace.zig",
+                else => {},
+            }
+
+            @setEvalBranchQuota(10_000);
             const filename = filename: {
                 const tag = @tagName(self);
                 var filename: [tag.len]u8 = undefined;
@@ -182,6 +230,20 @@ pub const Action = enum {
 
             return "cli/" ++ filename ++ ".zig";
         }
+    }
+
+    pub fn helpFunction(comptime self: Action) []const u8 {
+        return switch (self) {
+            .@"workspace-list" => "runList",
+            .@"workspace-open" => "runOpen",
+            .@"workspace-save" => "runSave",
+            .@"workspace-restore" => "runRestore",
+            .@"workspace-list-sessions" => "runListSessions",
+            .@"workspace-focus-session" => "runFocusSession",
+            .@"workspace-split" => "runSplit",
+            .@"workspace-close-session" => "runCloseSession",
+            else => "run",
+        };
     }
 
     /// Returns the options of action. Supports generating shell completions
@@ -208,6 +270,15 @@ pub const Action = enum {
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
                 .@"toggle-quick-terminal" => toggle_quick_terminal.Options,
+                .@"workspace-list",
+                .@"workspace-open",
+                .@"workspace-save",
+                .@"workspace-restore",
+                .@"workspace-list-sessions",
+                .@"workspace-focus-session",
+                .@"workspace-split",
+                .@"workspace-close-session",
+                => workspace.optionsForAction(self),
             };
         }
     }

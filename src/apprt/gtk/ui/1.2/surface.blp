@@ -129,7 +129,7 @@ Overlay terminal_page {
   // widget which undesirable side effects. Second, we can make it reactive
   // here in the blueprint with relatively little code.
   Revealer {
-    reveal-child: bind $should_border_be_shown(template.config, template.bell-ringing) as <bool>;
+    reveal-child: bind $should_border_be_shown(template.config, template.bell-ringing, template.split-attention) as <bool>;
     transition-type: crossfade;
     transition-duration: 500;
     // Revealers take up the full size, we need this to not capture events.
@@ -291,8 +291,13 @@ menu context_menu_model {
       label: _("Split");
 
       item {
-        label: _("Change Title…");
+        label: _("Change Terminal Title…");
         action: "surface.prompt-title";
+      }
+
+      item {
+        label: _("Change Tab Title…");
+        action: "win.prompt-tab-title";
       }
 
       item {
@@ -326,21 +331,21 @@ menu context_menu_model {
     }
 
     submenu {
-      label: _("Tab");
+      label: _("Workspace");
 
       item {
-        label: _("Change Tab Title…");
-        action: "tab.prompt-tab-title";
+        label: _("Rename Workspace…");
+        action: "win.prompt-workspace-title";
       }
 
       item {
-        label: _("New Tab");
+        label: _("New Workspace");
         action: "win.new-tab";
       }
 
       item {
-        label: _("Close Tab");
-        action: "tab.close";
+        label: _("Close Workspace");
+        action: "workspace.close";
         target: "this";
       }
     }

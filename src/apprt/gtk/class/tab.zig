@@ -5,19 +5,15 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
-const configpkg = @import("../../../config.zig");
-const apprt = @import("../../../apprt.zig");
-const CoreSurface = @import("../../../Surface.zig");
+const Common = @import("../class.zig").Common;
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
-const Common = @import("../class.zig").Common;
-const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
-const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
+const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScrolledWindow;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 
-const log = std.log.scoped(.gtk_ghostty_window);
+const log = std.log.scoped(.gtk_ghostty_tab);
 
 pub const Tab = extern struct {
     const Self = @This();
@@ -32,72 +28,40 @@ pub const Tab = extern struct {
     });
 
     pub const properties = struct {
-        /// The active surface is the surface that should be receiving all
-        /// surface-targeted actions. This is usually the focused surface,
-        /// but may also not be focused if the user has selected a non-surface
-        /// widget.
-        pub const @"active-surface" = struct {
-            pub const name = "active-surface";
+        pub const surface = struct {
+            pub const name = "surface";
             const impl = gobject.ext.defineProperty(
                 name,
                 Self,
                 ?*Surface,
                 .{
-                    .accessor = gobject.ext.typedAccessor(
-                        Self,
-                        ?*Surface,
-                        .{
-                            .getter = Self.getActiveSurface,
-                        },
-                    ),
+                    .accessor = .{
+                        .getter = getSurfaceValue,
+                        .setter = setSurfaceValue,
+                    },
                 },
             );
         };
 
-        pub const config = struct {
-            pub const name = "config";
+        pub const title = struct {
+            pub const name = "title";
             const impl = gobject.ext.defineProperty(
                 name,
                 Self,
-                ?*Config,
+                ?[:0]const u8,
                 .{
-                    .accessor = C.privateObjFieldAccessor("config"),
-                },
-            );
-        };
-
-        pub const @"split-tree" = struct {
-            pub const name = "split-tree";
-            const impl = gobject.ext.defineProperty(
-                name,
-                Self,
-                ?*SplitTree,
-                .{
+                    .default = null,
                     .accessor = gobject.ext.typedAccessor(
                         Self,
-                        ?*SplitTree,
+                        ?[:0]const u8,
                         .{
-                            .getter = getSplitTree,
+                            .getter = Self.getComputedTitle,
+                            .getter_transfer = .none,
+                            .setter = Self.setComputedTitle,
+                            .setter_transfer = .full,
                         },
                     ),
-                },
-            );
-        };
-
-        pub const @"surface-tree" = struct {
-            pub const name = "surface-tree";
-            const impl = gobject.ext.defineProperty(
-                name,
-                Self,
-                ?*Surface.Tree,
-                .{
-                    .accessor = gobject.ext.typedAccessor(
-                        Self,
-                        ?*Surface.Tree,
-                        .{
-                            .getter = getSurfaceTree,
-                        },
-                    ),
+                    .explicit_notify = true,
                 },
             );
         };
@@ -115,18 +79,6 @@ pub const Tab = extern struct {
             );
         };
 
-        pub const title = struct {
-            pub const name = "title";
-            const impl = gobject.ext.defineProperty(
-                name,
-                Self,
-                ?[:0]const u8,
-                .{
-                    .default = null,
-                    .accessor = C.privateStringFieldAccessor("title"),
-                },
-            );
-        };
         pub const @"title-override" = struct {
             pub const name = "title-override";
             const impl = gobject.ext.defineProperty(
@@ -141,135 +93,96 @@ pub const Tab = extern struct {
         };
     };
 
-    pub const signals = struct {
-        /// Emitted whenever the tab would like to be closed.
-        pub const @"close-request" = struct {
-            pub const name = "close-request";
-            pub const connect = impl.connect;
-            const impl = gobject.ext.defineSignal(
-                name,
-                Self,
-                &.{},
-                void,
-            );
-        };
-    };
-
     const Private = struct {
-        /// The configuration that this surface is using.
-        config: ?*Config = null,
-
-        /// The title of this tab. This is usually bound to the active surface.
+        surface: ?*Surface = null,
         title: ?[:0]const u8 = null,
-
-        /// The manually overridden title from `promptTabTitle`.
-        title_override: ?[:0]const u8 = null,
-
-        /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
+        title_override: ?[:0]const u8 = null,
+        action_group: ?*gio.SimpleActionGroup = null,
 
-        // Template bindings
-        split_tree: *SplitTree,
+        surface_scrolled_window: *SurfaceScrolledWindow,
 
         pub var offset: c_int = 0;
     };
 
-    const NewOptions = struct {
-        command: ?configpkg.Command = null,
-        working_directory: ?[:0]const u8 = null,
-        title: ?[:0]const u8 = null,
-
-        pub const none: @This() = .{};
-    };
-
-    /// Set the parent of this tab page. This only affects the first surface
-    /// ever created for a tab. If a surface was already created this does
-    /// nothing.
-    pub fn setParent(self: *Self, parent: *CoreSurface) void {
-        self.setParentWithContext(parent, .tab);
-    }
-
-    pub fn setParentWithContext(self: *Self, parent: *CoreSurface, context: apprt.surface.NewSurfaceContext) void {
-        if (self.getActiveSurface()) |surface| {
-            surface.setParent(parent, context);
-        }
-    }
-
-    pub fn new(config: ?*Config, overrides: NewOptions) *Self {
-        const tab = gobject.ext.newInstance(Tab, .{});
-        return tab.initCommon(config, true, overrides);
-    }
-
-    pub fn newEmpty(config: ?*Config) *Self {
-        const tab = gobject.ext.newInstance(Tab, .{});
-        return tab.initCommon(config, false, .none);
-    }
-
-    fn initCommon(
-        tab: *Self,
-        config: ?*Config,
-        create_initial_surface: bool,
-        overrides: NewOptions,
-    ) *Self {
-        const priv: *Private = tab.private();
-
-        if (config) |c| priv.config = c.ref();
-
-        // If our configuration is null then we get the configuration
-        // from the application.
-        if (priv.config == null) {
-            const app = Application.default();
-            priv.config = app.getConfig();
-        }
-
-        tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
-
-        if (create_initial_surface) {
-            // Create our initial surface in the split tree.
-            priv.split_tree.newSplit(.right, null, .{
-                .command = overrides.command,
-                .working_directory = overrides.working_directory,
-                .title = overrides.title,
-            }) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    // TODO: We should make our "no surfaces" state more aesthetically
-                    // pleasing and show something like an "Oops, something went wrong"
-                    // message. For now, this is incredibly unlikely.
-                    @panic("oom");
-                },
-            };
-        }
-
-        return tab;
+    pub fn new(surface: *Surface) *Self {
+        return gobject.ext.newInstance(Self, .{
+            .surface = surface,
+        });
     }
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
-
-        // Init our actions
         self.initActionMap();
     }
 
     fn initActionMap(self: *Self) void {
-        const s_param_type = glib.ext.VariantType.newFor([:0]const u8);
-        defer s_param_type.free();
-
         const actions = [_]ext.actions.Action(Self){
-            .init("close", actionClose, s_param_type),
-            .init("ring-bell", actionRingBell, null),
-            .init("next-page", actionNextPage, null),
-            .init("previous-page", actionPreviousPage, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
+            .init("ring-bell", actionRingBell, null),
         };
 
-        _ = ext.actions.addAsGroup(Self, self, "tab", &actions);
+        self.private().action_group = ext.actions.addAsGroup(Self, self, "tab", &actions);
     }
 
-    //---------------------------------------------------------------
-    // Properties
+    pub fn getSurface(self: *Self) ?*Surface {
+        return self.private().surface;
+    }
 
-    /// Overridden title. This will be generally be shown over the title
-    /// unless this is unset (null).
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
+    fn getComputedTitle(self: *Self) ?[:0]const u8 {
+        return self.private().title;
+    }
+
+    fn setComputedTitle(self: *Self, title: ?[:0]const u8) void {
+        const priv = self.private();
+        if (optionalStringEql(priv.title, title)) {
+            if (title) |unchanged| glib.free(@ptrCast(@constCast(unchanged)));
+            return;
+        }
+        if (priv.title) |current| glib.free(@ptrCast(@constCast(current)));
+        priv.title = title;
+        self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
+    }
+
+    fn optionalStringEql(
+        current: ?[:0]const u8,
+        next: ?[:0]const u8,
+    ) bool {
+        if (current) |current_value| {
+            const next_value = next orelse return false;
+            return std.mem.eql(u8, current_value, next_value);
+        }
+        return next == null;
+    }
+
+    pub fn getEffectiveTitle(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+        return priv.title_override orelse priv.title;
+    }
+
+    pub fn getTooltip(self: *Self) ?[:0]const u8 {
+        return self.private().tooltip;
+    }
+
+    fn getSurfaceValue(self: *Self, value: *gobject.Value) void {
+        gobject.ext.Value.set(value, self.private().surface);
+    }
+
+    fn setSurfaceValue(self: *Self, value: *const gobject.Value) void {
+        self.setSurface(gobject.ext.Value.get(value, ?*Surface));
+    }
+
+    pub fn setSurface(self: *Self, surface: ?*Surface) void {
+        const priv = self.private();
+        if (priv.surface == surface) return;
+        priv.surface = surface;
+        self.as(gobject.Object).notifyByPspec(properties.surface.impl.param_spec);
+    }
+
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
         if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
@@ -277,15 +190,13 @@ pub const Tab = extern struct {
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
     }
-    fn titleDialogSet(
-        _: *TitleDialog,
-        title_ptr: [*:0]const u8,
-        self: *Self,
-    ) callconv(.c) void {
+
+    fn titleDialogSet(_: *TitleDialog, title_ptr: [*:0]const u8, self: *Self) callconv(.c) void {
         const title = std.mem.span(title_ptr);
         self.setTitleOverride(if (title.len == 0) null else title);
     }
-    pub fn promptTabTitle(self: *Self) void {
+
+    pub fn promptTitle(self: *Self) void {
         const priv = self.private();
         const dialog = TitleDialog.new(.tab, priv.title_override orelse priv.title);
         _ = TitleDialog.signals.set.connect(
@@ -295,261 +206,100 @@ pub const Tab = extern struct {
             self,
             .{},
         );
-
         dialog.present(self.as(gtk.Widget));
     }
 
-    /// Get the currently active surface. See the "active-surface" property.
-    /// This does not ref the value.
-    pub fn getActiveSurface(self: *Self) ?*Surface {
-        return self.getSplitTree().getActiveSurface();
+    pub fn getFocused(self: *Self) bool {
+        const surface = self.getSurface() orelse return false;
+        return surface.getFocused();
     }
 
-    /// Get the surface tree of this tab.
-    pub fn getSurfaceTree(self: *Self) ?*Surface.Tree {
-        const priv = self.private();
-        return priv.split_tree.getTree();
+    pub fn grabFocus(self: *Self) void {
+        const surface = self.getSurface() orelse return;
+        surface.grabFocus();
     }
 
-    /// Get the split tree widget that is in this tab.
-    pub fn getSplitTree(self: *Self) *SplitTree {
-        const priv = self.private();
-        return priv.split_tree;
-    }
-
-    /// Returns true if this tab needs confirmation before quitting based
-    /// on the various Ghostty configurations.
     pub fn getNeedsConfirmQuit(self: *Self) bool {
-        const tree = self.getSplitTree();
-        return tree.getNeedsConfirmQuit();
+        const surface = self.getSurface() orelse return false;
+        const core = surface.core() orelse return false;
+        return core.needsConfirmQuit();
     }
 
-    /// Get the tab view holding this tab, if any.
-    fn getTabView(self: *Self) ?*adw.TabView {
-        return ext.getAncestor(
-            adw.TabView,
-            self.as(gtk.Widget),
+    fn getPageView(self: *Self) ?*adw.TabView {
+        return ext.getAncestor(adw.TabView, self.as(gtk.Widget));
+    }
+
+    fn getPage(self: *Self) ?*adw.TabPage {
+        const page_view = self.getPageView() orelse return null;
+        return page_view.getPage(self.as(gtk.Widget));
+    }
+
+    fn actionPromptTabTitle(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
+        self.promptTitle();
+    }
+
+    fn actionRingBell(_: *gio.SimpleAction, _: ?*glib.Variant, self: *Self) callconv(.c) void {
+        const page = self.getPage() orelse return;
+        if (page.getSelected() != 0) return;
+        page.setNeedsAttention(@intFromBool(true));
+    }
+
+    fn closureComputedTitle(
+        _: *Self,
+        surface_title_: ?[*:0]const u8,
+        tab_override_: ?[*:0]const u8,
+        unread_pending_: c_int,
+        bell_ringing_: c_int,
+        _: *gobject.ParamSpec,
+    ) callconv(.c) ?[*:0]const u8 {
+        const plain = std.mem.span(
+            tab_override_ orelse
+                surface_title_ orelse
+                "Ghostty",
         );
-    }
 
-    /// Get the tab page holding this tab, if any.
-    fn getTabPage(self: *Self) ?*adw.TabPage {
-        const tab_view = self.getTabView() orelse return null;
-        return tab_view.getPage(self.as(gtk.Widget));
-    }
+        if (bell_ringing_ == 0 and unread_pending_ == 0) {
+            return glib.ext.dupeZ(u8, plain);
+        }
 
-    //---------------------------------------------------------------
-    // Virtual methods
+        var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
+        defer buf.deinit();
+        if (bell_ringing_ != 0) {
+            buf.writer.writeAll("🔔 ") catch return glib.ext.dupeZ(u8, plain);
+        } else {
+            buf.writer.writeAll("• ") catch return glib.ext.dupeZ(u8, plain);
+        }
+        buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
+        return glib.ext.dupeZ(u8, buf.written());
+    }
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
-        if (priv.config) |v| {
-            v.unref();
-            priv.config = null;
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("tab", null);
+            group.unref();
+            priv.action_group = null;
         }
-
-        gtk.Widget.disposeTemplate(
-            self.as(gtk.Widget),
-            getGObjectType(),
-        );
-
-        gobject.Object.virtual_methods.dispose.call(
-            Class.parent,
-            self.as(Parent),
-        );
+        gtk.Widget.disposeTemplate(self.as(gtk.Widget), getGObjectType());
+        gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
     }
 
     fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
-        if (priv.tooltip) |v| {
-            glib.free(@ptrCast(@constCast(v)));
-            priv.tooltip = null;
-        }
         if (priv.title) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
+        }
+        if (priv.tooltip) |v| {
+            glib.free(@ptrCast(@constCast(v)));
+            priv.tooltip = null;
         }
         if (priv.title_override) |v| {
             glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
         }
 
-        gobject.Object.virtual_methods.finalize.call(
-            Class.parent,
-            self.as(Parent),
-        );
-    }
-    //---------------------------------------------------------------
-    // Signal handlers
-
-    fn propSplitTree(
-        _: *SplitTree,
-        _: *gobject.ParamSpec,
-        self: *Self,
-    ) callconv(.c) void {
-        self.as(gobject.Object).notifyByPspec(properties.@"surface-tree".impl.param_spec);
-
-        // If our tree is empty we close the tab.
-        const tree: *const Surface.Tree = self.getSurfaceTree() orelse &.empty;
-        if (tree.isEmpty()) {
-            signals.@"close-request".impl.emit(
-                self,
-                null,
-                .{},
-                null,
-            );
-            return;
-        }
-    }
-
-    fn propActiveSurface(
-        _: *SplitTree,
-        _: *gobject.ParamSpec,
-        self: *Self,
-    ) callconv(.c) void {
-        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
-    }
-
-    fn actionClose(
-        _: *gio.SimpleAction,
-        param_: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        const param = param_ orelse {
-            log.warn("tab.close-tab called without a parameter", .{});
-            return;
-        };
-
-        var str: ?[*:0]const u8 = null;
-        param.get("&s", &str);
-
-        const tab_view = self.getTabView() orelse return;
-        const page = tab_view.getPage(self.as(gtk.Widget));
-
-        const mode = std.meta.stringToEnum(
-            apprt.action.CloseTabMode,
-            std.mem.span(
-                str orelse {
-                    log.warn("invalid mode provided to tab.close-tab", .{});
-                    return;
-                },
-            ),
-        ) orelse {
-            // Need to be defensive here since actions can be triggered externally.
-            log.warn("invalid mode provided to tab.close-tab: {s}", .{str.?});
-            return;
-        };
-
-        // Delegate to our parent to handle this, since this will emit
-        // a close-page signal that the parent can intercept.
-        switch (mode) {
-            .this => tab_view.closePage(page),
-            .other => tab_view.closeOtherPages(page),
-            .right => tab_view.closePagesAfter(page),
-        }
-    }
-
-    fn actionPromptTabTitle(
-        _: *gio.SimpleAction,
-        _: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        self.promptTabTitle();
-    }
-
-    fn actionRingBell(
-        _: *gio.SimpleAction,
-        _: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        // Future note: I actually don't like this logic living here at all.
-        // I think a better approach will be for the ring bell action to
-        // specify its sending surface and then do all this in the window.
-
-        // If the page is selected already we don't mark it as needing
-        // attention. We only want to mark unfocused pages. This will then
-        // clear when the page is selected.
-        const page = self.getTabPage() orelse return;
-        if (page.getSelected() != 0) return;
-        page.setNeedsAttention(@intFromBool(true));
-    }
-
-    /// Select the next tab page.
-    fn actionNextPage(
-        _: *gio.SimpleAction,
-        _: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        const tab_view = self.getTabView() orelse return;
-        _ = tab_view.selectNextPage();
-    }
-
-    /// Select the previous tab page.
-    fn actionPreviousPage(
-        _: *gio.SimpleAction,
-        _: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        const tab_view = self.getTabView() orelse return;
-        _ = tab_view.selectPreviousPage();
-    }
-
-    fn closureComputedTitle(
-        _: *Self,
-        config_: ?*Config,
-        terminal_: ?[*:0]const u8,
-        surface_override_: ?[*:0]const u8,
-        tab_override_: ?[*:0]const u8,
-        zoomed_: c_int,
-        bell_ringing_: c_int,
-        _: *gobject.ParamSpec,
-    ) callconv(.c) ?[*:0]const u8 {
-        const zoomed = zoomed_ != 0;
-        const bell_ringing = bell_ringing_ != 0;
-
-        // Our plain title is the manually tab overridden title if it exists,
-        // otherwise the overridden title if it exists, otherwise
-        // the terminal title if it exists, otherwise a default string.
-        const plain = plain: {
-            const default = "Ghostty";
-            const config_title: ?[*:0]const u8 = title: {
-                const config = config_ orelse break :title null;
-                break :title config.get().title orelse null;
-            };
-
-            const plain = tab_override_ orelse
-                surface_override_ orelse
-                terminal_ orelse
-                config_title orelse
-                break :plain default;
-            break :plain std.mem.span(plain);
-        };
-
-        // We don't need a config in every case, but if we don't have a config
-        // let's just assume something went terribly wrong and use our
-        // default title. Its easier then guarding on the config existing
-        // in every case for something so unlikely.
-        const config = if (config_) |v| v.get() else {
-            log.warn("config unavailable for computed title, likely bug", .{});
-            return glib.ext.dupeZ(u8, plain);
-        };
-
-        // Use an allocator to build up our string as we write it.
-        var buf: std.Io.Writer.Allocating = .init(Application.default().allocator());
-        defer buf.deinit();
-
-        // If our bell is ringing, then we prefix the bell icon to the title.
-        if (bell_ringing and config.@"bell-features".title) {
-            buf.writer.writeAll("🔔 ") catch {};
-        }
-
-        // If we're zoomed, prefix with the magnifying glass emoji.
-        if (zoomed) {
-            buf.writer.writeAll("🔍 ") catch {};
-        }
-
-        buf.writer.writeAll(plain) catch return glib.ext.dupeZ(u8, plain);
-        return glib.ext.dupeZ(u8, buf.written());
+        gobject.Object.virtual_methods.finalize.call(Class.parent, self.as(Parent));
     }
 
     const C = Common(Self, Private);
@@ -564,8 +314,8 @@ pub const Tab = extern struct {
         pub const Instance = Self;
 
         fn init(class: *Class) callconv(.c) void {
-            gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
+            gobject.ext.ensureType(SurfaceScrolledWindow);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -575,29 +325,16 @@ pub const Tab = extern struct {
                 }),
             );
 
-            // Properties
             gobject.ext.registerProperties(class, &.{
-                properties.@"active-surface".impl,
-                properties.config.impl,
-                properties.@"split-tree".impl,
-                properties.@"surface-tree".impl,
+                properties.surface.impl,
                 properties.title.impl,
-                properties.@"title-override".impl,
                 properties.tooltip.impl,
+                properties.@"title-override".impl,
             });
 
-            // Bindings
-            class.bindTemplateChildPrivate("split_tree", .{});
-
-            // Template Callbacks
+            class.bindTemplateChildPrivate("surface_scrolled_window", .{});
             class.bindTemplateCallback("computed_title", &closureComputedTitle);
-            class.bindTemplateCallback("notify_active_surface", &propActiveSurface);
-            class.bindTemplateCallback("notify_tree", &propSplitTree);
 
-            // Signals
-            signals.@"close-request".impl.register(.{});
-
-            // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
             gobject.Object.virtual_methods.finalize.implement(class, &finalize);
         }

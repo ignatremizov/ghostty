@@ -1,0 +1,20 @@
+using Gtk 4.0;
+
+template $GhosttyWorkspacePage: Box {
+  styles [
+    "workspace-page",
+  ]
+
+  orientation: vertical;
+  hexpand: true;
+  vexpand: true;
+  title: bind $computed_title(template.config, template.surface-title, template.title-override, split_tree.is-zoomed, split_tree.active-surface as <$GhosttySurface>.bell-ringing) as <string>;
+  sidebar-title: bind $computed_sidebar_title(split_tree.active-surface as <$GhosttySurface>.workspace-title, template.title-override) as <string>;
+  sidebar-subtitle: bind split_tree.active-surface as <$GhosttySurface>.workspace-subtitle;
+  tooltip: bind split_tree.active-surface as <$GhosttySurface>.pwd;
+
+  $GhosttySplitTree split_tree {
+    notify::active-surface => $notify_active_surface();
+    notify::tree => $notify_tree();
+  }
+}

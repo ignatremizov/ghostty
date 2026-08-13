@@ -83,6 +83,11 @@ const log = std.log.scoped(.generic_renderer);
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
+        const can_replay_presented_frame =
+            !(if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
+                apprt.App.must_draw_from_app_thread
+            else
+                false);
 
         pub const API = GraphicsAPI;
 
@@ -203,6 +208,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
+
+        /// True once we've successfully presented at least one frame. Used to
+        /// safely re-present the last target during synchronous resize callbacks
+        /// without risking an initial blank window.
+        has_presented: std.atomic.Value(bool) = .{ .raw = false },
 
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
@@ -1007,9 +1017,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (comptime DisplayLink == void) return;
             const display_link = self.display_link orelse return;
             log.info("updating display link display id={}", .{id});
+            const was_running = display_link.isRunning();
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
+                return;
             };
+
+            // CVDisplayLink can silently "run" without ever delivering callbacks if it
+            // was started before a valid current display was set. Restarting it after
+            // we successfully set the display fixes the stuck-vsync-no-frames state.
+            if (was_running and self.focused) {
+                display_link.stop() catch {};
+                display_link.start() catch {};
+            }
         }
 
         /// True if our renderer has animations so that a higher frequency
@@ -1471,6 +1491,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
 
+            // On macOS, CoreAnimation can synchronously request a display during bounds changes.
+            // If we resize our render target and present a freshly cleared surface before the IO
+            // thread delivers the new terminal state/cell buffers, we can show a single-frame
+            // blank flash. To avoid this, satisfy the synchronous display by re-presenting the
+            // last completed frame and let the normal render loop catch up on the next tick.
+            //
+            // We must not do this for runtimes that require all drawing from the app thread
+            // (GTK/GLArea). Those runtimes only ever reach us through `drawFrame(true)`, so
+            // replaying the previous target here would prevent `self.size.screen` from ever
+            // advancing to the new surface size and can leave stale framebuffers visible after
+            // resizes and split changes.
+            if (comptime can_replay_presented_frame) {
+                if (sync and
+                    size_changed and
+                    self.has_presented.load(.monotonic))
+                {
+                    try self.api.presentLastTarget();
+                    return;
+                }
+            }
+
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
             const needs_redraw =
@@ -1486,6 +1527,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 try self.api.presentLastTarget();
                 return;
             }
+
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.
@@ -1738,6 +1780,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Always release our semaphore
             self.swap_chain.releaseFrame();
+
+            if (comptime can_replay_presented_frame) {
+                // Track that we have a last good frame to re-present during sync resize callbacks.
+                if (health == .healthy and
+                    !self.has_presented.load(.monotonic))
+                {
+                    self.has_presented.store(true, .monotonic);
+                }
+            }
         }
 
         /// Call this any time the background image path changes.
@@ -1912,6 +1963,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // And indicate that our swap chain targets need to
                 // be re-created to account for the new blending mode.
                 self.target_config_modified +%= 1;
+            }
+
+            if (@hasField(GraphicsAPI, "background")) {
+                self.api.background = config.background;
+            }
+            if (@hasField(GraphicsAPI, "background_opacity")) {
+                self.api.background_opacity = config.background_opacity;
             }
 
             if (custom_shaders_changed) {

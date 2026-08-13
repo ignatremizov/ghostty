@@ -391,6 +391,11 @@ fn drainMailbox(self: *Thread) !void {
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
 
+                // Vsync-backed renderers can skip timer-driven draws, so force
+                // one frame when becoming visible to avoid a stale/blank window
+                // until the next display-link callback arrives.
+                if (v and self.renderer.hasVsync()) self.drawFrame(true);
+
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
                 // little resource cost and properly maintaining their active

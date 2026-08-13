@@ -78,6 +78,9 @@ pub const TitleDialog = extern struct {
         /// The initial value of the entry field.
         initial_value: ?[:0]const u8 = null,
 
+        /// Deferred focus/select timer after present().
+        focus_timeout_id: ?c_uint = null,
+
         // Template bindings
         target: Target,
         entry: *gtk.Entry,
@@ -125,6 +128,25 @@ pub const TitleDialog = extern struct {
             alertDialogReady,
             self,
         );
+
+        _ = self.ref();
+        const focus_timeout_id = glib.timeoutAdd(1, grabInitialFocus, self);
+        if (focus_timeout_id == 0) {
+            self.unref();
+        } else {
+            priv.focus_timeout_id = focus_timeout_id;
+        }
+    }
+
+    fn grabInitialFocus(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        self.private().focus_timeout_id = null;
+        defer self.unref();
+
+        const entry = self.private().entry;
+        _ = entry.as(gtk.Widget).grabFocus();
+        entry.as(gtk.Editable).selectRegion(0, -1);
+        return 0;
     }
 
     fn alertDialogReady(
@@ -149,6 +171,13 @@ pub const TitleDialog = extern struct {
     }
 
     fn dispose(self: *Self) callconv(.c) void {
+        const priv = self.private();
+        if (priv.focus_timeout_id) |source| {
+            _ = glib.Source.remove(source);
+            priv.focus_timeout_id = null;
+            self.unref();
+        }
+
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
             getGObjectType(),
@@ -220,10 +249,12 @@ pub const TitleDialog = extern struct {
 pub const Target = enum(c_int) {
     surface,
     tab,
+    workspace,
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .surface => i18n._("Change Terminal Title"),
             .tab => i18n._("Change Tab Title"),
+            .workspace => i18n._("Rename Workspace"),
         };
     }
 

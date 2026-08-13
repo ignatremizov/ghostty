@@ -88,6 +88,10 @@ renderer: Renderer,
 /// The render state
 renderer_state: rendererpkg.State,
 
+/// Monotonic counter incremented whenever PTY output may have changed the
+/// terminal buffer or scrollback.
+scrollback_generation: std.atomic.Value(u64),
+
 /// The renderer thread manager
 renderer_thread: rendererpkg.Thread,
 
@@ -339,6 +343,7 @@ const DerivedConfig = struct {
     notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
+    persisted_scrollback_limit: usize,
     key_remaps: input.KeyRemapSet,
 
     const Link = struct {
@@ -418,6 +423,7 @@ const DerivedConfig = struct {
             .notify_on_command_finish = config.@"notify-on-command-finish",
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
+            .persisted_scrollback_limit = config.@"persisted-scrollback-limit",
             .key_remaps = try config.@"key-remap".clone(alloc),
 
             // Assignments happen sequentially so we have to do this last
@@ -461,6 +467,10 @@ const DerivedConfig = struct {
 /// Create a new surface. This must be called from the main thread. The
 /// pointer to the memory for the surface must be provided and must be
 /// stable due to interfacing with various callbacks.
+pub const InitOptions = struct {
+    initial_scrollback_file: ?std.Io.File = null,
+};
+
 pub fn init(
     self: *Surface,
     alloc: Allocator,
@@ -468,7 +478,11 @@ pub fn init(
     app: *App,
     rt_app: *apprt.runtime.App,
     rt_surface: *apprt.runtime.Surface,
+    opts: InitOptions,
 ) !void {
+    var initial_scrollback_file = opts.initial_scrollback_file;
+    errdefer if (initial_scrollback_file) |file| file.close(global.io());
+
     // Apply our conditional state. If we fail to apply the conditional state
     // then we log and attempt to move forward with the old config.
     var config_: ?configpkg.Config = config_original.changeConditionalState(
@@ -488,6 +502,11 @@ pub fn init(
         c.@"working-directory" = config_original.@"working-directory";
         break :config c;
     } else config_original;
+
+    if (config.@"persisted-scrollback-limit" == 0) {
+        if (initial_scrollback_file) |file| file.close(global.io());
+        initial_scrollback_file = null;
+    }
 
     // Get our configuration
     var derived_config = try DerivedConfig.init(alloc, config);
@@ -608,6 +627,7 @@ pub fn init(
             .mutex = mutex,
             .terminal = &self.io.terminal,
         },
+        .scrollback_generation = .init(0),
         .renderer_thr = undefined,
         .mouse = .{},
         .keyboard = .{},
@@ -672,17 +692,25 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        var termio_config = try termio.Termio.DerivedConfig.init(alloc, config);
+        var termio_config_owned = false;
+        errdefer if (!termio_config_owned) termio_config.deinit();
+
+        const termio_initial_scrollback_file = initial_scrollback_file;
+        initial_scrollback_file = null;
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .config = termio_config,
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .initial_scrollback_file = termio_initial_scrollback_file,
         });
+        termio_config_owned = true;
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
@@ -1749,6 +1777,8 @@ pub fn updateConfig(
     const config: *const configpkg.Config = if (config_) |*c| c else original;
 
     // Update our new derived config immediately
+    const old_persisted_scrollback_limit =
+        self.config.persisted_scrollback_limit;
     const derived = DerivedConfig.init(self.alloc, config) catch |err| {
         // If the derivation fails then we just log and return. We don't
         // hard fail in this case because we don't want to error the surface
@@ -1758,6 +1788,11 @@ pub fn updateConfig(
     };
     self.config.deinit();
     self.config = derived;
+    if (old_persisted_scrollback_limit !=
+        self.config.persisted_scrollback_limit)
+    {
+        _ = self.markScrollbackChanged();
+    }
 
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
@@ -2057,6 +2092,14 @@ pub fn hasSelection(self: *const Surface) bool {
     return self.io.terminal.screens.active.selection != null;
 }
 
+pub fn markScrollbackChanged(self: *Surface) u64 {
+    return self.scrollback_generation.fetchAdd(1, .monotonic) + 1;
+}
+
+pub fn scrollbackGeneration(self: *const Surface) u64 {
+    return self.scrollback_generation.load(.monotonic);
+}
+
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -2087,12 +2130,17 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     var expandhome_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const expanded = internal_os.expandHome(path, &expandhome_buf) catch path;
+    var env = global.environMap() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer env.deinit();
+    const expanded = internal_os.expandHome(&env, path, &expandhome_buf) catch path;
 
     if (std.fs.path.isAbsolute(expanded)) {
         if (std.mem.eql(u8, expanded, path)) return null;
 
-        std.fs.accessAbsolute(expanded, .{}) catch {
+        std.Io.Dir.accessAbsolute(global.io(), expanded, .{}) catch {
             return null;
         };
 
@@ -2140,6 +2188,17 @@ test "Surface: opening path expands tilde before pwd resolution" {
         .windows, .ios => try testing.expectEqualStrings(path, expanded),
         else => @compileError("unimplemented"),
     }
+}
+
+test "Surface: scrollback generation increments when marked changed" {
+    const testing = std.testing;
+
+    var surface: Surface = undefined;
+    surface.scrollback_generation = .init(0);
+
+    try testing.expectEqual(@as(u64, 0), surface.scrollbackGeneration());
+    try testing.expectEqual(@as(u64, 1), surface.markScrollbackChanged());
+    try testing.expectEqual(@as(u64, 1), surface.scrollbackGeneration());
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
@@ -2540,15 +2599,29 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
+    // Resizes can arrive during UI/layout transitions where the surface is momentarily
+    // too small to fit even a single terminal cell. Rendering at a 0xN or Nx0 grid
+    // produces a transient "blank" frame. Keep the last valid size until we have
+    // a usable grid again.
+    const prev_size = self.size;
+
     // Save our screen size
     self.size.screen = size;
     self.balancePaddingIfNeeded();
 
     // Recalculate our grid size. Because Ghostty supports fluid resizing,
     // its possible the grid doesn't change at all even if the screen size changes.
-    // We have to update the IO thread no matter what because we send
-    // pixel-level sizing to the subprocess.
+    // Once we still have a usable grid we update the IO thread even when only
+    // the pixel size changed, because we send pixel-level sizing to the
+    // subprocess. If the surface is temporarily too small for any cells, keep
+    // the last valid size and defer the IO-thread resize until a usable grid
+    // returns so we don't thrash the terminal/renderer through a transient
+    // 0xN or Nx0 layout state.
     const grid_size = self.size.grid();
+    if (grid_size.columns == 0 or grid_size.rows == 0) {
+        self.size = prev_size;
+        return;
+    }
     if (grid_size.columns < 5 and (self.size.padding.left > 0 or self.size.padding.right > 0)) {
         log.warn("WARNING: very small terminal grid detected with padding " ++
             "set. Is your padding reasonable?", .{});
@@ -4948,6 +5021,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.terminal.fullReset();
+            _ = self.markScrollbackChanged();
         },
 
         .start_search => {
@@ -5716,6 +5790,735 @@ const WriteScreenLoc = enum {
     history, // History (scrollback)
     selection, // Selected text
 };
+
+pub const ScrollbackWriteResult = struct {
+    generation: u64,
+    bytes: usize,
+};
+
+pub fn persistedScrollbackLimit(self: *const Surface) usize {
+    return self.config.persisted_scrollback_limit;
+}
+
+pub fn writeScrollbackFile(
+    self: *Surface,
+    dir: std.Io.Dir,
+    filename: []const u8,
+    max_bytes: usize,
+) !ScrollbackWriteResult {
+    return self.writeScrollbackFileWithLimit(
+        dir,
+        filename,
+        max_bytes,
+        self.config.persisted_scrollback_limit,
+    );
+}
+
+pub fn writeScrollbackFileWithLimit(
+    self: *Surface,
+    dir: std.Io.Dir,
+    filename: []const u8,
+    max_bytes: usize,
+    persisted_scrollback_limit: usize,
+) !ScrollbackWriteResult {
+    if (std.mem.indexOfScalar(u8, filename, 0) != null or
+        std.mem.indexOfScalar(u8, filename, '/') != null or
+        std.mem.indexOfScalar(u8, filename, '\\') != null)
+    {
+        return error.InvalidScrollbackPath;
+    }
+
+    const effective_max = @min(max_bytes, persisted_scrollback_limit);
+    if (effective_max == 0) return error.NoScrollback;
+
+    var scrollback_writer = CappedScrollbackWriter.init(
+        self.alloc,
+        effective_max,
+    );
+    defer scrollback_writer.deinit();
+    var saved_generation: u64 = 0;
+    var saved_colors: SavedScrollbackDefaultColors = undefined;
+    var saved_palette: @TypeOf(self.io.terminal.colors.palette.current) = undefined;
+
+    var clone_rows: usize = 0;
+    var saved_snapshot: SavedScrollbackSnapshot = snapshot: while (true) {
+        var candidate = candidate: {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+
+            const on_alt = self.io.terminal.screens.active_key == .alternate;
+            const screen = if (on_alt)
+                self.io.terminal.screens.get(.primary) orelse return error.NoScrollback
+            else
+                self.io.terminal.screens.active;
+            if (clone_rows == 0) {
+                clone_rows = savedScrollbackInitialCloneRows(
+                    screen.pages.rows,
+                    screen.pages.cols,
+                    effective_max,
+                );
+            }
+            const region = savedScrollbackCloneRegion(&screen.pages, clone_rows);
+            saved_generation = self.scrollbackGeneration();
+            saved_colors = savedScrollbackDefaultColors(
+                self.io.terminal.colors.background.get(),
+                self.io.terminal.colors.foreground.get(),
+                self.io.terminal.modes.get(.reverse_colors),
+            );
+            saved_palette = self.io.terminal.colors.palette.current;
+            break :candidate .{
+                .screen = try screen.clone(
+                    global.io(),
+                    self.alloc,
+                    region.top,
+                    null,
+                ),
+                .reached_top = region.reached_top,
+            };
+        };
+
+        if (candidate.reached_top) {
+            break :snapshot .{
+                .screen = candidate.screen,
+                .full_selection_fits = null,
+            };
+        }
+
+        const full_selection_fits = try savedScrollbackScreenFits(
+            &candidate.screen,
+            saved_colors,
+            &saved_palette,
+            effective_max,
+        );
+        if (full_selection_fits) {
+            const next_clone_rows = std.math.mul(
+                usize,
+                clone_rows,
+                2,
+            ) catch break :snapshot .{
+                .screen = candidate.screen,
+                .full_selection_fits = true,
+            };
+            candidate.screen.deinit();
+            clone_rows = next_clone_rows;
+            continue;
+        }
+
+        break :snapshot .{
+            .screen = candidate.screen,
+            .full_selection_fits = false,
+        };
+    };
+    defer saved_snapshot.screen.deinit();
+
+    formatSavedScrollbackTail(
+        self.alloc,
+        &saved_snapshot.screen,
+        saved_colors,
+        &saved_palette,
+        effective_max,
+        saved_snapshot.full_selection_fits,
+        &scrollback_writer.writer,
+    ) catch |err| {
+        if (err == error.WriteFailed and scrollback_writer.too_large) {
+            return error.SavedScrollbackTooLarge;
+        }
+        return err;
+    };
+
+    const scrollback_data = scrollback_writer.written();
+    if (scrollback_data.len == 0) return error.NoScrollback;
+
+    var write_buf: [4096]u8 = undefined;
+    var atomic_file = try dir.createFileAtomic(global.io(), filename, .{
+        .permissions = .fromMode(0o600),
+        .replace = true,
+    });
+    defer atomic_file.deinit(global.io());
+    var file_writer = atomic_file.file.writer(global.io(), &write_buf);
+
+    try file_writer.interface.writeAll(scrollback_data);
+    try file_writer.flush();
+    try atomic_file.file.sync(global.io());
+    try atomic_file.replace(global.io());
+    try syncDirectory(dir);
+    return .{
+        .generation = saved_generation,
+        .bytes = scrollback_data.len,
+    };
+}
+
+const saved_scrollback_reset = "\x1b[0m";
+
+const SavedScrollbackSnapshot = struct {
+    screen: terminal.Screen,
+    full_selection_fits: ?bool,
+};
+
+const SavedScrollbackCloneRegion = struct {
+    top: terminal.Point,
+    reached_top: bool,
+};
+
+const saved_scrollback_initial_clone_rows_max = 50_000;
+
+fn savedScrollbackInitialCloneRows(
+    screen_rows: usize,
+    cols: usize,
+    max_bytes: usize,
+) usize {
+    return @max(
+        screen_rows,
+        @min(
+            saved_scrollback_initial_clone_rows_max,
+            @max(1, max_bytes / @max(1, cols)),
+        ),
+    );
+}
+
+fn savedScrollbackCloneRegion(
+    pages: *const terminal.PageList,
+    max_rows: usize,
+) SavedScrollbackCloneRegion {
+    const bottom = pages.getBottomRight(.screen) orelse return .{
+        .top = .{ .screen = .{} },
+        .reached_top = true,
+    };
+    var top = bottom;
+    var rows = bottom.rowIterator(.left_up, null);
+    var count: usize = 0;
+    while (count < max_rows) : (count += 1) {
+        top = rows.next() orelse return .{
+            .top = pages.pointFromPin(.screen, top).?,
+            .reached_top = true,
+        };
+    }
+
+    return .{
+        .top = pages.pointFromPin(.screen, top).?,
+        .reached_top = rows.next() == null,
+    };
+}
+
+fn savedScrollbackScreenFits(
+    screen: *const terminal.Screen,
+    colors: SavedScrollbackDefaultColors,
+    palette: *const terminal.color.Palette,
+    max_bytes: usize,
+) std.Io.Writer.Error!bool {
+    const pages = &screen.pages;
+    const bottom = pages.getBottomRight(.screen) orelse return true;
+    return savedScrollbackSelectionFits(
+        screen,
+        pages.getTopLeft(.history),
+        bottom,
+        colors,
+        palette,
+        max_bytes,
+    );
+}
+
+fn formatSavedScrollbackTail(
+    alloc: Allocator,
+    screen: *const terminal.Screen,
+    colors: SavedScrollbackDefaultColors,
+    palette: *const terminal.color.Palette,
+    max_bytes: usize,
+    full_selection_fits: ?bool,
+    writer: *std.Io.Writer,
+) (Allocator.Error || std.Io.Writer.Error || error{SavedScrollbackTooLarge})!void {
+    const pages = &screen.pages;
+    const top = pages.getTopLeft(.history);
+    const bottom = pages.getBottomRight(.screen) orelse return;
+
+    var row_starts: std.ArrayList(terminal.PageList.Pin) = .empty;
+    defer row_starts.deinit(alloc);
+    var rows = top.rowIterator(.right_down, bottom);
+    while (rows.next()) |row| try row_starts.append(alloc, row);
+    if (row_starts.items.len == 0) return;
+
+    var start_index: usize = 0;
+    const selection_fits = full_selection_fits orelse
+        try savedScrollbackSelectionFits(
+            screen,
+            row_starts.items[0],
+            bottom,
+            colors,
+            palette,
+            max_bytes,
+        );
+    if (!selection_fits) {
+        var low: usize = 1;
+        var high = row_starts.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (try savedScrollbackSelectionFits(
+                screen,
+                row_starts.items[mid],
+                bottom,
+                colors,
+                palette,
+                max_bytes,
+            )) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        if (low == row_starts.items.len) {
+            return error.SavedScrollbackTooLarge;
+        }
+        start_index = low;
+    }
+
+    try formatSavedScrollbackSelection(
+        screen,
+        row_starts.items[start_index],
+        bottom,
+        colors,
+        palette,
+        writer,
+    );
+}
+
+fn savedScrollbackSelectionFits(
+    screen: *const terminal.Screen,
+    start: terminal.PageList.Pin,
+    end: terminal.PageList.Pin,
+    colors: SavedScrollbackDefaultColors,
+    palette: *const terminal.color.Palette,
+    max_bytes: usize,
+) std.Io.Writer.Error!bool {
+    var counter = LimitedScrollbackCountingWriter.init(max_bytes);
+    formatSavedScrollbackSelection(
+        screen,
+        start,
+        end,
+        colors,
+        palette,
+        &counter.writer,
+    ) catch |err| {
+        if (err == error.WriteFailed and counter.too_large) return false;
+        return err;
+    };
+    return true;
+}
+
+fn formatSavedScrollbackSelection(
+    screen: *const terminal.Screen,
+    start: terminal.PageList.Pin,
+    end: terminal.PageList.Pin,
+    colors: SavedScrollbackDefaultColors,
+    palette: *const terminal.color.Palette,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try writeSavedScrollbackColorPreamble(writer, colors);
+    try writer.writeAll(saved_scrollback_reset);
+
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, .{
+        .emit = .vt,
+        .unwrap = true,
+        .trim = false,
+        .palette = palette,
+    });
+    formatter.content = .{ .selection = terminal.Selection.init(
+        start,
+        end,
+        false,
+    ) };
+    try formatter.format(writer);
+}
+
+fn writeSavedScrollbackColorPreamble(
+    writer: *std.Io.Writer,
+    colors: SavedScrollbackDefaultColors,
+) std.Io.Writer.Error!void {
+    if (colors.foreground) |fg| {
+        try writer.print(
+            "\x1b]10;rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\",
+            .{ fg.r, fg.g, fg.b },
+        );
+    }
+    if (colors.background) |bg| {
+        try writer.print(
+            "\x1b]11;rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\",
+            .{ bg.r, bg.g, bg.b },
+        );
+    }
+}
+
+const SavedScrollbackDefaultColors = struct {
+    background: ?terminal.color.RGB,
+    foreground: ?terminal.color.RGB,
+};
+
+fn savedScrollbackDefaultColors(
+    background: ?terminal.color.RGB,
+    foreground: ?terminal.color.RGB,
+    reverse: bool,
+) SavedScrollbackDefaultColors {
+    if (reverse and background != null and foreground != null) {
+        return .{
+            .background = foreground,
+            .foreground = background,
+        };
+    }
+
+    return .{
+        .background = background,
+        .foreground = foreground,
+    };
+}
+
+const CappedScrollbackWriter = struct {
+    const Self = @This();
+
+    alloc: Allocator,
+    max: usize,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+    too_large: bool = false,
+    writer: std.Io.Writer,
+
+    fn init(alloc: Allocator, max: usize) Self {
+        return .{
+            .alloc = alloc,
+            .max = max,
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &vtable,
+            },
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.data.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn written(self: *Self) []const u8 {
+        return self.data.items;
+    }
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .sendFile = sendFile,
+        .flush = flush,
+        .rebase = rebase,
+    };
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *Self = @fieldParentPtr("writer", writer);
+        const pattern = data[data.len - 1];
+
+        var append_len: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            append_len = std.math.add(usize, append_len, bytes.len) catch {
+                self.too_large = true;
+                return error.WriteFailed;
+            };
+        }
+        const splat_len = std.math.mul(usize, pattern.len, splat) catch {
+            self.too_large = true;
+            return error.WriteFailed;
+        };
+        append_len = std.math.add(usize, append_len, splat_len) catch {
+            self.too_large = true;
+            return error.WriteFailed;
+        };
+        if (append_len > self.max or self.data.items.len > self.max - append_len) {
+            self.too_large = true;
+            return error.WriteFailed;
+        }
+
+        self.data.ensureUnusedCapacity(self.alloc, append_len) catch return error.WriteFailed;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.data.appendSliceAssumeCapacity(bytes);
+        }
+        if (pattern.len == 1) {
+            self.data.appendNTimesAssumeCapacity(pattern[0], splat);
+        } else {
+            for (0..splat) |_| self.data.appendSliceAssumeCapacity(pattern);
+        }
+        return append_len;
+    }
+
+    fn sendFile(
+        _: *std.Io.Writer,
+        _: *std.Io.File.Reader,
+        _: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        return error.Unimplemented;
+    }
+
+    fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {}
+
+    fn rebase(
+        _: *std.Io.Writer,
+        _: usize,
+        _: usize,
+    ) std.Io.Writer.Error!void {
+        return error.WriteFailed;
+    }
+};
+
+const LimitedScrollbackCountingWriter = struct {
+    const Self = @This();
+
+    max: usize,
+    count: usize = 0,
+    too_large: bool = false,
+    writer: std.Io.Writer,
+
+    fn init(max: usize) Self {
+        return .{
+            .max = max,
+            .writer = .{
+                .buffer = &.{},
+                .vtable = &vtable,
+            },
+        };
+    }
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .sendFile = sendFile,
+        .flush = flush,
+        .rebase = rebase,
+    };
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *Self = @fieldParentPtr("writer", writer);
+        const pattern = data[data.len - 1];
+        var added: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            added = std.math.add(usize, added, bytes.len) catch {
+                self.too_large = true;
+                return error.WriteFailed;
+            };
+        }
+        const repeated = std.math.mul(usize, pattern.len, splat) catch {
+            self.too_large = true;
+            return error.WriteFailed;
+        };
+        added = std.math.add(usize, added, repeated) catch {
+            self.too_large = true;
+            return error.WriteFailed;
+        };
+        if (added > self.max or self.count > self.max - added) {
+            self.too_large = true;
+            return error.WriteFailed;
+        }
+        self.count += added;
+        return added;
+    }
+
+    fn sendFile(
+        _: *std.Io.Writer,
+        _: *std.Io.File.Reader,
+        _: std.Io.Limit,
+    ) std.Io.Writer.FileError!usize {
+        return error.Unimplemented;
+    }
+
+    fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {}
+
+    fn rebase(
+        _: *std.Io.Writer,
+        _: usize,
+        _: usize,
+    ) std.Io.Writer.Error!void {
+        return error.WriteFailed;
+    }
+};
+
+test "Surface: capped scrollback writer rejects oversized output" {
+    const testing = std.testing;
+
+    var writer = CappedScrollbackWriter.init(testing.allocator, 5);
+    defer writer.deinit();
+
+    try writer.writer.writeAll("hello");
+    try testing.expectEqualStrings("hello", writer.written());
+    try testing.expectError(error.WriteFailed, writer.writer.writeAll("!"));
+    try testing.expect(writer.too_large);
+}
+
+test "Surface: saved scrollback colors bake reverse video" {
+    const testing = std.testing;
+    const background: terminal.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const foreground: terminal.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+
+    const normal = savedScrollbackDefaultColors(background, foreground, false);
+    try testing.expectEqual(background, normal.background.?);
+    try testing.expectEqual(foreground, normal.foreground.?);
+
+    const reversed = savedScrollbackDefaultColors(background, foreground, true);
+    try testing.expectEqual(foreground, reversed.background.?);
+    try testing.expectEqual(background, reversed.foreground.?);
+}
+
+test "Surface: saved scrollback initial clone rows are bounded" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        @as(usize, 2_560),
+        savedScrollbackInitialCloneRows(40, 100, 256_000),
+    );
+    try testing.expectEqual(
+        @as(usize, saved_scrollback_initial_clone_rows_max),
+        savedScrollbackInitialCloneRows(40, 100, 256 * 1024 * 1024),
+    );
+    try testing.expectEqual(
+        @as(usize, saved_scrollback_initial_clone_rows_max + 1),
+        savedScrollbackInitialCloneRows(
+            saved_scrollback_initial_clone_rows_max + 1,
+            0,
+            1,
+        ),
+    );
+}
+
+test "Surface: saved scrollback retains newest complete rows within limit" {
+    const testing = std.testing;
+
+    var term = try terminal.Terminal.init(testing.io, testing.allocator, .{
+        .cols = 8,
+        .rows = 2,
+        .max_scrollback_bytes = 1024,
+    });
+    defer term.deinit(testing.allocator);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("old1\r\nold2\r\nnew3\r\nnew4");
+
+    const screen = term.screens.active;
+    const colors = savedScrollbackDefaultColors(null, null, false);
+
+    var two_rows = CappedScrollbackWriter.init(testing.allocator, 18);
+    defer two_rows.deinit();
+    try formatSavedScrollbackTail(
+        testing.allocator,
+        screen,
+        colors,
+        &term.colors.palette.current,
+        18,
+        null,
+        &two_rows.writer,
+    );
+    try testing.expectEqualStrings(
+        "\x1b[0mnew3\r\nnew4",
+        two_rows.written(),
+    );
+
+    var one_row = CappedScrollbackWriter.init(testing.allocator, 8);
+    defer one_row.deinit();
+    try formatSavedScrollbackTail(
+        testing.allocator,
+        screen,
+        colors,
+        &term.colors.palette.current,
+        8,
+        null,
+        &one_row.writer,
+    );
+    try testing.expectEqualStrings("\x1b[0mnew4", one_row.written());
+
+    var too_small = CappedScrollbackWriter.init(testing.allocator, 7);
+    defer too_small.deinit();
+    try testing.expectError(
+        error.SavedScrollbackTooLarge,
+        formatSavedScrollbackTail(
+            testing.allocator,
+            screen,
+            colors,
+            &term.colors.palette.current,
+            7,
+            null,
+            &too_small.writer,
+        ),
+    );
+}
+
+test "Surface: saved scrollback limit ignores trailing blank screen rows" {
+    const testing = std.testing;
+
+    var term = try terminal.Terminal.init(testing.io, testing.allocator, .{
+        .cols = 8,
+        .rows = 4,
+        .max_scrollback_bytes = 1024,
+    });
+    defer term.deinit(testing.allocator);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("kept");
+
+    var output = CappedScrollbackWriter.init(testing.allocator, 8);
+    defer output.deinit();
+    try formatSavedScrollbackTail(
+        testing.allocator,
+        term.screens.active,
+        savedScrollbackDefaultColors(null, null, false),
+        &term.colors.palette.current,
+        8,
+        null,
+        &output.writer,
+    );
+    try testing.expectEqualStrings("\x1b[0mkept", output.written());
+}
+
+test "Surface: saved scrollback serializes wrapped wide glyph once" {
+    const testing = std.testing;
+
+    var term = try terminal.Terminal.init(testing.io, testing.allocator, .{
+        .cols = 3,
+        .rows = 2,
+        .max_scrollback_bytes = 1024,
+    });
+    defer term.deinit(testing.allocator);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("1A⚡");
+
+    var output = CappedScrollbackWriter.init(testing.allocator, 1024);
+    defer output.deinit();
+    try formatSavedScrollbackTail(
+        testing.allocator,
+        term.screens.active,
+        savedScrollbackDefaultColors(null, null, false),
+        &term.colors.palette.current,
+        1024,
+        null,
+        &output.writer,
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, output.written(), "⚡"),
+    );
+}
+
+fn syncDirectory(dir: std.Io.Dir) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    const rc = std.posix.system.fsync(dir.handle);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return,
+        .BADF, .INVAL, .ROFS, .OPNOTSUPP => return,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
 
 fn writeScreenFile(
     self: *Surface,

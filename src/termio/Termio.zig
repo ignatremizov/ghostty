@@ -12,6 +12,7 @@ const EnvMap = std.process.Environ.Map;
 const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
+const stream_terminal = @import("../terminal/stream_terminal.zig");
 const terminalpkg = @import("../terminal/main.zig");
 const global = @import("../global.zig");
 const xev = global.xev;
@@ -24,6 +25,8 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_file = @import("../lib/compat/file.zig");
 
 const log = std.log.scoped(.io_exec);
+pub const max_saved_scrollback_replay_bytes =
+    configpkg.Config.max_persisted_scrollback_bytes;
 
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
@@ -72,6 +75,9 @@ last_cursor_reset: ?std.Io.Timestamp = null,
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
+
+/// VT-formatted scrollback file to replay before the backend starts.
+initial_scrollback_file: ?std.Io.File = null,
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -170,6 +176,7 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    persisted_scrollback_limit: usize,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -206,6 +213,7 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .persisted_scrollback_limit = config.@"persisted-scrollback-limit",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -218,11 +226,23 @@ pub const DerivedConfig = struct {
     }
 };
 
+fn scrollbackFormatConfigChanged(
+    old: *const DerivedConfig,
+    new: *const DerivedConfig,
+) bool {
+    return !std.meta.eql(old.palette, new.palette) or
+        !std.meta.eql(old.foreground, new.foreground) or
+        !std.meta.eql(old.background, new.background);
+}
+
 /// Initialize the termio state.
 ///
 /// This will also start the child process if the termio is configured
 /// to run a child process.
 pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
+    var initial_scrollback_file = opts.initial_scrollback_file;
+    errdefer if (initial_scrollback_file) |file| file.close(global.io());
+
     // The default terminal modes based on our config.
     const default_modes: terminalpkg.ModePacked = modes: {
         var modes: terminalpkg.ModePacked = .{};
@@ -295,6 +315,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         alloc,
         opts.full_config,
     );
+    errdefer if (thread_enter_state) |v| v.destroy();
 
     self.* = .{
         .alloc = alloc,
@@ -309,7 +330,9 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .mailbox = opts.mailbox,
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
+        .initial_scrollback_file = initial_scrollback_file,
     };
+    initial_scrollback_file = null;
 }
 
 pub fn deinit(self: *Termio) void {
@@ -323,6 +346,7 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
+    if (self.initial_scrollback_file) |file| file.close(global.io());
 }
 
 pub fn threadEnter(
@@ -352,6 +376,14 @@ pub fn threadEnter(
         .mailbox = &self.mailbox,
         .backend = undefined, // Backend must replace this on threadEnter
     };
+
+    if (self.initial_scrollback_file) |file| {
+        self.initial_scrollback_file = null;
+        defer file.close(global.io());
+        self.replayScrollback(file) catch |err| {
+            log.warn("failed to replay saved scrollback err={}", .{err});
+        };
+    }
 
     // Setup our backend
     try self.backend.threadEnter(self.alloc, self, data);
@@ -383,6 +415,87 @@ pub fn threadEnter(
 
 pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
+}
+
+pub fn replayScrollback(self: *Termio, file: std.Io.File) !void {
+    const replay_limit = @min(
+        self.config.persisted_scrollback_limit,
+        max_saved_scrollback_replay_bytes,
+    );
+    try validateReplayScrollbackFile(file, replay_limit);
+
+    // Saved scrollback is workspace-local file data. Replay it through the
+    // readonly terminal stream so it can rebuild terminal state without
+    // invoking clipboard, writeback, notification, or other host effects.
+    var replay_error: ?anyerror = null;
+    replay: {
+        var replay_stream: stream_terminal.Stream = .initAlloc(self.alloc, .{
+            .terminal = &self.terminal,
+            .allow_resource_protocols = false,
+            .saved_scrollback_replay = true,
+        });
+        defer replay_stream.deinit();
+
+        var buf: [64 * 1024]u8 = undefined;
+        var bytes_read: u64 = 0;
+        while (true) {
+            const n = file.readStreaming(global.io(), &.{&buf}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    replay_error = err;
+                    break :replay;
+                },
+            };
+            if (n == 0) continue;
+            bytes_read += @intCast(n);
+            if (bytes_read > replay_limit) {
+                replay_error = error.SavedScrollbackTooLarge;
+                break :replay;
+            }
+            {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                replay_stream.nextSlice(buf[0..n]);
+            }
+        }
+    }
+
+    self.normalizeSavedScrollbackReplay();
+    if (replay_error) |err| return err;
+    try self.renderer_wakeup.notify();
+}
+
+fn normalizeSavedScrollbackReplay(self: *Termio) void {
+    {
+        var normalization_stream: stream_terminal.Stream = .initAlloc(self.alloc, .{
+            .terminal = &self.terminal,
+        });
+        defer normalization_stream.deinit();
+
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        normalization_stream.nextSlice(
+            "\x1b[m" ++
+                "\x1b[?9l" ++
+                "\x1b[?1000l" ++
+                "\x1b[?1002l" ++
+                "\x1b[?1003l" ++
+                "\x1b[?1005l" ++
+                "\x1b[?1006l" ++
+                "\x1b[?1015l" ++
+                "\x1b[?1016l" ++
+                "\x1b[?2004l" ++
+                "\x1b[?25h" ++
+                "\r\n",
+        );
+        self.terminal.clearPreviousChar();
+    }
+}
+
+fn validateReplayScrollbackFile(file: std.Io.File, max_bytes: u64) !void {
+    const stat = try file.stat(global.io());
+    if (stat.kind != .file) return error.InvalidSavedScrollbackFile;
+    if (stat.size > max_bytes) return error.SavedScrollbackTooLarge;
 }
 
 /// Send a message to the mailbox. Depending on the mailbox type in use
@@ -427,6 +540,8 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
+    const scrollback_format_changed = scrollbackFormatConfigChanged(&self.config, config);
+
     // Deinit our old config. We do this in the lock because the
     // stream handler may be referencing the old config (i.e. enquiry resp)
     self.config.deinit();
@@ -455,6 +570,9 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         const color = config.cursor_color orelse break :cursor null;
         break :cursor color.toTerminalRGB() orelse break :cursor null;
     };
+    if (scrollback_format_changed) {
+        _ = self.surface_mailbox.surface.markScrollbackChanged();
+    }
 
     // Set the image limits
     try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
@@ -478,6 +596,9 @@ pub fn resize(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        const old_cols = self.terminal.cols;
+        const old_rows = self.terminal.rows;
+
         // Update the size of our terminal state
         try self.terminal.resize(
             self.alloc,
@@ -490,6 +611,9 @@ pub fn resize(
                 },
             },
         );
+        if (old_cols != grid_size.columns or old_rows != grid_size.rows) {
+            _ = self.surface_mailbox.surface.markScrollbackChanged();
+        }
 
         // If we have size reporting enabled we need to send a report.
         if (self.terminal.modes.get(.in_band_size_reports)) {
@@ -551,6 +675,8 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // knowledge of where the cursor is and causes rendering issues. So,
         // for alt screen, we do nothing.
         if (self.terminal.screens.active_key == .alternate) return;
+
+        _ = self.surface_mailbox.surface.markScrollbackChanged();
 
         // Clear our selection
         self.terminal.screens.active.clearSelection();
@@ -692,6 +818,13 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.nextSlice(buf);
     }
 
+    self.terminal_stream.handler.flushSynchronizedOutputWatchdog();
+
+    if (self.terminal_stream.handler.scrollback_dirty) {
+        self.terminal_stream.handler.scrollback_dirty = false;
+        _ = self.surface_mailbox.surface.markScrollbackChanged();
+    }
+
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
     if (self.terminal_stream.handler.termio_messaged) {
@@ -782,4 +915,68 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "scrollback format config changes track persisted color inputs" {
+    const testing = std.testing;
+
+    var base_config = try configpkg.Config.default(testing.allocator);
+    defer base_config.deinit();
+    var base = try DerivedConfig.init(testing.allocator, &base_config);
+    defer base.deinit();
+
+    var same_config = try configpkg.Config.default(testing.allocator);
+    defer same_config.deinit();
+    var same = try DerivedConfig.init(testing.allocator, &same_config);
+    defer same.deinit();
+    try testing.expect(!scrollbackFormatConfigChanged(&base, &same));
+
+    var image_only = try DerivedConfig.init(testing.allocator, &base_config);
+    defer image_only.deinit();
+    image_only.image_storage_limit += 1;
+    try testing.expect(!scrollbackFormatConfigChanged(&base, &image_only));
+
+    var foreground_config = try configpkg.Config.default(testing.allocator);
+    defer foreground_config.deinit();
+    foreground_config.foreground = .{ .r = 1, .g = 2, .b = 3 };
+    var foreground = try DerivedConfig.init(testing.allocator, &foreground_config);
+    defer foreground.deinit();
+    try testing.expect(scrollbackFormatConfigChanged(&base, &foreground));
+
+    var background_config = try configpkg.Config.default(testing.allocator);
+    defer background_config.deinit();
+    background_config.background = .{ .r = 1, .g = 2, .b = 3 };
+    var background = try DerivedConfig.init(testing.allocator, &background_config);
+    defer background.deinit();
+    try testing.expect(scrollbackFormatConfigChanged(&base, &background));
+
+    var palette_config = try configpkg.Config.default(testing.allocator);
+    defer palette_config.deinit();
+    palette_config.palette.value[1] = .{ .r = 1, .g = 2, .b = 3 };
+    var palette = try DerivedConfig.init(testing.allocator, &palette_config);
+    defer palette.deinit();
+    try testing.expect(scrollbackFormatConfigChanged(&base, &palette));
+}
+
+test "saved scrollback replay validates regular bounded files" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile(testing.io, "small.vt", .{ .read = true });
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, "hello\n");
+        try validateReplayScrollbackFile(file, 1024);
+    }
+    {
+        const file = try tmp.dir.createFile(testing.io, "large.vt", .{ .read = true });
+        defer file.close(testing.io);
+        try file.setLength(testing.io, 1025);
+        try testing.expectError(
+            error.SavedScrollbackTooLarge,
+            validateReplayScrollbackFile(file, 1024),
+        );
+    }
 }

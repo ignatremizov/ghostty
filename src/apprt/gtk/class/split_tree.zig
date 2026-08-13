@@ -9,6 +9,7 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
+const datastruct = @import("../../../datastruct/main.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
@@ -16,12 +17,20 @@ const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const Surface = @import("surface.zig").Surface;
-const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScrolledWindow;
+const SplitTabs = @import("split_tabs.zig").SplitTabs;
 
 const log = std.log.scoped(.gtk_ghostty_split_tree);
 
 pub const SplitTree = extern struct {
     const Self = @This();
+    const NewSplitOverrides = struct {
+        command: ?configpkg.Command = null,
+        working_directory: ?[:0]const u8 = null,
+        title: ?[:0]const u8 = null,
+        focus_new_surface: bool = true,
+
+        pub const none: @This() = .{};
+    };
     parent_instance: Parent,
     pub const Parent = gtk.Box;
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
@@ -98,7 +107,7 @@ pub const SplitTree = extern struct {
             const impl = gobject.ext.defineProperty(
                 name,
                 Self,
-                ?*Surface.Tree,
+                ?*SplitTabs.Tree,
                 .{
                     .accessor = .{
                         .getter = getTreeValue,
@@ -137,7 +146,29 @@ pub const SplitTree = extern struct {
             const impl = gobject.ext.defineSignal(
                 name,
                 Self,
-                &.{ ?*const Surface.Tree, ?*const Surface.Tree },
+                &.{ ?*const SplitTabs.Tree, ?*const SplitTabs.Tree },
+                void,
+            );
+        };
+
+        pub const @"surface-added" = struct {
+            pub const name = "surface-added";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{*Surface},
+                void,
+            );
+        };
+
+        pub const @"surface-removed" = struct {
+            pub const name = "surface-removed";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{*Surface},
                 void,
             );
         };
@@ -145,7 +176,8 @@ pub const SplitTree = extern struct {
 
     const Private = struct {
         /// The tree datastructure containing all of our surface views.
-        tree: ?*Surface.Tree,
+        tree: ?*SplitTabs.Tree,
+        action_group: ?*gio.SimpleActionGroup = null,
 
         // Template bindings
         tree_bin: *adw.Bin,
@@ -167,9 +199,15 @@ pub const SplitTree = extern struct {
 
         /// Used to store state about a pending surface close for the
         /// close dialog.
-        pending_close: ?Surface.Tree.Node.Handle,
+        pending_close: ?PendingClose = null,
+        pending_close_dialog: ?*CloseConfirmationDialog = null,
+        empty_leaf_cleanup_source: ?c_uint = null,
 
         pub var offset: c_int = 0;
+    };
+
+    const PendingClose = struct {
+        surface: *Surface,
     };
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
@@ -196,7 +234,7 @@ pub const SplitTree = extern struct {
             .init("close-split", actionCloseSplit, null),
         };
 
-        _ = ext.actions.addAsGroup(Self, self, "split-tree", &actions);
+        self.private().action_group = ext.actions.addAsGroup(Self, self, "split-tree", &actions);
     }
 
     fn bindSurfaceSplitState(self: *Self, surface: *Surface) void {
@@ -219,17 +257,29 @@ pub const SplitTree = extern struct {
     /// surface properties from anywhere.
     pub fn newSplit(
         self: *Self,
-        direction: Surface.Tree.Split.Direction,
+        direction: SplitTabs.Tree.Split.Direction,
         parent_: ?*Surface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
+        overrides: NewSplitOverrides,
     ) Allocator.Error!void {
+        _ = try self.newSplitAtSurface(
+            direction,
+            self.getActiveSurface(),
+            parent_,
+            overrides,
+        );
+    }
+
+    /// Create a new split relative to a specific anchor surface.
+    pub fn newSplitAtSurface(
+        self: *Self,
+        direction: SplitTabs.Tree.Split.Direction,
+        anchor: ?*Surface,
+        parent_: ?*Surface,
+        overrides: NewSplitOverrides,
+    ) Allocator.Error!*Surface {
         const alloc = Application.default().allocator();
+        const previous_last_focused = self.private().last_focused.get();
+        defer if (previous_last_focused) |v| v.unref();
 
         // Create our new surface.
         const surface: *Surface = .new(.{
@@ -251,25 +301,32 @@ pub const SplitTree = extern struct {
         self.bindSurfaceSplitState(surface);
 
         // Create our tree
-        var single_tree = try Surface.Tree.init(alloc, surface);
+        const split_tabs = SplitTabs.new(surface);
+        defer split_tabs.unref();
+        _ = split_tabs.refSink();
+
+        var single_tree = try SplitTabs.Tree.init(alloc, split_tabs);
         defer single_tree.deinit();
 
-        // We want to move our focus to the new surface no matter what.
-        // But we need to be careful to restore state if we fail.
-        const old_last_focused = self.private().last_focused.get();
-        defer if (old_last_focused) |v| v.unref(); // unref strong ref from get
-        self.private().last_focused.set(surface);
-        errdefer self.private().last_focused.set(old_last_focused);
+        // Interactive splits move focus to the new surface, but some control
+        // paths need to preserve the currently selected surface.
+        const next_last_focused = if (overrides.focus_new_surface)
+            surface
+        else
+            previous_last_focused;
+        self.private().last_focused.set(next_last_focused);
+        errdefer self.private().last_focused.set(previous_last_focused);
 
         // If we have no tree yet, then this becomes our tree and we're done.
         const old_tree = self.getTree() orelse {
             self.setTree(&single_tree);
-            return;
+            return surface;
         };
 
-        // The handle we create the split relative to. Today this is the active
-        // surface but this might be the handle of the given parent if we want.
-        const handle = self.getActiveSurfaceHandle() orelse .root;
+        const handle = if (anchor) |surface_anchor|
+            self.findSurfaceHandle(surface_anchor) orelse self.getActiveSurfaceHandle() orelse .root
+        else
+            self.getActiveSurfaceHandle() orelse .root;
 
         // Create our split!
         var new_tree = try old_tree.split(
@@ -287,18 +344,23 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+        return surface;
     }
 
     pub fn addExistingSurface(
         self: *Self,
-        direction: Surface.Tree.Split.Direction,
+        direction: SplitTabs.Tree.Split.Direction,
         surface: *Surface,
     ) Allocator.Error!void {
         const alloc = Application.default().allocator();
 
         self.bindSurfaceSplitState(surface);
 
-        var single_tree = try Surface.Tree.init(alloc, surface);
+        const split_tabs = SplitTabs.new(surface);
+        defer split_tabs.unref();
+        _ = split_tabs.refSink();
+
+        var single_tree = try SplitTabs.Tree.init(alloc, split_tabs);
         defer single_tree.deinit();
 
         const old_last_focused = self.private().last_focused.get();
@@ -323,9 +385,37 @@ pub const SplitTree = extern struct {
         self.setTree(&new_tree);
     }
 
+    pub fn newTab(
+        self: *Self,
+        parent_: ?*Surface,
+        overrides: struct {
+            command: ?configpkg.Command = null,
+            working_directory: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+
+            pub const none: @This() = .{};
+        },
+    ) Allocator.Error!void {
+        const tree = self.getTree() orelse {
+            try self.newSplit(.right, parent_, .{
+                .command = overrides.command,
+                .working_directory = overrides.working_directory,
+                .title = overrides.title,
+            });
+            return;
+        };
+        const handle = self.getActiveSurfaceHandle() orelse .root;
+        const leaf = tree.nodes[handle.idx()].leaf;
+        _ = try leaf.newTab(parent_, .{
+            .command = overrides.command,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        });
+    }
+
     pub fn resize(
         self: *Self,
-        direction: Surface.Tree.Split.Direction,
+        direction: SplitTabs.Tree.Split.Direction,
         amount: u16,
     ) Allocator.Error!bool {
         // Avoid useless work
@@ -352,7 +442,7 @@ pub const SplitTree = extern struct {
             .up => -(amount_f64 / height_f64),
         };
 
-        const layout: Surface.Tree.Split.Layout = switch (direction) {
+        const layout: SplitTabs.Tree.Split.Layout = switch (direction) {
             .left, .right => .horizontal,
             .up, .down => .vertical,
         };
@@ -370,7 +460,7 @@ pub const SplitTree = extern struct {
 
     /// Move focus from the currently focused surface to the given
     /// direction. Returns true if focus switched to a new surface.
-    pub fn goto(self: *Self, to: Surface.Tree.Goto) bool {
+    pub fn goto(self: *Self, to: SplitTabs.Tree.Goto) bool {
         const tree = self.getTree() orelse return false;
         const active = self.getActiveSurfaceHandle() orelse return false;
         const target = if (tree.goto(
@@ -390,7 +480,7 @@ pub const SplitTree = extern struct {
         if (active == target) return false;
 
         // Get the surface at the target location and grab focus.
-        const surface = tree.nodes[target.idx()].leaf;
+        const surface = tree.nodes[target.idx()].leaf.getActiveSurface() orelse return false;
         surface.grabFocus();
 
         // We also need to setup our last_focused to this because if we
@@ -425,13 +515,25 @@ pub const SplitTree = extern struct {
         return true;
     }
 
-    fn disconnectSurfaceHandlers(self: *Self) void {
+    fn disconnectSurfaceHandler(self: *Self, surface: *Surface) void {
+        _ = gobject.signalHandlersDisconnectMatched(
+            surface.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+    }
+
+    fn disconnectLeafHandlers(self: *Self) void {
         const tree = self.getTree() orelse return;
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
+            const leaf = entry.view;
             _ = gobject.signalHandlersDisconnectMatched(
-                surface.as(gobject.Object),
+                leaf.as(gobject.Object),
                 .{ .data = true },
                 0,
                 0,
@@ -442,32 +544,89 @@ pub const SplitTree = extern struct {
         }
     }
 
+    fn disconnectSurfaceHandlers(self: *Self) void {
+        const tree = self.getTree() orelse return;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                self.disconnectSurfaceHandler(surface);
+            }
+        }
+    }
+
+    fn clearSurfaceBindings(self: *Self) void {
+        const tree = self.getTree() orelse return;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                surface.setSplitBinding(null);
+            }
+        }
+    }
+
+    fn connectSurfaceHandler(self: *Self, surface: *Surface) void {
+        self.disconnectSurfaceHandler(surface);
+        _ = Surface.signals.@"close-request".connect(
+            surface,
+            *Self,
+            surfaceCloseRequest,
+            self,
+            .{},
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface,
+            *Self,
+            propSurfaceFocused,
+            self,
+            .{ .detail = "focused" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            surface,
+            *Self,
+            propSurfaceMapped,
+            self,
+            .{ .detail = "mapped" },
+        );
+    }
+
+    fn connectLeafHandlers(self: *Self) void {
+        const tree = self.getTree() orelse return;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            const leaf = entry.view;
+            _ = SplitTabs.signals.@"surface-added".connect(
+                leaf,
+                *Self,
+                leafSurfaceAdded,
+                self,
+                .{},
+            );
+            _ = SplitTabs.signals.@"surface-removed".connect(
+                leaf,
+                *Self,
+                leafSurfaceRemoved,
+                self,
+                .{},
+            );
+        }
+    }
+
     fn connectSurfaceHandlers(self: *Self) void {
         const tree = self.getTree() orelse return;
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
-            _ = Surface.signals.@"close-request".connect(
-                surface,
-                *Self,
-                surfaceCloseRequest,
-                self,
-                .{},
-            );
-            _ = gobject.Object.signals.notify.connect(
-                surface,
-                *Self,
-                propSurfaceFocused,
-                self,
-                .{ .detail = "focused" },
-            );
-            _ = gobject.Object.signals.notify.connect(
-                surface,
-                *Self,
-                propSurfaceMapped,
-                self,
-                .{ .detail = "mapped" },
-            );
+            const leaf = entry.view;
+            const n = leaf.getSurfaceCount();
+            for (0..@intCast(n)) |i| {
+                const surface = leaf.getSurfaceAt(@intCast(i)) orelse continue;
+                self.connectSurfaceHandler(surface);
+            }
         }
     }
 
@@ -480,11 +639,7 @@ pub const SplitTree = extern struct {
         const tree = self.getTree() orelse return false;
         var it = tree.iterator();
         while (it.next()) |entry| {
-            if (entry.view.core()) |core| {
-                if (core.needsConfirmQuit()) {
-                    return true;
-                }
-            }
+            if (entry.view.getNeedsConfirmQuit()) return true;
         }
 
         return false;
@@ -495,10 +650,10 @@ pub const SplitTree = extern struct {
     pub fn getActiveSurface(self: *Self) ?*Surface {
         const tree = self.getTree() orelse return null;
         const handle = self.getActiveSurfaceHandle() orelse return null;
-        return tree.nodes[handle.idx()].leaf;
+        return tree.nodes[handle.idx()].leaf.getActiveSurface();
     }
 
-    fn getActiveSurfaceHandle(self: *Self) ?Surface.Tree.Node.Handle {
+    fn getActiveSurfaceHandle(self: *Self) ?SplitTabs.Tree.Node.Handle {
         const tree = self.getTree() orelse return null;
         var it = tree.iterator();
         while (it.next()) |entry| {
@@ -515,7 +670,7 @@ pub const SplitTree = extern struct {
             // We need to find the handle of the last focused surface.
             it = tree.iterator();
             while (it.next()) |entry| {
-                if (entry.view == v) return entry.handle;
+                if (entry.view.containsSurface(v)) return entry.handle;
             }
         }
 
@@ -531,40 +686,53 @@ pub const SplitTree = extern struct {
         return surface;
     }
 
+    /// Select a surface and make it the active surface without moving GTK
+    /// focus. This is used when restoring a background workspace.
+    pub fn selectSurfaceWithoutFocus(self: *Self, surface: *Surface) bool {
+        const handle = self.findSurfaceHandle(surface) orelse return false;
+        const tree = self.getTree() orelse return false;
+        const leaf = tree.nodes[handle.idx()].leaf;
+        if (!leaf.selectSurfaceWithoutFocus(surface)) return false;
+
+        self.private().last_focused.set(surface);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+        return true;
+    }
+
     pub fn getHasSurfaces(self: *Self) bool {
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+        const tree: *const SplitTabs.Tree = self.private().tree orelse &.empty;
         return !tree.isEmpty();
     }
 
     pub fn getIsZoomed(self: *Self) bool {
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+        const tree: *const SplitTabs.Tree = self.private().tree orelse &.empty;
         return tree.zoomed != null;
     }
 
-    pub fn findSurfaceHandle(self: *Self, surface: *Surface) ?Surface.Tree.Node.Handle {
+    pub fn findSurfaceHandle(self: *Self, surface: *Surface) ?SplitTabs.Tree.Node.Handle {
         const tree = self.getTree() orelse return null;
         var it = tree.iterator();
         while (it.next()) |entry| {
-            if (entry.view == surface) return entry.handle;
+            if (entry.view.containsSurface(surface)) return entry.handle;
         }
         return null;
     }
 
     /// Get the tree data model that we're showing in this widget. This
     /// does not clone the tree.
-    pub fn getTree(self: *Self) ?*Surface.Tree {
+    pub fn getTree(self: *Self) ?*SplitTabs.Tree {
         return self.private().tree;
     }
 
     /// Set the tree data model that we're showing in this widget. This
     /// will clone the given tree.
-    pub fn setTree(self: *Self, tree_: ?*const Surface.Tree) void {
+    pub fn setTree(self: *Self, tree_: ?*const SplitTabs.Tree) void {
         const priv = self.private();
 
         // We always normalize our tree parameter so that empty trees
         // become null so that we don't have to deal with callers being
         // confused about that.
-        const tree: ?*const Surface.Tree = tree: {
+        const tree: ?*const SplitTabs.Tree = tree: {
             const tree = tree_ orelse break :tree null;
             if (tree.isEmpty()) break :tree null;
             break :tree tree;
@@ -580,19 +748,22 @@ pub const SplitTree = extern struct {
         );
 
         if (priv.tree) |old_tree| {
+            self.disconnectLeafHandlers();
             self.disconnectSurfaceHandlers();
-            ext.boxedFree(Surface.Tree, old_tree);
+            ext.boxedFree(SplitTabs.Tree, old_tree);
             priv.tree = null;
         }
 
         if (tree) |new_tree| {
             assert(priv.tree == null);
             assert(!new_tree.isEmpty());
-            priv.tree = ext.boxedCopy(Surface.Tree, new_tree);
+            priv.tree = ext.boxedCopy(SplitTabs.Tree, new_tree);
+            self.connectLeafHandlers();
             self.connectSurfaceHandlers();
         }
 
         self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
     fn getTreeValue(self: *Self, value: *gobject.Value) void {
@@ -605,15 +776,15 @@ pub const SplitTree = extern struct {
     fn setTreeValue(self: *Self, value: *const gobject.Value) void {
         self.setTree(gobject.ext.Value.get(
             value,
-            ?*Surface.Tree,
+            ?*SplitTabs.Tree,
         ));
     }
 
     pub fn getIsSplit(self: *Self) bool {
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+        const tree: *const SplitTabs.Tree = self.private().tree orelse &.empty;
         if (tree.isEmpty()) return false;
 
-        const root_handle: Surface.Tree.Node.Handle = .root;
+        const root_handle: SplitTabs.Tree.Node.Handle = .root;
         const root = tree.nodes[root_handle.idx()];
         return switch (root) {
             .leaf => false,
@@ -626,6 +797,8 @@ pub const SplitTree = extern struct {
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+        self.clearPendingCloseDialog(true);
+        self.clearPendingClose();
         priv.last_focused.set(null);
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
@@ -638,6 +811,22 @@ pub const SplitTree = extern struct {
                 log.warn("unable to remove restore_focus source", .{});
             }
             priv.restore_focus_source = null;
+        }
+        if (priv.empty_leaf_cleanup_source) |source| {
+            _ = glib.Source.remove(source);
+            priv.empty_leaf_cleanup_source = null;
+        }
+        self.disconnectLeafHandlers();
+        self.disconnectSurfaceHandlers();
+        self.clearSurfaceBindings();
+        if (priv.tree) |tree| {
+            ext.boxedFree(SplitTabs.Tree, tree);
+            priv.tree = null;
+        }
+        if (priv.action_group) |group| {
+            self.as(gtk.Widget).insertActionGroup("split-tree", null);
+            group.unref();
+            priv.action_group = null;
         }
 
         gtk.Widget.disposeTemplate(
@@ -652,12 +841,6 @@ pub const SplitTree = extern struct {
     }
 
     fn finalize(self: *Self) callconv(.c) void {
-        const priv = self.private();
-        if (priv.tree) |tree| {
-            ext.boxedFree(Surface.Tree, tree);
-            priv.tree = null;
-        }
-
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
             self.as(Parent),
@@ -681,7 +864,7 @@ pub const SplitTree = extern struct {
         args.get("&s", &dir);
 
         const direction = std.meta.stringToEnum(
-            Surface.Tree.Split.Direction,
+            SplitTabs.Tree.Split.Direction,
             std.mem.span(dir) orelse return,
         ) orelse {
             // Need to be defensive here since actions can be triggered externally.
@@ -746,18 +929,19 @@ pub const SplitTree = extern struct {
     ) callconv(.c) void {
         const core = surface.core() orelse return;
 
-        // Reset our pending close state
         const priv = self.private();
-        priv.pending_close = null;
+        if (priv.pending_close != null) return;
 
-        // Find the surface in the tree to verify this is valid and
-        // set our pending close handle.
-        priv.pending_close = handle: {
+        // Retain the originating surface. Tree handles are mutable and may
+        // be replaced while the confirmation dialog is open.
+        priv.pending_close = pending_close: {
             const tree = self.getTree() orelse return;
             var it = tree.iterator();
             while (it.next()) |entry| {
-                if (entry.view == surface) {
-                    break :handle entry.handle;
+                if (entry.view.containsSurface(surface)) {
+                    break :pending_close .{
+                        .surface = surface.ref(),
+                    };
                 }
             }
 
@@ -775,6 +959,7 @@ pub const SplitTree = extern struct {
 
         // Show a confirmation dialog
         const dialog: *CloseConfirmationDialog = .new(.surface);
+        priv.pending_close_dialog = dialog.ref();
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
             *Self,
@@ -782,13 +967,28 @@ pub const SplitTree = extern struct {
             self,
             .{},
         );
+        _ = CloseConfirmationDialog.signals.cancel.connect(
+            dialog,
+            *Self,
+            closeConfirmationCancel,
+            self,
+            .{},
+        );
         dialog.present(self.as(gtk.Widget));
     }
 
     pub fn removeSurface(self: *Self, surface: *Surface) bool {
+        const retained_surface = surface.ref();
+        defer retained_surface.unref();
         const handle = self.findSurfaceHandle(surface) orelse return false;
-        surface.setSplitBinding(null);
-        self.removeHandle(handle);
+        const tree = self.getTree() orelse return false;
+        const leaf = tree.nodes[handle.idx()].leaf;
+        if (leaf.getSurfaceCount() > 1) {
+            return leaf.detachSurface(surface);
+        }
+
+        if (!self.removeHandle(handle)) return false;
+        retained_surface.setSplitBinding(null);
         return true;
     }
 
@@ -796,35 +996,88 @@ pub const SplitTree = extern struct {
         _: ?*CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
-        // Get the handle we're closing
-        const priv = self.private();
-        const handle = priv.pending_close orelse return;
-        priv.pending_close = null;
+        _ = self.ref();
+        defer self.unref();
+        const pending_close = self.private().pending_close orelse return;
+        defer {
+            self.clearPendingCloseDialog(false);
+            self.clearPendingClose();
+        }
 
-        self.removeHandle(handle);
+        _ = self.removeSurface(pending_close.surface);
+    }
+
+    fn closeConfirmationCancel(
+        _: ?*CloseConfirmationDialog,
+        self: *Self,
+    ) callconv(.c) void {
+        _ = self.ref();
+        defer self.unref();
+        self.clearPendingCloseDialog(false);
+        self.clearPendingClose();
+    }
+
+    fn clearPendingCloseDialog(self: *Self, close: bool) void {
+        const priv = self.private();
+        const dialog = priv.pending_close_dialog orelse return;
+        priv.pending_close_dialog = null;
+        _ = gobject.signalHandlersDisconnectMatched(
+            dialog.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+        if (close) dialog.close();
+        dialog.unref();
+    }
+
+    fn clearPendingClose(self: *Self) void {
+        const priv = self.private();
+        if (priv.pending_close) |pending_close| {
+            pending_close.surface.unref();
+            priv.pending_close = null;
+        }
+    }
+
+    fn nextFocusHandleAfterRemove(
+        comptime Tree: type,
+        tree: *const Tree,
+        alloc: Allocator,
+        handle: Tree.Node.Handle,
+    ) ?Tree.Node.Handle {
+        const next_handle: Tree.Node.Handle =
+            (tree.goto(alloc, handle, .previous) catch null) orelse
+            (tree.goto(alloc, handle, .next) catch null) orelse
+            return null;
+        if (next_handle == handle) return null;
+        return next_handle;
     }
 
     fn removeHandle(
         self: *Self,
-        handle: Surface.Tree.Node.Handle,
-    ) void {
+        handle: SplitTabs.Tree.Node.Handle,
+    ) bool {
         // Figure out our next focus target. The next focus target is
         // always the "previous" surface unless we're the leftmost then
         // its the next.
         const priv = self.private();
-        const old_tree = self.getTree() orelse return;
+        const old_tree = self.getTree() orelse return false;
         const next_focus: ?*Surface = next_focus: {
             const alloc = Application.default().allocator();
-            const next_handle: Surface.Tree.Node.Handle =
-                (old_tree.goto(alloc, handle, .previous) catch null) orelse
-                (old_tree.goto(alloc, handle, .next) catch null) orelse
-                break :next_focus null;
-            if (next_handle == handle) break :next_focus null;
+            const next_handle = nextFocusHandleAfterRemove(
+                SplitTabs.Tree,
+                old_tree,
+                alloc,
+                handle,
+            ) orelse break :next_focus null;
 
             // Note: we don't need to ref this or anything because its
             // guaranteed to remain in the new tree since its not part
             // of the handle we're removing.
-            break :next_focus old_tree.nodes[next_handle.idx()].leaf;
+            break :next_focus old_tree.nodes[next_handle.idx()].leaf.getActiveSurface();
         };
 
         // Remove it from the tree.
@@ -833,14 +1086,16 @@ pub const SplitTree = extern struct {
             handle,
         ) catch |err| {
             log.warn("unable to remove surface from tree: {}", .{err});
-            return;
+            return false;
         };
         defer new_tree.deinit();
         self.setTree(&new_tree);
 
         // Grab focus. We have to set this on the "last focused" because our
-        // focus will be set when the tree is redrawn.
+        // focus will be set when the tree is redrawn. When removing the last
+        // pane, this intentionally remains null because the tree is empty.
         if (next_focus) |v| priv.last_focused.set(v);
+        return true;
     }
 
     fn propSurfaceFocused(
@@ -874,6 +1129,79 @@ pub const SplitTree = extern struct {
             onRestoreFocus,
             self,
         );
+    }
+
+    fn leafSurfaceAdded(
+        _: *SplitTabs,
+        surface: *Surface,
+        self: *Self,
+    ) callconv(.c) void {
+        self.bindSurfaceSplitState(surface);
+        self.connectSurfaceHandler(surface);
+        signals.@"surface-added".impl.emit(self, null, .{surface}, null);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    fn leafSurfaceRemoved(
+        leaf: *SplitTabs,
+        surface: *Surface,
+        self: *Self,
+    ) callconv(.c) void {
+        self.disconnectSurfaceHandler(surface);
+        surface.setSplitBinding(null);
+        signals.@"surface-removed".impl.emit(self, null, .{surface}, null);
+
+        if (!leaf.getHasSurfaces()) {
+            const tree = self.getTree() orelse return;
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                if (entry.view == leaf) {
+                    if (!self.removeHandle(entry.handle)) {
+                        self.scheduleEmptyLeafCleanup();
+                    }
+                    return;
+                }
+            }
+        }
+
+        if (leaf.getActiveSurface()) |next_surface| {
+            self.private().last_focused.set(next_surface);
+        }
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    fn scheduleEmptyLeafCleanup(self: *Self) void {
+        const priv = self.private();
+        if (priv.empty_leaf_cleanup_source != null) return;
+        priv.empty_leaf_cleanup_source = glib.timeoutAdd(
+            1000,
+            retryEmptyLeafCleanup,
+            self,
+        );
+    }
+
+    fn retryEmptyLeafCleanup(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        _ = self.ref();
+        defer self.unref();
+        self.private().empty_leaf_cleanup_source = null;
+
+        while (true) {
+            const tree = self.getTree() orelse return 0;
+            const empty_handle = empty: {
+                var it = tree.iterator();
+                while (it.next()) |entry| {
+                    if (!entry.view.getHasSurfaces()) {
+                        break :empty entry.handle;
+                    }
+                }
+                return 0;
+            };
+            if (!self.removeHandle(empty_handle)) {
+                self.scheduleEmptyLeafCleanup();
+                return 0;
+            }
+        }
     }
 
     fn propTree(
@@ -930,7 +1258,7 @@ pub const SplitTree = extern struct {
         priv.rebuild_source = null;
 
         // Rebuild our tree
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+        const tree: *const SplitTabs.Tree = self.private().tree orelse &.empty;
         if (tree.isEmpty()) {
             priv.tree_bin.setChild(null);
         } else {
@@ -940,6 +1268,14 @@ pub const SplitTree = extern struct {
             );
             defer built.deinit();
             priv.tree_bin.setChild(built.widget);
+
+            // Rebuilding the widget hierarchy reparents live surface widgets.
+            // Force every surface to repaint once attached so newly split panes
+            // don't sit blank until an unrelated event triggers a redraw.
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                entry.view.redraw();
+            }
         }
 
         // Replacing our tree widget hierarchy can reset focus state.
@@ -1015,26 +1351,12 @@ pub const SplitTree = extern struct {
 
     fn buildTree(
         self: *Self,
-        tree: *const Surface.Tree,
-        current: Surface.Tree.Node.Handle,
+        tree: *const SplitTabs.Tree,
+        current: SplitTabs.Tree.Node.Handle,
     ) BuildTreeResult {
         return switch (tree.nodes[current.idx()]) {
             .leaf => |v| leaf: {
-                const window = ext.getAncestor(
-                    SurfaceScrolledWindow,
-                    v.as(gtk.Widget),
-                ) orelse {
-                    // The surface isn't in a window already so we don't
-                    // have to worry about reuse.
-                    break :leaf .initNew(gobject.ext.newInstance(
-                        SurfaceScrolledWindow,
-                        .{ .surface = v },
-                    ).as(gtk.Widget));
-                };
-
-                // Keep this widget alive while we detach it from the
-                // old tree and adopt it into the new one.
-                break :leaf .initReused(window.as(gtk.Widget));
+                break :leaf .initReused(v.as(gtk.Widget));
             },
             .split => |s| split: {
                 const left = self.buildTree(tree, s.left);
@@ -1136,6 +1458,8 @@ pub const SplitTree = extern struct {
 
             // Signals
             signals.changed.impl.register(.{});
+            signals.@"surface-added".impl.register(.{});
+            signals.@"surface-removed".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
@@ -1147,6 +1471,42 @@ pub const SplitTree = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
+
+const TestTree = datastruct.SplitTree(TestView);
+
+const TestView = struct {
+    const Self = @This();
+
+    label: []const u8,
+
+    pub fn ref(self: *Self, alloc: Allocator) Allocator.Error!*Self {
+        const ptr = try alloc.create(Self);
+        ptr.* = self.*;
+        return ptr;
+    }
+
+    pub fn unref(self: *Self, alloc: Allocator) void {
+        alloc.destroy(self);
+    }
+
+    pub fn splitTreeLabel(self: *const Self) []const u8 {
+        return self.label;
+    }
+};
+
+test "SplitTree.nextFocusHandleAfterRemove returns null when removing the last pane" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var view: TestView = .{ .label = "A" };
+    var tree: TestTree = try TestTree.init(alloc, &view);
+    defer tree.deinit();
+
+    try testing.expectEqual(
+        @as(?TestTree.Node.Handle, null),
+        SplitTree.nextFocusHandleAfterRemove(TestTree, &tree, alloc, .root),
+    );
+}
 
 /// This is an internal-only widget that represents a split in the
 /// split tree. This is a wrapper around gtk.Paned that allows us to handle
@@ -1175,7 +1535,7 @@ const SplitTreeSplit = extern struct {
     const Private = struct {
         /// The handle of the node in the tree that this split represents.
         /// Assumed to be correct.
-        handle: Surface.Tree.Node.Handle,
+        handle: SplitTabs.Tree.Node.Handle,
 
         /// Source to handle repositioning the split when properties change.
         idle: ?c_uint = null,
@@ -1198,8 +1558,8 @@ const SplitTreeSplit = extern struct {
     /// an immutable widget and we don't want to deal with the overhead of
     /// all the boilerplate for properties, signals, bindings, etc.
     pub fn new(
-        handle: Surface.Tree.Node.Handle,
-        split: *const Surface.Tree.Split,
+        handle: SplitTabs.Tree.Node.Handle,
+        split: *const SplitTabs.Tree.Split,
         start_child: *gtk.Widget,
         end_child: *gtk.Widget,
     ) *Self {
@@ -1266,7 +1626,11 @@ const SplitTreeSplit = extern struct {
             self.as(gtk.Widget),
         ) orelse return 0;
         const tree = split_tree.getTree() orelse return 0;
-        const split: *const Surface.Tree.Split = &tree.nodes[priv.handle.idx()].split;
+        if (priv.handle.idx() >= tree.nodes.len) return 0;
+        const split: *const SplitTabs.Tree.Split = switch (tree.nodes[priv.handle.idx()]) {
+            .split => |*split| split,
+            .leaf => return 0,
+        };
 
         // Current, min, and max positions as pixels.
         const pos = paned.getPosition();

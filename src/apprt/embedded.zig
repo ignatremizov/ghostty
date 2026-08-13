@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const lib = @import("../lib/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -28,6 +29,11 @@ const log = std.log.scoped(.embedded_window);
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// On Linux with OpenGL, draws must happen on the app/main thread
+    /// because the host's GL context (e.g., GTK GLArea) is only valid there.
+    /// On macOS with Metal, this is not needed since Metal handles threading.
+    pub const must_draw_from_app_thread = builtin.target.os.tag == .linux;
+
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -346,6 +352,7 @@ pub const App = struct {
 pub const Platform = union(PlatformTag) {
     macos: MacOS,
     ios: IOS,
+    linux: Linux,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -359,6 +366,10 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
+    /// Linux platform. The host is responsible for ensuring a valid
+    /// OpenGL context is current before calling surface init and draw.
+    pub const Linux = struct {};
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -368,6 +379,10 @@ pub const Platform = union(PlatformTag) {
 
         ios: extern struct {
             uiview: ?*anyopaque,
+        },
+
+        linux: extern struct {
+            reserved: ?*anyopaque,
         },
     };
 
@@ -388,6 +403,8 @@ pub const Platform = union(PlatformTag) {
                     break :ios error.UIViewMustBeSet);
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
+
+            .linux => if (builtin.target.os.tag == .linux) .{ .linux = .{} } else error.UnsupportedPlatform,
         };
     }
 };
@@ -398,6 +415,11 @@ pub const PlatformTag = enum(c_int) {
 
     macos = 1,
     ios = 2,
+    linux = 3,
+
+    test "ghostty.h PlatformTag" {
+        try lib.checkGhosttyHEnum(PlatformTag, "GHOSTTY_PLATFORM_");
+    }
 };
 
 pub const EnvVar = extern struct {
@@ -584,6 +606,7 @@ pub const Surface = struct {
             app.core_app,
             app,
             self,
+            .{},
         );
         errdefer self.core_surface.deinit();
 
@@ -770,7 +793,13 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
-        self.core_surface.draw() catch |err| {
+        // On macOS/CoreAnimation resize paths, a synchronous draw re-presents
+        // the last frame to avoid blank flashes while resizing. On Linux/GTK,
+        // that same behavior can keep the renderer stuck at the stale size,
+        // so use the non-sync path there to let the renderer detect the new
+        // GL viewport and resize its FBO.
+        const sync = builtin.target.os.tag != .linux;
+        self.core_surface.renderer.drawFrame(sync) catch |err| {
             log.err("error in draw err={}", .{err});
             return;
         };
@@ -795,6 +824,11 @@ pub const Surface = struct {
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
+        // A 0-sized surface can't be rendered and is commonly produced transiently
+        // by UI/layout systems during split/resize operations. Treat it as a no-op
+        // so we keep the last valid size/content until a real size arrives.
+        if (width == 0 or height == 0) return;
+
         // Runtimes sometimes generate superfluous resize events even
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
@@ -1677,6 +1711,25 @@ pub const CAPI = struct {
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();
+    }
+
+    /// Notify the surface that its display/GL context is about to be
+    /// destroyed (e.g., GTK GLArea unrealize during reparenting).
+    /// This deinitializes GL resources (FBOs, shaders) while preserving
+    /// the terminal/pty state. The host MUST make the GL context current
+    /// before calling this.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        surface.core_surface.renderer.displayUnrealized();
+    }
+
+    /// Notify the surface that a new display/GL context is now available
+    /// (e.g., GTK GLArea re-realize after reparenting). This reinitializes
+    /// GL resources (reloads GLAD, recompiles shaders, recreates FBOs).
+    /// The host MUST make the new GL context current before calling this.
+    export fn ghostty_surface_display_realized(surface: *Surface) void {
+        surface.core_surface.renderer.displayRealized() catch |err| {
+            log.err("error in displayRealized err={}", .{err});
+        };
     }
 
     /// Tell the surface that it needs to schedule a render

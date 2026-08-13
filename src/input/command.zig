@@ -415,27 +415,27 @@ fn actionCommands(action: Action.Key) []const Command {
 
         .new_tab => comptime &.{.{
             .action = .new_tab,
-            .title = "New Tab",
-            .description = "Open a new tab.",
+            .title = "New Workspace",
+            .description = "Open a new workspace page.",
         }},
 
         .move_tab => comptime &.{
             .{
                 .action = .{ .move_tab = -1 },
-                .title = "Move Tab Left",
-                .description = "Move the current tab to the left.",
+                .title = "Move Workspace Left",
+                .description = "Move the current workspace page to the left.",
             },
             .{
                 .action = .{ .move_tab = 1 },
-                .title = "Move Tab Right",
-                .description = "Move the current tab to the right.",
+                .title = "Move Workspace Right",
+                .description = "Move the current workspace page to the right.",
             },
         },
 
         .toggle_tab_overview => comptime &.{.{
             .action = .toggle_tab_overview,
-            .title = "Toggle Tab Overview",
-            .description = "Toggle the tab overview.",
+            .title = "Toggle Workspace Sidebar",
+            .description = "Toggle the workspace sidebar.",
         }},
 
         .prompt_surface_title => comptime &.{.{
@@ -447,7 +447,7 @@ fn actionCommands(action: Action.Key) []const Command {
         .prompt_tab_title => comptime &.{.{
             .action = .prompt_tab_title,
             .title = "Change Tab Title…",
-            .description = "Prompt for a new title for the current tab.",
+            .description = "Prompt for a new title for the current tab in the active split.",
         }},
 
         .new_split => comptime &.{
@@ -582,18 +582,18 @@ fn actionCommands(action: Action.Key) []const Command {
         .close_tab => comptime &.{
             .{
                 .action = .{ .close_tab = .this },
-                .title = "Close Tab",
-                .description = "Close the current tab.",
+                .title = "Close Workspace",
+                .description = "Close the current workspace page.",
             },
             .{
                 .action = .{ .close_tab = .other },
-                .title = "Close Other Tabs",
-                .description = "Close all tabs in this window except the current one.",
+                .title = "Close Other Workspaces",
+                .description = "Close all workspace pages in this window except the current one.",
             },
             .{
                 .action = .{ .close_tab = .right },
-                .title = "Close Tabs to the Right",
-                .description = "Close all tabs to the right of the current one.",
+                .title = "Close Workspaces to the Right",
+                .description = "Close all workspace pages to the right of the current one.",
             },
         },
 
@@ -738,4 +738,17 @@ test "command defaults" {
     try testing.expect(defaults.len > 0);
     try testing.expectEqual(defaults.len, defaultsC.len);
     try testing.expectEqual(@as(usize, 0), actionCommands(.move_split_to_tab).len);
+}
+
+test "workspace sidebar command uses preferred action string" {
+    const testing = std.testing;
+
+    const commands = actionCommands(.toggle_tab_overview);
+    try testing.expectEqual(@as(usize, 1), commands.len);
+
+    const cval = try commands[0].cval(testing.allocator);
+    defer testing.allocator.free(std.mem.span(cval.action));
+
+    try testing.expectEqualStrings("toggle_workspace_sidebar", std.mem.span(cval.action));
+    try testing.expectEqualStrings("toggle_tab_overview", std.mem.span(cval.action_key));
 }

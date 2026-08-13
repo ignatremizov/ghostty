@@ -175,6 +175,7 @@ pub const CloseConfirmationDialog = extern struct {
 /// together into one struct that is the sole source of truth.
 pub const Target = enum(c_int) {
     app,
+    workspace,
     tab,
     window,
     surface,
@@ -182,6 +183,7 @@ pub const Target = enum(c_int) {
     pub fn title(self: Target) [*:0]const u8 {
         return switch (self) {
             .app => i18n._("Quit Ghostty?"),
+            .workspace => i18n._("Close Workspace?"),
             .tab => i18n._("Close Tab?"),
             .window => i18n._("Close Window?"),
             .surface => i18n._("Close Split?"),
@@ -191,7 +193,8 @@ pub const Target = enum(c_int) {
     pub fn body(self: Target) [*:0]const u8 {
         return switch (self) {
             .app => i18n._("All terminal sessions will be terminated."),
-            .tab => i18n._("All terminal sessions in this tab will be terminated."),
+            .workspace => i18n._("All terminal sessions in this workspace page will be terminated."),
+            .tab => i18n._("The currently running process in this tab will be terminated."),
             .window => i18n._("All terminal sessions in this window will be terminated."),
             .surface => i18n._("The currently running process in this split will be terminated."),
         };

@@ -91,7 +91,7 @@ pub const Command = union(Key) {
     /// https://sw.kovidgoyal.net/kitty/color-stack/#id1
     kitty_color_protocol: kitty_color.OSC,
 
-    /// Show a desktop notification (OSC 9 or OSC 777)
+    /// Show a desktop notification (OSC 9, OSC 99, or OSC 777)
     show_desktop_notification: struct {
         title: [:0]const u8,
         body: [:0]const u8,
@@ -300,6 +300,35 @@ pub const Parser = struct {
     /// Maximum size of a "normal" OSC.
     pub const MAX_BUF = 2048;
 
+    pub const KittyNotificationPending = struct {
+        active: bool = false,
+        id_len: usize = 0,
+        title_len: usize = 0,
+        body_len: usize = 0,
+        title_seen: bool = false,
+        body_seen: bool = false,
+        title_base64: bool = false,
+        body_base64: bool = false,
+        id: [64]u8 = undefined,
+        title: [MAX_BUF + 1]u8 = undefined,
+        body: [MAX_BUF + 1]u8 = undefined,
+
+        pub fn reset(self: *KittyNotificationPending) void {
+            self.active = false;
+            self.id_len = 0;
+            self.title_len = 0;
+            self.body_len = 0;
+            self.title_seen = false;
+            self.body_seen = false;
+            self.title_base64 = false;
+            self.body_base64 = false;
+        }
+
+        pub fn idSlice(self: *const KittyNotificationPending) []const u8 {
+            return self.id[0..self.id_len];
+        }
+    };
+
     /// Optional allocator used to accept data longer than MAX_BUF.
     /// This only applies to some commands (e.g. OSC 52) that can
     /// reasonably exceed MAX_BUF.
@@ -317,6 +346,9 @@ pub const Parser = struct {
 
     /// The command that is the result of parsing.
     command: Command,
+
+    /// Partial kitty notification state (OSC 99).
+    kitty_notification_pending: KittyNotificationPending = .{},
 
     pub const State = enum {
         start,
@@ -355,6 +387,7 @@ pub const Parser = struct {
         @"66",
         @"72",
         @"77",
+        @"99",
         @"104",
         @"110",
         @"111",
@@ -714,6 +747,12 @@ pub const Parser = struct {
                 else => self.state = .invalid,
             },
 
+            .@"9" => switch (c) {
+                ';' => self.captureTrailing(.fixed),
+                '9' => self.state = .@"99",
+                else => self.state = .invalid,
+            },
+
             .@"77" => switch (c) {
                 '7' => self.state = .@"777",
                 else => self.state = .invalid,
@@ -747,9 +786,13 @@ pub const Parser = struct {
             .@"22",
             .@"777",
             .@"8",
-            .@"9",
             => switch (c) {
                 ';' => self.captureTrailing(.fixed),
+                else => self.state = .invalid,
+            },
+
+            .@"99" => switch (c) {
+                ';' => self.captureTrailing(.allocating),
                 else => self.state = .invalid,
             },
         }
@@ -804,6 +847,8 @@ pub const Parser = struct {
             .@"8" => parsers.hyperlink.parse(self, terminator_ch),
 
             .@"9" => parsers.osc9.parse(self, terminator_ch),
+
+            .@"99" => parsers.kitty_notification.parse(self, terminator_ch),
 
             .@"21" => parsers.kitty_color.parse(self, terminator_ch),
 

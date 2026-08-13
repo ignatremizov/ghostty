@@ -7,9 +7,18 @@ Guidance for coding agents working in this fork of Ghostty.
 - Build: `nix --extra-experimental-features 'nix-command flakes' develop -c zig build`
   - On macOS, if you do not need the app bundle, use
     `nix --extra-experimental-features 'nix-command flakes' develop -c zig build -Demit-macos-app=false`
-- Run: `nix --extra-experimental-features 'nix-command flakes' develop -c zig build run`
+- Run GTK locally: `ghostty-dev run`
+  - This Ubuntu/NVIDIA host requires a graphics-driver bridge for Nix-built GTK
+    binaries. Direct execution, including through `nix develop`, can fail with
+    `Failed to create EGL display`.
+  - `~/.local/bin/ghostty-dev` uses a pinned `nixGL`, builds first when needed,
+    and accepts Ghostty arguments after `run`.
 - Test: `nix --extra-experimental-features 'nix-command flakes' develop -c zig build test`
   - Prefer targeted runs with `-Dtest-filter=<name>` because the full suite is slow
+- Local shortcuts:
+  - `ghostty-dev build`
+  - `ghostty-dev test [-Dtest-filter=<name>]`
+  - `ghostty-dev shell`
 - Format Zig: `nix --extra-experimental-features 'nix-command flakes' develop -c zig fmt .`
 - Format Swift: `swiftlint lint --strict --fix`
 - Format other files: `prettier -w .`
